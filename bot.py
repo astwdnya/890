@@ -4715,6 +4715,22 @@ async def html_command(event):
     await process_html_request(event, parts[1].strip())
 
 
+_SUBDOMAIN_MAP = {
+    "pornhub.com": ["de", "it", "fr", "es", "pt", "nl", "jp", "cn", "pl", "ru", "ar", "api"],
+    "youporn.com": ["de", "it", "fr", "es", "pt", "nl", "jp", "pl", "ru", "ar", "br"],
+    "redtube.com": ["de", "it", "fr", "es", "jp", "pl", "ru", "ar", "br"],
+    "xvideos.com": ["de", "it", "fr", "es", "pt", "nl", "jp", "cn", "pl", "ru", "ar", "br"],
+    "eporner.com": ["de", "it", "fr", "es", "pt", "nl", "jp", "cn", "pl", "ru", "ar", "br"],
+    "xnxx.com": ["www", "nl", "sa", "sample", "events", "noc"],
+    "xhamster.com": ["www", "de", "deu", "usernames", "event", "seo", "sc", "webdev"],
+}
+
+def _normalize_subdomain(url: str) -> str:
+    for domain, subs in _SUBDOMAIN_MAP.items():
+        for sub in subs:
+            url = re.sub(rf"https?://{re.escape(sub)}\.{re.escape(domain)}", f"https://{domain}", url)
+    return url
+
 async def generic_url_handler(event):
     if event.sender_id not in AUTHORIZED_USERS or event.raw_text.startswith("/"):
         return
@@ -4732,6 +4748,7 @@ async def generic_url_handler(event):
         processing_messages.discard(msg_id)
         return
     target_url = urls[0]
+    target_url = _normalize_subdomain(target_url)
 
     if (
         YOUTUBE_RE.match(target_url)
