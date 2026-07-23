@@ -12642,7 +12642,7 @@ async def main():
     client.add_event_handler(
         subburn_proc_cancel_callback, events.CallbackQuery(pattern=r"subburn_proc_cancel_(.+)")
     )
-    bot.add_event_handler(
+    client.add_event_handler(
         subtitle_cancel_callback, events.CallbackQuery(pattern=r"subcancl_(.+)")
     )
     client.add_event_handler(
