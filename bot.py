@@ -332,6 +332,7 @@ from otherwebsiteshandler.luxuretv_handler import (
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
+from telegram_subtitle_handler import register_subtitle_handlers
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -12566,6 +12567,9 @@ async def main():
     )
     client.add_event_handler(snapwc_captcha_handler, events.NewMessage(incoming=True))
     client.add_event_handler(generic_url_handler, events.NewMessage(incoming=True))
+
+    # Register subtitle extraction handlers (Telegram files + direct links)
+    register_subtitle_handlers(client)
 
     # Inline search handler
     client.add_event_handler(xnxx_inline_handler, events.InlineQuery())
