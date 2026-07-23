@@ -332,7 +332,7 @@ from otherwebsiteshandler.luxuretv_handler import (
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
-from telegram_subtitle_handler import register_subtitle_handlers
+from subtitle_extractor import get_subtitle_streams, extract_subtitles
 
 # ====================== CONFIGURATION ======================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -5417,119 +5417,24 @@ async def generic_url_handler(event):
                 # ── Subtitle burn flow ──────────────────────────────────
                 subtitle_name = ""
                 if is_video and SUB_BURN_ENABLED:
-                    # چک soft subtitle
-                    await safe_edit(status_msg, "🔍 Checking for subtitle...")
-                    persian_sub, non_persian_info = await extract_persian_subtitle(
-                        filepath
-                    )
+                    await safe_edit(status_msg, "🔍 Checking for subtitles...")
+                    sub_streams = get_subtitle_streams(filepath)
 
-                    if persian_sub:
-                        # soft sub فارسی پیدا شد — مستقیم burn میکنیم
-                        await safe_edit(
-                            status_msg,
-                            "🔤 Persian subtitle found! Sending to HappyScribe...",
+                    if sub_streams:
+                        sub_list = "\n".join(
+                            f"  {i+1}. {s['language']}" + (f" — {s['title']}" if s['title'] else "")
+                            for i, s in enumerate(sub_streams)
                         )
-
-                        async def _prog(text):
-                            await safe_edit(status_msg, text)
-
-                        dl_url, err = await hardcode_subtitle_online(
-                            video_path=filepath,
-                            subtitle_path=persian_sub,
-                            progress_callback=_prog,
-                        )
-                        try:
-                            os.remove(persian_sub)
-                        except Exception:
-                            pass
-
-                        if dl_url:
-                            # دانلود نتیجه
-                            out_name = os.path.splitext(orig_name)[0] + "_subtitled.mp4"
-                            out_path = os.path.join(
-                                OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}"
-                            )
-                            await safe_edit(status_msg, "⬇️ Downloading result...")
-                            try:
-                                async with aiohttp.ClientSession() as sess:
-                                    async with sess.get(
-                                        dl_url, timeout=ClientTimeout(total=600)
-                                    ) as resp:
-                                        if resp.status == 200:
-                                            async with aiofiles.open(
-                                                out_path, "wb"
-                                            ) as f:
-                                                async for (
-                                                    chunk
-                                                ) in resp.content.iter_chunked(524288):
-                                                    await f.write(chunk)
-                            except Exception as e:
-                                await safe_edit(
-                                    status_msg, f"❌ Download error: {str(e)[:80]}"
-                                )
-                                out_path = None
-
-                            if (
-                                out_path
-                                and os.path.exists(out_path)
-                                and os.path.getsize(out_path) > 0
-                            ):
-                                try:
-                                    os.remove(filepath)
-                                except Exception:
-                                    pass
-                                subtitle_name = "Persian"
-                                filepath = out_path
-                                size = os.path.getsize(filepath)
-                                orig_name = out_name
-                                # fallthrough به آپلود عادی
-                            else:
-                                await safe_edit(
-                                    status_msg,
-                                    "⚠️ HappyScribe failed, uploading original...",
-                                )
-                        else:
-                            await safe_edit(
-                                status_msg,
-                                f"⚠️ HappyScribe error: {err[:80]}\nUploading original...",
-                            )
-
-                    elif non_persian_info:
-                        # زیرنویس غیرفارسی پیدا شد — از کاربر تأیید بگیر
-                        sub_lang = non_persian_info.get("lang", "unknown")
-                        sub_title = non_persian_info.get("title", "")
-                        sub_codec = non_persian_info.get("codec", "")
-                        info_parts = [f"`{sub_lang}`"]
-                        if sub_title:
-                            info_parts.append(f"📝 `{sub_title}`")
-                        if sub_codec:
-                            info_parts.append(f"📄 `{sub_codec}`")
-                        sub_desc = " | ".join(info_parts)
-
                         prompt_msg = await event.client.send_message(
                             event.chat_id,
-                            f"🔤 **Subtitle found** in:\n`{orig_name}`\n\n"
-                            f"Language: {sub_desc}\n\n"
-                            "Use this subtitle?",
+                            f"🎬 **{orig_name}**\n\n"
+                            f"{len(sub_streams)} soft subtitle(s) found:\n{sub_list}\n\n"
+                            "Send video as-is or burn a subtitle?",
                             parse_mode="markdown",
                             buttons=[
-                                [
-                                    Button.inline(
-                                        "✅ Use this subtitle",
-                                        f"subextr_{event.chat_id}",
-                                    )
-                                ],
-                                [
-                                    Button.inline(
-                                        "⏭ Skip — upload as-is",
-                                        f"subskip_{event.chat_id}_{event.id}",
-                                    )
-                                ],
-                                [
-                                    Button.inline(
-                                        "❌ Cancel", f"subcancl_{event.chat_id}"
-                                    )
-                                ],
+                                [Button.inline("📤 ارسال ویدیو", f"subsend_{event.chat_id}_{event.id}")],
+                                [Button.inline("🔥 سوختن زیرنویس", f"subburn_list_{event.chat_id}_{event.id}")],
+                                [Button.inline("❌ Cancel", f"subcancl_{event.chat_id}")],
                             ],
                         )
                         subtitle_sessions[event.chat_id] = {
@@ -5539,13 +5444,9 @@ async def generic_url_handler(event):
                             "status_msg_id": prompt_msg.id,
                             "size": size,
                             "dur_str": dur_str,
-                            "pending_sub_index": non_persian_info["index"],
-                            "subtitle_name": sub_lang
-                            if sub_lang != "unknown"
-                            else (sub_title or "Subtitle"),
+                            "sub_streams": sub_streams,
                         }
                         return
-
                     else:
                         # هیچ زیرنویسی توی فایل نبود — از کاربر بخواه فایل بفرسته
                         prompt_msg = await event.client.send_message(
@@ -6271,7 +6172,7 @@ async def subburn_callback(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.answer("⛔ Unauthorized", alert=True)
 
-    batch_key = event.data.decode().replace("subburn_", "")
+    batch_key = event.data.decode().replace("subburn_vbatch_", "")
     batch = video_send_pending.pop(batch_key, None)
     if not batch or not batch.get("files"):
         return await event.answer("❌ Session expired.", alert=True)
@@ -6570,6 +6471,219 @@ async def subextr_callback(event):
             gh_line = f"\n☁️ [GitHub DL]({gh_url})"
         await safe_edit(status_msg, "📤 Uploading...")
     _ul_id = f"ul_{chat_id}_{int(time.time())}"
+    cap = build_video_caption(out_name, size, vid_duration, subtitle_name)
+    if gh_line:
+        cap += gh_line
+    await send_file_with_progress(
+        client=event.client,
+        chat_id=chat_id,
+        filepath=filepath,
+        caption=cap,
+        status_msg=status_msg,
+        ul_id=_ul_id,
+    )
+    active_uploads.pop(_ul_id, None)
+    try:
+        os.remove(filepath)
+    except Exception:
+        pass
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+    try:
+        await event.delete()
+    except Exception:
+        pass
+    raise events.StopPropagation
+
+
+async def subsend_callback(event):
+    """کاربر دکمه ارسال ویدیو رو زد — بدون زیرنویس آپلود کن."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+    m = re.match(r"subsend_(-?\d+)", event.data.decode())
+    if not m:
+        return await event.answer("❌ Invalid data.", alert=True)
+    chat_id = int(m.group(1))
+    session = subtitle_sessions.pop(chat_id, None)
+    if not session:
+        return await event.answer("❌ Session expired.", alert=True)
+    await event.answer("📤 Sending video...", alert=False)
+    video_path = session.get("video_path")
+    video_orig_name = session.get("video_orig_name", "video")
+    status_msg = session.get("status_msg")
+    size = session.get("size", 0)
+    dur_str = session.get("dur_str", "")
+    status_msg_id = session.get("status_msg_id")
+    if status_msg_id:
+        try:
+            await event.client.delete_messages(chat_id, status_msg_id)
+        except Exception:
+            pass
+    try:
+        await event.delete()
+    except Exception:
+        pass
+    if not video_path or not os.path.exists(video_path):
+        if status_msg:
+            await safe_edit(status_msg, "❌ Video file expired.")
+        return
+    if status_msg:
+        await safe_edit(status_msg, "📤 Uploading...")
+    gh_line = ""
+    if GITHUB_ENABLED:
+        if status_msg:
+            await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+        gh_url = await maybe_upload_github(event.client, chat_id, video_path, size)
+        if gh_url:
+            gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+        if status_msg:
+            await safe_edit(status_msg, "📤 Uploading...")
+    _ul_id = f"subsend_{chat_id}_{event.id}"
+    vid_duration, _, _ = await get_video_info(video_path)
+    cap = build_video_caption(video_orig_name, size, vid_duration)
+    if gh_line:
+        cap += gh_line
+    try:
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=chat_id,
+            filepath=video_path,
+            caption=cap,
+            status_msg=status_msg,
+            ul_id=_ul_id,
+        )
+    except Exception as e:
+        if status_msg:
+            await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:80]}")
+    finally:
+        active_uploads.pop(_ul_id, None)
+        try:
+            os.remove(video_path)
+        except Exception:
+            pass
+
+
+async def subburn_list_callback(event):
+    """کاربر دکمه سوختن زیرنویس رو زد — لیست زیرنویس‌ها رو نشون بده."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+    m = re.match(r"subburn_list_(-?\d+)", event.data.decode())
+    if not m:
+        return await event.answer("❌ Invalid data.", alert=True)
+    chat_id = int(m.group(1))
+    session = subtitle_sessions.get(chat_id)
+    if not session:
+        return await event.answer("❌ Session expired.", alert=True)
+    sub_streams = session.get("sub_streams", [])
+    if not sub_streams:
+        return await event.answer("❌ No subtitle streams found.", alert=True)
+    buttons = []
+    for i, s in enumerate(sub_streams):
+        lang = s.get("language", "und")
+        title = s.get("title", "")
+        label = f"{lang}" + (f" — {title}" if title else "")
+        buttons.append([Button.inline(label, f"subburn_sel_{chat_id}_{i}")])
+    buttons.append([Button.inline("❌ Cancel", f"subcancl_{chat_id}")])
+    try:
+        await event.edit("🔥 **Choose a subtitle to burn:**", buttons=buttons)
+    except Exception:
+        pass
+
+
+async def subburn_sel_callback(event):
+    """کاربر یکی از زیرنویس‌ها رو انتخاب کرد — استخراج و HardSub."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+    m = re.match(r"subburn_sel_(-?\d+)_(\d+)$", event.data.decode())
+    if not m:
+        return await event.answer("❌ Invalid data.", alert=True)
+    chat_id = int(m.group(1))
+    sub_idx = int(m.group(2))
+    session = subtitle_sessions.pop(chat_id, None)
+    if not session:
+        return await event.answer("❌ Session expired.", alert=True)
+    video_path = session["video_path"]
+    orig_name = session["video_orig_name"]
+    status_msg = session["status_msg"]
+    sub_streams = session.get("sub_streams", [])
+    if sub_idx >= len(sub_streams):
+        return await event.answer("❌ Invalid subtitle index.", alert=True)
+    sub_info = sub_streams[sub_idx]
+    sub_index = sub_info["index"]
+    sub_lang = sub_info.get("language", "und")
+    sub_title = sub_info.get("title", "")
+    subtitle_name = sub_lang + (f" — {sub_title}" if sub_title else "")
+    await event.answer("⏳ Extracting subtitle...", alert=False)
+    try:
+        await event.edit("⏳ Extracting subtitle from video...", buttons=None)
+    except Exception:
+        pass
+    out_srt = os.path.join(OUTPUT_FOLDER, f"extracted_sub_{int(time.time())}.srt")
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i", video_path,
+        "-map", f"0:{sub_index}",
+        "-c:s", "srt",
+        out_srt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+    if not os.path.exists(out_srt) or os.path.getsize(out_srt) == 0:
+        try:
+            await event.edit("❌ Failed to extract subtitle.", buttons=None)
+        except Exception:
+            pass
+        return
+    await safe_edit(status_msg, "🔤 Subtitle extracted! Sending to HappyScribe...")
+    async def _prog(text):
+        await safe_edit(status_msg, text)
+    dl_url, err = await hardcode_subtitle_online(
+        video_path=video_path,
+        subtitle_path=out_srt,
+        progress_callback=_prog,
+    )
+    try:
+        os.remove(out_srt)
+    except Exception:
+        pass
+    if not dl_url:
+        await safe_edit(status_msg, f"⚠️ HappyScribe error: {err[:80]}\nUploading original...")
+        raise events.StopPropagation
+    out_name = os.path.splitext(orig_name)[0] + "_subtitled.mp4"
+    out_path = os.path.join(OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}")
+    await safe_edit(status_msg, "⬇️ Downloading result...")
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(dl_url, timeout=ClientTimeout(total=600)) as resp:
+                if resp.status == 200:
+                    async with aiofiles.open(out_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(524288):
+                            await f.write(chunk)
+    except Exception as e:
+        await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}")
+        raise events.StopPropagation
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        await safe_edit(status_msg, "⚠️ HappyScribe failed, uploading original...")
+        raise events.StopPropagation
+    try:
+        os.remove(video_path)
+    except Exception:
+        pass
+    filepath = out_path
+    size = os.path.getsize(filepath)
+    vid_duration, _, _ = await get_video_info(filepath)
+    gh_line = ""
+    if GITHUB_ENABLED:
+        await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+        gh_url = await maybe_upload_github(event.client, chat_id, filepath, size)
+        if gh_url:
+            gh_line = f"\n☁️ [GitHub DL]({gh_url})"
+        await safe_edit(status_msg, "📤 Uploading...")
+    _ul_id = f"subburn_{chat_id}_{int(time.time())}"
     cap = build_video_caption(out_name, size, vid_duration, subtitle_name)
     if gh_line:
         cap += gh_line
@@ -12193,7 +12307,16 @@ async def main():
         vsend_callback, events.CallbackQuery(pattern=r"vsend_(.+)")
     )
     client.add_event_handler(
-        subburn_callback, events.CallbackQuery(pattern=r"subburn_(.+)")
+        subburn_callback, events.CallbackQuery(pattern=r"subburn_vbatch_(.+)")
+    )
+    client.add_event_handler(
+        subsend_callback, events.CallbackQuery(pattern=r"subsend_(.+)")
+    )
+    client.add_event_handler(
+        subburn_list_callback, events.CallbackQuery(pattern=r"subburn_list_(.+)")
+    )
+    client.add_event_handler(
+        subburn_sel_callback, events.CallbackQuery(pattern=r"subburn_sel_(.+)")
     )
     client.add_event_handler(
         sharelink_callback, events.CallbackQuery(pattern=r"sharelink_(.+)")
@@ -12567,9 +12690,6 @@ async def main():
     )
     client.add_event_handler(snapwc_captcha_handler, events.NewMessage(incoming=True))
     client.add_event_handler(generic_url_handler, events.NewMessage(incoming=True))
-
-    # Register subtitle extraction handlers (Telegram files + direct links)
-    register_subtitle_handlers(client)
 
     # Inline search handler
     client.add_event_handler(xnxx_inline_handler, events.InlineQuery())
