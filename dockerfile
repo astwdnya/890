@@ -48,6 +48,8 @@ COPY youtube_extractor.py .
 COPY happyscribe_subtitle.py .
 COPY xnxx_handler.py .
 COPY ytdlp_handler.py .
+COPY subtitle_extractor.py .
+COPY telegram_subtitle_handler.py .
 COPY otherwebsiteshandler/ otherwebsiteshandler/
 COPY searcher/ searcher/
 
