@@ -3,6 +3,8 @@
 # Fixes: 403 auto-dirpy + FFmpeg scale/rotation fix + size_input chat_id fix + pause/resume split
 
 import asyncio
+import glob
+import math
 import os
 import re
 import sys
@@ -6416,52 +6418,71 @@ async def subextr_callback(event):
             pass
         return
 
-    await safe_edit(status_msg, "🔤 Subtitle extracted! Sending to HappyScribe...")
-
-    async def _prog(text):
-        await safe_edit(status_msg, text)
-
-    dl_url, err = await hardcode_subtitle_online(
-        video_path=video_path,
-        subtitle_path=out_srt,
-        progress_callback=_prog,
-    )
-    try:
-        os.remove(out_srt)
-    except Exception:
-        pass
-
-    if not dl_url:
-        await safe_edit(
-            status_msg, f"⚠️ HappyScribe error: {err[:80]}\nUploading original..."
-        )
-        raise events.StopPropagation
-
+    # Check if video is too large for HappyScribe (490MB+)
+    video_size_mb = os.path.getsize(video_path) / (1024 * 1024)
     out_name = os.path.splitext(orig_name)[0] + "_subtitled.mp4"
-    out_path = os.path.join(OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}")
-    await safe_edit(status_msg, "⬇️ Downloading result...")
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(dl_url, timeout=ClientTimeout(total=600)) as resp:
-                if resp.status == 200:
-                    async with aiofiles.open(out_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(524288):
-                            await f.write(chunk)
-    except Exception as e:
-        await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}")
-        raise events.StopPropagation
+    if video_size_mb > 490:
+        await safe_edit(status_msg, f"📏 Video is {video_size_mb:.0f}MB — splitting into parts...")
+        merged_path = await _burn_subtitle_split(
+            event, chat_id, video_path, out_srt, subtitle_name,
+            status_msg, orig_name,
+        )
+        try: os.remove(out_srt)
+        except: pass
+        try: os.remove(video_path)
+        except: pass
+        if merged_path:
+            filepath = merged_path
+            size = os.path.getsize(filepath)
+        else:
+            await safe_edit(status_msg, "⚠️ Split-burn failed, uploading original...")
+            raise events.StopPropagation
+    else:
+        await safe_edit(status_msg, "🔤 Subtitle extracted! Sending to HappyScribe...")
 
-    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-        await safe_edit(status_msg, "⚠️ HappyScribe failed, uploading original...")
-        raise events.StopPropagation
+        async def _prog(text):
+            await safe_edit(status_msg, text)
 
-    try:
-        os.remove(video_path)
-    except Exception:
-        pass
+        dl_url, err = await hardcode_subtitle_online(
+            video_path=video_path,
+            subtitle_path=out_srt,
+            progress_callback=_prog,
+        )
+        try:
+            os.remove(out_srt)
+        except Exception:
+            pass
 
-    filepath = out_path
-    size = os.path.getsize(filepath)
+        if not dl_url:
+            await safe_edit(
+                status_msg, f"⚠️ HappyScribe error: {err[:80]}\nUploading original..."
+            )
+            raise events.StopPropagation
+
+        out_path = os.path.join(OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}")
+        await safe_edit(status_msg, "⬇️ Downloading result...")
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(dl_url, timeout=ClientTimeout(total=600)) as resp:
+                    if resp.status == 200:
+                        async with aiofiles.open(out_path, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(524288):
+                                await f.write(chunk)
+        except Exception as e:
+            await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}")
+            raise events.StopPropagation
+
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            await safe_edit(status_msg, "⚠️ HappyScribe failed, uploading original...")
+            raise events.StopPropagation
+
+        try:
+            os.remove(video_path)
+        except Exception:
+            pass
+
+        filepath = out_path
+        size = os.path.getsize(filepath)
     vid_duration, _, _ = await get_video_info(filepath)
     gh_line = ""
     if GITHUB_ENABLED:
@@ -6496,6 +6517,152 @@ async def subextr_callback(event):
     except Exception:
         pass
     raise events.StopPropagation
+
+
+async def _burn_subtitle_split(
+    event, chat_id: int, video_path: str, subtitle_path: str,
+    subtitle_name: str, status_msg, orig_name: str,
+) -> Optional[str]:
+    """
+    برای ویدیوهای >490MB: split به پارت‌های <500MB، هرکدوم رو با زیرنویس
+    به HappyScribe بده، دانلود کن، بعد concat کن.
+    برمی‌گردونه مسیر فایل نهایی یا None.
+    """
+    total_size = os.path.getsize(video_path)
+    MAX_PART = 485 * 1024 * 1024
+    num_parts = math.ceil(total_size / MAX_PART)
+    if num_parts < 2:
+        return None
+
+    await safe_edit(status_msg, f"✂️ Splitting video into {num_parts} parts...")
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    split_dir = os.path.join(OUTPUT_FOLDER, f"split_{int(time.time())}")
+    os.makedirs(split_dir, exist_ok=True)
+    split_pat = os.path.join(split_dir, "part_%03d.mp4")
+
+    # Get total duration
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    try:
+        total_dur = float(json.loads(stdout.decode()).get("format", {}).get("duration", 0))
+    except Exception:
+        total_dur = 0
+    if total_dur <= 0:
+        total_dur = 600
+
+    part_dur = total_dur / num_parts
+
+    # Split by duration (segment muxer, re-encode to ensure clean keyframes)
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", video_path,
+        "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+        "-c:a", "aac", "-b:a", "128k",
+        "-map", "0",
+        "-f", "segment", "-segment_time", str(part_dur),
+        "-reset_timestamps", "1", "-avoid_negative_ts", "make_zero",
+        split_pat,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+
+    parts = sorted(glob.glob(os.path.join(split_dir, "part_*.mp4")))
+    if not parts:
+        shutil.rmtree(split_dir, ignore_errors=True)
+        return None
+
+    processed = []
+    try:
+        for i, part_path in enumerate(parts):
+            part_size = os.path.getsize(part_path)
+            if part_size < 1024:
+                try: os.remove(part_path)
+                except: pass
+                continue
+
+            await safe_edit(status_msg, f"🔄 Part {i+1}/{len(parts)} — sending to HappyScribe...")
+
+            # Get actual part duration for subtitle trim
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", part_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            try:
+                part_info = json.loads(stdout.decode())
+                pdur = float(part_info.get("format", {}).get("duration", 0))
+            except Exception:
+                pdur = part_dur
+
+            # Trim subtitle to match this part
+            part_start = i * part_dur
+            trimmed_sub = os.path.join(split_dir, f"sub_{i:03d}.srt")
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y",
+                "-ss", str(part_start), "-t", str(pdur),
+                "-i", subtitle_path,
+                "-c:s", "srt", trimmed_sub,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+
+            sub_for_part = trimmed_sub if (os.path.exists(trimmed_sub) and os.path.getsize(trimmed_sub) > 0) else subtitle_path
+
+            # HappyScribe
+            async def _prog(t):
+                await safe_edit(status_msg, t)
+            dl_url, err = await hardcode_subtitle_online(
+                video_path=part_path, subtitle_path=sub_for_part,
+                progress_callback=_prog,
+            )
+            if not dl_url:
+                await safe_edit(status_msg, f"⚠️ Part {i+1} failed: {err[:80]}")
+                raise Exception(f"Part {i+1} failed")
+
+            # Download result
+            out_part = os.path.join(split_dir, f"done_{i:03d}.mp4")
+            await safe_edit(status_msg, f"⬇️ Downloading part {i+1}/{len(parts)}...")
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(dl_url, timeout=ClientTimeout(total=600)) as resp:
+                    if resp.status != 200:
+                        raise Exception(f"HTTP {resp.status}")
+                    async with aiofiles.open(out_part, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(524288):
+                            await f.write(chunk)
+            if os.path.exists(out_part) and os.path.getsize(out_part) > 0:
+                processed.append(out_part)
+
+        if not processed:
+            raise Exception("No parts processed")
+
+        # Concatenate
+        await safe_edit(status_msg, "🔗 Joining parts...")
+        final_path = os.path.join(OUTPUT_FOLDER, f"merged_{int(time.time())}_{orig_name}")
+        concat_file = os.path.join(split_dir, "concat.txt")
+        with open(concat_file, "w") as f:
+            for p in processed:
+                f.write(f"file '{os.path.abspath(p)}'\n")
+
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concat_file,
+            "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+            "-c:a", "aac", "-b:a", "128k",
+            final_path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+        if os.path.exists(final_path) and os.path.getsize(final_path) > 0:
+            return final_path
+    except Exception as e:
+        logger.error(f"[SPLIT-BURN] Error: {e}")
+    finally:
+        shutil.rmtree(split_dir, ignore_errors=True)
+
+    return None
 
 
 async def subsend_callback(event):
@@ -6638,43 +6805,62 @@ async def subburn_sel_callback(event):
         except Exception:
             pass
         return
-    await safe_edit(status_msg, "🔤 Subtitle extracted! Sending to HappyScribe...")
-    async def _prog(text):
-        await safe_edit(status_msg, text)
-    dl_url, err = await hardcode_subtitle_online(
-        video_path=video_path,
-        subtitle_path=out_srt,
-        progress_callback=_prog,
-    )
-    try:
-        os.remove(out_srt)
-    except Exception:
-        pass
-    if not dl_url:
-        await safe_edit(status_msg, f"⚠️ HappyScribe error: {err[:80]}\nUploading original...")
-        raise events.StopPropagation
+    # Check if video is too large for HappyScribe (490MB+)
+    video_size_mb = os.path.getsize(video_path) / (1024 * 1024)
     out_name = os.path.splitext(orig_name)[0] + "_subtitled.mp4"
-    out_path = os.path.join(OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}")
-    await safe_edit(status_msg, "⬇️ Downloading result...")
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(dl_url, timeout=ClientTimeout(total=600)) as resp:
-                if resp.status == 200:
-                    async with aiofiles.open(out_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(524288):
-                            await f.write(chunk)
-    except Exception as e:
-        await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}")
-        raise events.StopPropagation
-    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-        await safe_edit(status_msg, "⚠️ HappyScribe failed, uploading original...")
-        raise events.StopPropagation
-    try:
-        os.remove(video_path)
-    except Exception:
-        pass
-    filepath = out_path
-    size = os.path.getsize(filepath)
+    if video_size_mb > 490:
+        await safe_edit(status_msg, f"📏 Video is {video_size_mb:.0f}MB — splitting into parts...")
+        merged_path = await _burn_subtitle_split(
+            event, chat_id, video_path, out_srt, subtitle_name,
+            status_msg, orig_name,
+        )
+        try: os.remove(out_srt)
+        except: pass
+        try: os.remove(video_path)
+        except: pass
+        if merged_path:
+            filepath = merged_path
+            size = os.path.getsize(filepath)
+        else:
+            await safe_edit(status_msg, "⚠️ Split-burn failed, uploading original...")
+            raise events.StopPropagation
+    else:
+        await safe_edit(status_msg, "🔤 Subtitle extracted! Sending to HappyScribe...")
+        async def _prog(text):
+            await safe_edit(status_msg, text)
+        dl_url, err = await hardcode_subtitle_online(
+            video_path=video_path,
+            subtitle_path=out_srt,
+            progress_callback=_prog,
+        )
+        try:
+            os.remove(out_srt)
+        except Exception:
+            pass
+        if not dl_url:
+            await safe_edit(status_msg, f"⚠️ HappyScribe error: {err[:80]}\nUploading original...")
+            raise events.StopPropagation
+        out_path = os.path.join(OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}")
+        await safe_edit(status_msg, "⬇️ Downloading result...")
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(dl_url, timeout=ClientTimeout(total=600)) as resp:
+                    if resp.status == 200:
+                        async with aiofiles.open(out_path, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(524288):
+                                await f.write(chunk)
+        except Exception as e:
+            await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}")
+            raise events.StopPropagation
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            await safe_edit(status_msg, "⚠️ HappyScribe failed, uploading original...")
+            raise events.StopPropagation
+        try:
+            os.remove(video_path)
+        except Exception:
+            pass
+        filepath = out_path
+        size = os.path.getsize(filepath)
     vid_duration, _, _ = await get_video_info(filepath)
     gh_line = ""
     if GITHUB_ENABLED:
