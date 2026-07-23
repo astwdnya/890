@@ -386,6 +386,7 @@ pending_sponsor_name: Dict[int, str] = {}  # مرحله اول اضافه کرد
 
 # نگه‌داری ویدیوهایی که منتظر فایل زیرنویس هستن
 subtitle_sessions: Dict[int, Dict] = {}  # key: chat_id
+subburn_cancel: Dict[int, bool] = {}  # key: chat_id, True = cancel requested
 
 
 def _escape_md(text: str) -> str:
@@ -6389,7 +6390,7 @@ async def subextr_callback(event):
 
     await event.answer("⏳ Extracting subtitle...", alert=False)
     try:
-        await event.edit("⏳ Extracting subtitle from video...", buttons=None)
+        await event.edit("⏳ Extracting subtitle from video...", buttons=_sub_btn(chat_id))
     except Exception:
         pass
 
@@ -6416,13 +6417,17 @@ async def subextr_callback(event):
             await event.edit("❌ Failed to extract subtitle.", buttons=None)
         except Exception:
             pass
+        try:
+            os.remove(video_path)
+        except Exception:
+            pass
         return
 
     # Check if video is too large for HappyScribe (490MB+)
     video_size_mb = os.path.getsize(video_path) / (1024 * 1024)
     out_name = os.path.splitext(orig_name)[0] + "_subtitled.mp4"
     if video_size_mb > 490:
-        await safe_edit(status_msg, f"📏 Video is {video_size_mb:.0f}MB — splitting into parts...")
+        await safe_edit(status_msg, f"📏 Video is {video_size_mb:.0f}MB — splitting into parts...", buttons=_sub_btn(chat_id))
         merged_path = await _burn_subtitle_split(
             event, chat_id, video_path, out_srt, subtitle_name,
             status_msg, orig_name,
@@ -6434,14 +6439,25 @@ async def subextr_callback(event):
         if merged_path:
             filepath = merged_path
             size = os.path.getsize(filepath)
+        elif subburn_cancel.get(chat_id):
+            subburn_cancel.pop(chat_id, None)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            raise events.StopPropagation
         else:
-            await safe_edit(status_msg, "⚠️ Split-burn failed, uploading original...")
+            await safe_edit(status_msg, "⚠️ Split-burn failed, uploading original...", buttons=_sub_btn(chat_id))
             raise events.StopPropagation
     else:
-        await safe_edit(status_msg, "🔤 Subtitle extracted! Sending to HappyScribe...")
+        await safe_edit(status_msg, "🔤 Subtitle extracted! Sending to HappyScribe...", buttons=_sub_btn(chat_id))
 
         async def _prog(text):
-            await safe_edit(status_msg, text)
+            await safe_edit(status_msg, text, buttons=_sub_btn(chat_id))
 
         dl_url, err = await hardcode_subtitle_online(
             video_path=video_path,
@@ -6455,25 +6471,51 @@ async def subextr_callback(event):
 
         if not dl_url:
             await safe_edit(
-                status_msg, f"⚠️ HappyScribe error: {err[:80]}\nUploading original..."
+                status_msg, f"⚠️ HappyScribe error: {err[:80]}\nUploading original...",
+                buttons=_sub_btn(chat_id),
             )
             raise events.StopPropagation
 
+        if subburn_cancel.get(chat_id):
+            subburn_cancel.pop(chat_id, None)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            try:
+                os.remove(video_path)
+            except Exception:
+                pass
+            raise events.StopPropagation
+
         out_path = os.path.join(OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}")
-        await safe_edit(status_msg, "⬇️ Downloading result...")
+        await safe_edit(status_msg, "⬇️ Downloading result...", buttons=_sub_btn(chat_id))
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(dl_url, timeout=ClientTimeout(total=600)) as resp:
                     if resp.status == 200:
                         async with aiofiles.open(out_path, "wb") as f:
                             async for chunk in resp.content.iter_chunked(524288):
+                                if subburn_cancel.get(chat_id):
+                                    raise Exception("Cancelled by user")
                                 await f.write(chunk)
         except Exception as e:
-            await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}")
+            if str(e) == "Cancelled by user":
+                subburn_cancel.pop(chat_id, None)
+                try: os.remove(video_path)
+                except: pass
+                try: os.remove(out_path)
+                except: pass
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                raise events.StopPropagation
+            await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}", buttons=_sub_btn(chat_id))
             raise events.StopPropagation
 
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-            await safe_edit(status_msg, "⚠️ HappyScribe failed, uploading original...")
+            await safe_edit(status_msg, "⚠️ HappyScribe failed, uploading original...", buttons=_sub_btn(chat_id))
             raise events.StopPropagation
 
         try:
@@ -6486,11 +6528,11 @@ async def subextr_callback(event):
     vid_duration, _, _ = await get_video_info(filepath)
     gh_line = ""
     if GITHUB_ENABLED:
-        await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+        await safe_edit(status_msg, "☁️ Uploading to GitHub...", buttons=_sub_btn(chat_id))
         gh_url = await maybe_upload_github(event.client, chat_id, filepath, size)
         if gh_url:
             gh_line = f"\n☁️ [GitHub DL]({gh_url})"
-        await safe_edit(status_msg, "📤 Uploading...")
+        await safe_edit(status_msg, "📤 Uploading...", buttons=_sub_btn(chat_id))
     _ul_id = f"ul_{chat_id}_{int(time.time())}"
     cap = build_video_caption(out_name, size, vid_duration, subtitle_name)
     if gh_line:
@@ -6519,6 +6561,10 @@ async def subextr_callback(event):
     raise events.StopPropagation
 
 
+def _sub_btn(chat_id: int):
+    return [[Button.inline("❌ Cancel", f"subburn_proc_cancel_{chat_id}")]]
+
+
 async def _burn_subtitle_split(
     event, chat_id: int, video_path: str, subtitle_path: str,
     subtitle_name: str, status_msg, orig_name: str,
@@ -6534,7 +6580,7 @@ async def _burn_subtitle_split(
     if num_parts < 2:
         return None
 
-    await safe_edit(status_msg, f"✂️ Splitting video into {num_parts} parts...")
+    await safe_edit(status_msg, f"✂️ Splitting video into {num_parts} parts...", buttons=_sub_btn(chat_id))
     base_name = os.path.splitext(os.path.basename(video_path))[0]
     split_dir = os.path.join(OUTPUT_FOLDER, f"split_{int(time.time())}")
     os.makedirs(split_dir, exist_ok=True)
@@ -6556,6 +6602,8 @@ async def _burn_subtitle_split(
     part_dur = total_dur / num_parts
 
     # Split by duration (segment muxer, re-encode to ensure clean keyframes)
+    if subburn_cancel.get(chat_id):
+        return None
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-y", "-i", video_path,
         "-c:v", "libx264", "-crf", "23", "-preset", "fast",
@@ -6576,13 +6624,15 @@ async def _burn_subtitle_split(
     processed = []
     try:
         for i, part_path in enumerate(parts):
+            if subburn_cancel.get(chat_id):
+                raise Exception("Cancelled by user")
             part_size = os.path.getsize(part_path)
             if part_size < 1024:
                 try: os.remove(part_path)
                 except: pass
                 continue
 
-            await safe_edit(status_msg, f"🔄 Part {i+1}/{len(parts)} — sending to HappyScribe...")
+            await safe_edit(status_msg, f"🔄 Part {i+1}/{len(parts)} — sending to HappyScribe...", buttons=_sub_btn(chat_id))
 
             # Get actual part duration for subtitle trim
             proc = await asyncio.create_subprocess_exec(
@@ -6610,20 +6660,26 @@ async def _burn_subtitle_split(
 
             sub_for_part = trimmed_sub if (os.path.exists(trimmed_sub) and os.path.getsize(trimmed_sub) > 0) else subtitle_path
 
+            if subburn_cancel.get(chat_id):
+                raise Exception("Cancelled by user")
+
             # HappyScribe
             async def _prog(t):
-                await safe_edit(status_msg, t)
+                await safe_edit(status_msg, t, buttons=_sub_btn(chat_id))
             dl_url, err = await hardcode_subtitle_online(
                 video_path=part_path, subtitle_path=sub_for_part,
                 progress_callback=_prog,
             )
             if not dl_url:
-                await safe_edit(status_msg, f"⚠️ Part {i+1} failed: {err[:80]}")
+                await safe_edit(status_msg, f"⚠️ Part {i+1} failed: {err[:80]}", buttons=_sub_btn(chat_id))
                 raise Exception(f"Part {i+1} failed")
+
+            if subburn_cancel.get(chat_id):
+                raise Exception("Cancelled by user")
 
             # Download result
             out_part = os.path.join(split_dir, f"done_{i:03d}.mp4")
-            await safe_edit(status_msg, f"⬇️ Downloading part {i+1}/{len(parts)}...")
+            await safe_edit(status_msg, f"⬇️ Downloading part {i+1}/{len(parts)}...", buttons=_sub_btn(chat_id))
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(dl_url, timeout=ClientTimeout(total=600)) as resp:
                     if resp.status != 200:
@@ -6637,8 +6693,11 @@ async def _burn_subtitle_split(
         if not processed:
             raise Exception("No parts processed")
 
+        if subburn_cancel.get(chat_id):
+            raise Exception("Cancelled by user")
+
         # Concatenate
-        await safe_edit(status_msg, "🔗 Joining parts...")
+        await safe_edit(status_msg, "🔗 Joining parts...", buttons=_sub_btn(chat_id))
         final_path = os.path.join(OUTPUT_FOLDER, f"merged_{int(time.time())}_{orig_name}")
         concat_file = os.path.join(split_dir, "concat.txt")
         with open(concat_file, "w") as f:
@@ -6658,9 +6717,13 @@ async def _burn_subtitle_split(
         if os.path.exists(final_path) and os.path.getsize(final_path) > 0:
             return final_path
     except Exception as e:
-        logger.error(f"[SPLIT-BURN] Error: {e}")
+        if str(e) == "Cancelled by user":
+            logger.info(f"[SPLIT-BURN] Cancelled by user for chat {chat_id}")
+        else:
+            logger.error(f"[SPLIT-BURN] Error: {e}")
     finally:
         shutil.rmtree(split_dir, ignore_errors=True)
+        subburn_cancel.pop(chat_id, None)
 
     return None
 
@@ -6784,7 +6847,7 @@ async def subburn_sel_callback(event):
     subtitle_name = sub_lang + (f" — {sub_title}" if sub_title else "")
     await event.answer("⏳ Extracting subtitle...", alert=False)
     try:
-        await event.edit("⏳ Extracting subtitle from video...", buttons=None)
+        await event.edit("⏳ Extracting subtitle from video...", buttons=_sub_btn(chat_id))
     except Exception:
         pass
     out_srt = os.path.join(OUTPUT_FOLDER, f"extracted_sub_{int(time.time())}.srt")
@@ -6804,12 +6867,16 @@ async def subburn_sel_callback(event):
             await event.edit("❌ Failed to extract subtitle.", buttons=None)
         except Exception:
             pass
+        try:
+            os.remove(video_path)
+        except Exception:
+            pass
         return
     # Check if video is too large for HappyScribe (490MB+)
     video_size_mb = os.path.getsize(video_path) / (1024 * 1024)
     out_name = os.path.splitext(orig_name)[0] + "_subtitled.mp4"
     if video_size_mb > 490:
-        await safe_edit(status_msg, f"📏 Video is {video_size_mb:.0f}MB — splitting into parts...")
+        await safe_edit(status_msg, f"📏 Video is {video_size_mb:.0f}MB — splitting into parts...", buttons=_sub_btn(chat_id))
         merged_path = await _burn_subtitle_split(
             event, chat_id, video_path, out_srt, subtitle_name,
             status_msg, orig_name,
@@ -6821,13 +6888,24 @@ async def subburn_sel_callback(event):
         if merged_path:
             filepath = merged_path
             size = os.path.getsize(filepath)
+        elif subburn_cancel.get(chat_id):
+            subburn_cancel.pop(chat_id, None)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            raise events.StopPropagation
         else:
-            await safe_edit(status_msg, "⚠️ Split-burn failed, uploading original...")
+            await safe_edit(status_msg, "⚠️ Split-burn failed, uploading original...", buttons=_sub_btn(chat_id))
             raise events.StopPropagation
     else:
-        await safe_edit(status_msg, "🔤 Subtitle extracted! Sending to HappyScribe...")
+        await safe_edit(status_msg, "🔤 Subtitle extracted! Sending to HappyScribe...", buttons=_sub_btn(chat_id))
         async def _prog(text):
-            await safe_edit(status_msg, text)
+            await safe_edit(status_msg, text, buttons=_sub_btn(chat_id))
         dl_url, err = await hardcode_subtitle_online(
             video_path=video_path,
             subtitle_path=out_srt,
@@ -6838,22 +6916,46 @@ async def subburn_sel_callback(event):
         except Exception:
             pass
         if not dl_url:
-            await safe_edit(status_msg, f"⚠️ HappyScribe error: {err[:80]}\nUploading original...")
+            await safe_edit(status_msg, f"⚠️ HappyScribe error: {err[:80]}\nUploading original...", buttons=_sub_btn(chat_id))
+            raise events.StopPropagation
+        if subburn_cancel.get(chat_id):
+            subburn_cancel.pop(chat_id, None)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            try:
+                os.remove(video_path)
+            except Exception:
+                pass
             raise events.StopPropagation
         out_path = os.path.join(OUTPUT_FOLDER, f"hs_{int(time.time())}_{out_name}")
-        await safe_edit(status_msg, "⬇️ Downloading result...")
+        await safe_edit(status_msg, "⬇️ Downloading result...", buttons=_sub_btn(chat_id))
         try:
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(dl_url, timeout=ClientTimeout(total=600)) as resp:
                     if resp.status == 200:
                         async with aiofiles.open(out_path, "wb") as f:
                             async for chunk in resp.content.iter_chunked(524288):
+                                if subburn_cancel.get(chat_id):
+                                    raise Exception("Cancelled by user")
                                 await f.write(chunk)
         except Exception as e:
-            await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}")
+            if str(e) == "Cancelled by user":
+                subburn_cancel.pop(chat_id, None)
+                try: os.remove(video_path)
+                except: pass
+                try: os.remove(out_path)
+                except: pass
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                raise events.StopPropagation
+            await safe_edit(status_msg, f"❌ Download error: {str(e)[:80]}", buttons=_sub_btn(chat_id))
             raise events.StopPropagation
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-            await safe_edit(status_msg, "⚠️ HappyScribe failed, uploading original...")
+            await safe_edit(status_msg, "⚠️ HappyScribe failed, uploading original...", buttons=_sub_btn(chat_id))
             raise events.StopPropagation
         try:
             os.remove(video_path)
@@ -6864,11 +6966,11 @@ async def subburn_sel_callback(event):
     vid_duration, _, _ = await get_video_info(filepath)
     gh_line = ""
     if GITHUB_ENABLED:
-        await safe_edit(status_msg, "☁️ Uploading to GitHub...")
+        await safe_edit(status_msg, "☁️ Uploading to GitHub...", buttons=_sub_btn(chat_id))
         gh_url = await maybe_upload_github(event.client, chat_id, filepath, size)
         if gh_url:
             gh_line = f"\n☁️ [GitHub DL]({gh_url})"
-        await safe_edit(status_msg, "📤 Uploading...")
+        await safe_edit(status_msg, "📤 Uploading...", buttons=_sub_btn(chat_id))
     _ul_id = f"subburn_{chat_id}_{int(time.time())}"
     cap = build_video_caption(out_name, size, vid_duration, subtitle_name)
     if gh_line:
@@ -6970,6 +7072,30 @@ async def subskip_callback(event):
             os.remove(video_path)
         except Exception:
             pass
+
+
+async def subburn_proc_cancel_callback(event):
+    """Cancel a running subtitle burn process mid-way."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+    raw = event.data.decode().replace("subburn_proc_cancel_", "")
+    try:
+        chat_id = int(raw.split("_")[0])
+    except Exception:
+        chat_id = int(raw)
+    subburn_cancel[chat_id] = True
+    session = subtitle_sessions.get(chat_id)
+    if session:
+        try:
+            os.remove(session.get("video_path", ""))
+        except Exception:
+            pass
+        subtitle_sessions.pop(chat_id, None)
+    await event.answer("🚫 Cancelling subtitle burn...", alert=False)
+    try:
+        await event.delete()
+    except Exception:
+        pass
 
 
 async def subtitle_cancel_callback(event):
@@ -12514,6 +12640,9 @@ async def main():
         subskip_callback, events.CallbackQuery(pattern=r"subskip_(.+)")
     )
     client.add_event_handler(
+        subburn_proc_cancel_callback, events.CallbackQuery(pattern=r"subburn_proc_cancel_(.+)")
+    )
+    bot.add_event_handler(
         subtitle_cancel_callback, events.CallbackQuery(pattern=r"subcancl_(.+)")
     )
     client.add_event_handler(
