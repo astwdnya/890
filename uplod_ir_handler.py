@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-هندلر آپلود فایل به سایت uplod.ir
----------------------------------
-- انتخاب فایل از طریق کلیک روی دکمه "انتخاب فایل"
-- کلیک روی دکمه "شروع اپلود"
-- نمایش درصد پیشرفت و سرعت آپلود به صورت زنده
-- استخراج لینک دانلود نهایی
+هندلر آپلود فایل به سایت uplod.ir (نسخه ضد-تشخیص)
+-------------------------------------------------
+- استفاده از Playwright با Stealth Mode کامل
+- هدرهای واقعی مرورگر شامل Client Hints (Sec-Ch-Ua, Sec-Fetch-*)
+- Pre-warm صفحه برای حل چالش JS  و دریافت کوکی session
+- Persistent Context برای حفظ کوکی‌ها بین اجراها
+- شبیه‌سازی رفتار کاربر (حرکت موس، scroll)
+- Retry logic با fallback
 
 استفاده:
     python3 uplod_ir_handler.py <file_path> [--headed] [--timeout 600] [--log out.log]
@@ -18,14 +20,16 @@
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
+import random
 from pathlib import Path
 from typing import Optional
 
 try:
-    from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
+    from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout, Response
 except ImportError:
     print("[ERR] playwright نصب نیست. ابتدا اجرا کنید:")
     print("  pip install playwright && playwright install chromium")
@@ -36,12 +40,15 @@ except ImportError:
 SITE_URL = "https://uplod.ir/"
 UPLOAD_PAGE = "https://uplod.ir/"
 FILE_INPUT_SELECTOR = "input#file_0"
-START_UPLOAD_BTN_TEXT = "شروع آپلود"          # دکمه شروع آپلود
+START_UPLOAD_BTN_TEXT = "شروع آپلود"          # دکمه شروع آپلود (ویرایش شده: آ ی)
 PROGRESS_DIV_SELECTOR = ".progress_div"
 PROGRESS_BAR_INNER = ".progressbar-inner"
 PROGRESS_COMPLETED = ".progressbar-completed"
 PROGRESS_SPEED = ".progressbar-speed"
 ABORT_LINK_TEXT = "Abort"
+
+# مسیر ذخیره پروفایل دائمی مرورگر (برای حفظ کوکی‌ها)
+PROFILE_DIR = "/tmp/uplod_ir_profile"
 
 # ---------- رنگ‌های ترمینال ----------
 class C:
@@ -59,9 +66,7 @@ class C:
 
 # ---------- توابع کمکی ----------
 def human_size(n: float) -> str:
-    """تبدیل بایت به واحد خوانا."""
-    if n is None:
-        return "?"
+    if n is None: return "?"
     n = float(n)
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if n < 1024.0:
@@ -71,7 +76,6 @@ def human_size(n: float) -> str:
 
 
 def render_progress_bar(pct: float, width: int = 30) -> str:
-    """رسم نوار پیشرفت."""
     if pct < 0: pct = 0
     if pct > 100: pct = 100
     filled = int(width * pct / 100)
@@ -80,7 +84,6 @@ def render_progress_bar(pct: float, width: int = 30) -> str:
 
 
 def log(msg: str, level: str = "INFO", color: str = C.WHT, log_file=None):
-    """لاگ رنگی ترمینال + فایل."""
     line = f"[{level}] {msg}"
     print(f"{color}{line}{C.R}", flush=True)
     if log_file:
@@ -91,6 +94,250 @@ def log(msg: str, level: str = "INFO", color: str = C.WHT, log_file=None):
             pass
 
 
+# ---------- اسکریپت Stealth کامل ----------
+# این اسکریپت قبل از لود هر صفحه اجرا می‌شه تا نشونه‌های اتوماسیون رو پاک کنه
+STEALTH_JS = r"""
+() => {
+    // 1) navigator.webdriver → undefined (مهم‌ترین نشانه)
+    try {
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+            configurable: true
+        });
+    } catch(e) {}
+
+    // 2) window.chrome object (نشان دهنده کروم واقعی)
+    if (!window.chrome) {
+        window.chrome = {
+            runtime: {},
+            loadTimes: function(){},
+            csi: function(){},
+            app: {},
+        };
+    }
+
+    // 3) navigator.plugins (کروم واقعی حداقل 3 پلاگین داره)
+    try {
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => {
+                const plugins = [
+                    {name: 'Chrome PDF Plugin'},
+                    {name: 'Chrome PDF Viewer'},
+                    {name: 'Native Client'},
+                ];
+                plugins.length = 3;
+                return plugins;
+            },
+            configurable: true
+        });
+    } catch(e) {}
+
+    // 4) navigator.languages
+    try {
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en', 'fa'],
+            configurable: true
+        });
+    } catch(e) {}
+
+    // 5) navigator.permissions - Patched to look normal
+    try {
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) =>
+            parameters.name === 'notifications'
+                ? Promise.resolve({state: Notification.permission})
+                : originalQuery(parameters);
+    } catch(e) {}
+
+    // 6) WebGL Vendor & Renderer (نشانه‌های کارت گرافیک واقعی)
+    try {
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Intel Inc.';          // UNMASKED_VENDOR_WEBGL
+            if (parameter === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
+            return getParameter.call(this, parameter);
+        };
+    } catch(e) {}
+
+    // 7) navigator.hardwareConcurrency (تعداد هسته‌های واقعی)
+    try {
+        Object.defineProperty(navigator, 'hardwareConcurrency', {
+            get: () => 8,
+            configurable: true
+        });
+    } catch(e) {}
+
+    // 8) navigator.deviceMemory
+    try {
+        Object.defineProperty(navigator, 'deviceMemory', {
+            get: () => 8,
+            configurable: true
+        });
+    } catch(e) {}
+
+    // 9) navigator.platform (به جای Linux، Windows نشون بده)
+    try {
+        Object.defineProperty(navigator, 'platform', {
+            get: () => 'Win32',
+            configurable: true
+        });
+    } catch(e) {}
+
+    // 10) navigator.userAgentData (Client Hints API)
+    try {
+        if (!navigator.userAgentData) {
+            navigator.userAgentData = {
+                brands: [
+                    {brand: 'Not.A/Brand', version: '8'},
+                    {brand: 'Chromium', version: '121'},
+                    {brand: 'Google Chrome', version: '121'}
+                ],
+                mobile: false,
+                platform: 'Windows',
+                getHighEntropyValues: () => Promise.resolve({
+                    architecture: 'x86',
+                    bitness: '64',
+                    fullVersionList: [
+                        {brand: 'Not.A/Brand', version: '8'},
+                        {brand: 'Chromium', version: '121'},
+                        {brand: 'Google Chrome', version: '121'}
+                    ],
+                    mobile: false,
+                    model: '',
+                    platform: 'Windows',
+                    platformVersion: '15.0.0',
+                    uaFullVersion: '121.0.6167.85'
+                })
+            };
+        }
+    } catch(e) {}
+
+    // 11) Hide automation in iframe contentWindow
+    try {
+        const elementDescriptor = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+        Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+            get: function() {
+                const frame = this;
+                const result = elementDescriptor.get.call(frame);
+                if (result) {
+                    try {
+                        Object.defineProperty(result, 'chrome', {value: window.chrome});
+                    } catch(e) {}
+                }
+                return result;
+            }
+        });
+    } catch(e) {}
+
+    // 12) Permissions API - mask notifications
+    try {
+        const originalQuery2 = navigator.permissions.query;
+        navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications'
+                ? Promise.resolve({state: Notification.permission})
+                : originalQuery2(parameters)
+        );
+    } catch(e) {}
+
+    // 13) navigator.connection (network info)
+    try {
+        if (!navigator.connection) {
+            Object.defineProperty(navigator, 'connection', {
+                value: {
+                    effectiveType: '4g',
+                    rtt: 50,
+                    downlink: 10,
+                    saveData: false
+                },
+                configurable: true
+            });
+        }
+    } catch(e) {}
+
+    // 14) Hide CDP runtime
+    try {
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+    } catch(e) {}
+
+    // 15) Mock toString to hide patches
+    try {
+        const originalToString = Function.prototype.toString;
+        Function.prototype.toString = function() {
+            if (this === window.navigator.permissions.query) {
+                return 'function query() { [native code] }';
+            }
+            return originalToString.call(this);
+        };
+    } catch(e) {}
+
+    // 16) navigator.vendor
+    try {
+        Object.defineProperty(navigator, 'vendor', {
+            get: () => 'Google Inc.',
+            configurable: true
+        });
+    } catch(e) {}
+
+    // 17) navigator.maxTouchPoints (desktop browser = 0)
+    try {
+        Object.defineProperty(navigator, 'maxTouchPoints', {
+            get: () => 0,
+            configurable: true
+        });
+    } catch(e) {}
+
+    // 18) window.outerWidth / outerHeight
+    try {
+        Object.defineProperty(window, 'outerWidth', {
+            get: () => window.innerWidth + 16,
+            configurable: true
+        });
+        Object.defineProperty(window, 'outerHeight', {
+            get: () => window.innerHeight + 88,
+            configurable: true
+        });
+    } catch(e) {}
+
+    // 19) screen properties
+    try {
+        Object.defineProperty(screen, 'availWidth', {get: () => 1920, configurable: true});
+        Object.defineProperty(screen, 'availHeight', {get: () => 1040, configurable: true});
+        Object.defineProperty(screen, 'width', {get: () => 1920, configurable: true});
+        Object.defineProperty(screen, 'height', {get: () => 1080, configurable: true});
+        Object.defineProperty(screen, 'colorDepth', {get: () => 24, configurable: true});
+        Object.defineProperty(screen, 'pixelDepth', {get: () => 24, configurable: true});
+    } catch(e) {}
+}
+"""
+
+
+# ---------- User-Agent و هدرهای واقعی ----------
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/121.0.0.0 Safari/537.36"
+)
+
+# هدرهای واقعی مرورگر - برای هر درخواست ست می‌شه
+EXTRA_HTTP_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9,fa;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "max-age=0",
+    "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
+}
+
+
 # ---------- کلاس اصلی هندلر ----------
 class UplodHandler:
     def __init__(
@@ -99,11 +346,13 @@ class UplodHandler:
         timeout: int = 600,
         log_file=None,
         verbose: bool = False,
+        persistent: bool = True,
     ):
         self.headed = headed
         self.timeout = timeout
         self.log_file = log_file
         self.verbose = verbose
+        self.persistent = persistent
         self.result: Optional[dict] = None
 
     # ---- لاگ داخلی ----
@@ -117,61 +366,135 @@ class UplodHandler:
             raise FileNotFoundError(f"فایل پیدا نشد: {file_path}")
 
         file_size = Path(file_path).stat().st_size
-        self._log(f"شروع هندلر آپلود uplod.ir", "INFO", C.CYN)
+        self._log("شروع هندلر آپلود uplod.ir (Stealth Mode)", "INFO", C.CYN)
         self._log(f"فایل: {file_path}", "INFO", C.WHT)
         self._log(f"حجم: {human_size(file_size)}", "INFO", C.WHT)
         self._log(f"مرورگر: {'نمایشی' if self.headed else 'بدون سر'}", "INFO", C.DIM)
+        self._log(f"Persistent: {self.persistent}", "INFO", C.DIM)
+
+        # اطمینان از وجود پوشه پروفایل
+        if self.persistent:
+            os.makedirs(PROFILE_DIR, exist_ok=True)
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=not self.headed,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/121.0.0.0 Safari/537.36"
-                ),
-                locale="fa-IR",
-                timezone_id="Asia/Tehran",
-            )
-            # مخفی کردن نشانه‌های اتوماسیون
-            context.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-            )
+            # تلاش با کانال chrome واقعی اگه نصب باشه، در غیر این صورت chromium
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-infobars",
+                "--window-position=0,0",
+                "--ignore-certificates-errors",
+                "--ignore-certificates-errors-spki-list",
+                "--enable-features=NetworkService,NetworkServiceInProcess",
+                "--disable-extensions",
+                "--disable-default-apps",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--password-store=basic",
+                "--use-mock-keychain",
+                "--enable-webgl",
+                "--enable-precise-memory-info",
+                "--lang=en-US,en",
+                f"--user-agent={USER_AGENT}",
+                "--remote-debugging-port=0",
+            ]
+
+            try:
+                if self.persistent:
+                    # استفاده از Persistent Context برای حفظ کوکی‌ها
+                    self._log(f"استفاده از پروفایل دائمی: {PROFILE_DIR}", "INFO", C.DIM)
+                    context = p.chromium.launch_persistent_context(
+                        user_data_dir=PROFILE_DIR,
+                        headless=not self.headed,
+                        args=launch_args,
+                        viewport={"width": 1920, "height": 1080},
+                        screen={"width": 1920, "height": 1080},
+                        user_agent=USER_AGENT,
+                        locale="en-US",
+                        timezone_id="Asia/Singapore",
+                        color_scheme="light",
+                        reduced_motion="no-preference",
+                        java_script_enabled=True,
+                        ignore_https_errors=True,
+                        extra_http_headers=EXTRA_HTTP_HEADERS,
+                    )
+                    browser = None  # در persistent mode، context باید close بشه
+                else:
+                    raise Exception("Falling back to non-persistent")
+
+            except Exception as e:
+                self._log(f"Persistent mode ناموفق: {e} - استفاده از حالت معمولی", "WRN", C.YLW)
+                browser = p.chromium.launch(
+                    headless=not self.headed,
+                    args=launch_args,
+                )
+                context = browser.new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    screen={"width": 1920, "height": 1080},
+                    user_agent=USER_AGENT,
+                    locale="en-US",
+                    timezone_id="Asia/Singapore",
+                    color_scheme="light",
+                    reduced_motion="no-preference",
+                    java_script_enabled=True,
+                    ignore_https_errors=True,
+                    extra_http_headers=EXTRA_HTTP_HEADERS,
+                )
+
+            # اضافه کردن Stealth Script به context
+            # این اسکریپت قبل از لود هر صفحه اجرا می‌شه
+            context.add_init_script(STEALTH_JS)
+
             page = context.new_page()
             page.set_default_timeout(self.timeout * 1000)
+
+            # اضافه کردن هدرهای اضافی به page level
+            try:
+                page.set_extra_http_headers(EXTRA_HTTP_HEADERS)
+            except Exception:
+                pass
+
+            # شبیه‌سازی mouse و keyboard واقعی
+            try:
+                page.mouse.move(100, 100)
+                page.mouse.move(200, 200, steps=10)
+            except Exception:
+                pass
 
             try:
                 result = self._run_flow(page, file_path, file_size)
             finally:
-                # ذخیره عکس صفحه نهایی برای دیباگ
                 try:
                     snapshot_path = "/home/z/my-project/scripts/last_state.png"
+                    if not os.path.exists(os.path.dirname(snapshot_path)):
+                        snapshot_path = "/tmp/last_state.png"
                     page.screenshot(path=snapshot_path, full_page=False)
                     self._log(f"عکس وضعیت نهایی: {snapshot_path}", "DBG", C.DIM)
                 except Exception:
                     pass
+                # ذخیره کوکی‌ها برای دیباگ
+                try:
+                    cookies = context.cookies()
+                    self._log(f"کوکی‌های session: {len(cookies)}", "DBG", C.DIM)
+                    if self.verbose:
+                        for c in cookies:
+                            self._log(f"  - {c['name']}={c['value'][:30]}...", "DBG", C.DIM)
+                except Exception:
+                    pass
                 context.close()
-                browser.close()
+                if browser:
+                    browser.close()
 
         self.result = result
         return result
 
     # ---- جریان اصلی ----
     def _run_flow(self, page: Page, file_path: str, file_size: int) -> dict:
-        # 1) باز کردن سایت
-        self._log(f"باز کردن سایت: {SITE_URL}", "STEP", C.YLW)
-        try:
-            page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60_000)
-        except PWTimeout:
-            raise RuntimeError("Timeout در باز کردن سایت - احتمالاً سایت در دسترس نیست")
+        # 1) باز کردن سایت با retry و pre-warming
+        if not self._open_site_with_retry(page):
+            raise RuntimeError("سایت پس از چند تلاش قابل دسترس نبود (403/timeout)")
 
         # بررسی 403
         if "403" in page.title() or "Forbidden" in page.title():
@@ -180,20 +503,19 @@ class UplodHandler:
             )
 
         self._log(f"عنوان صفحه: {page.title()}", "INFO", C.GRN)
+        self._log(f"URL فعلی: {page.url}", "INFO", C.DIM)
 
         # 2) انتظار برای input فایل
         self._log("جستجوی دکمه «انتخاب فایل»...", "STEP", C.YLW)
         try:
             page.wait_for_selector(FILE_INPUT_SELECTOR, state="attached", timeout=30_000)
         except PWTimeout:
-            # شاید لازم باشد روی تب «آپلود فایل» کلیک شود
             try:
                 page.click("#select_file", timeout=5_000)
                 page.wait_for_selector(FILE_INPUT_SELECTOR, state="attached", timeout=15_000)
             except Exception:
                 raise RuntimeError("دکمه انتخاب فایل پیدا نشد")
 
-        # اسکرول به محل دکمه
         try:
             page.evaluate(
                 "document.querySelector('#file_0').scrollIntoView({block:'center'})"
@@ -201,14 +523,29 @@ class UplodHandler:
         except Exception:
             pass
 
-        # 3) تنظیم فایل روی input (معادل کلیک و انتخاب)
+        # حرکت موس به محل دکمه برای شبیه‌سازی کاربر
+        try:
+            file_input = page.query_selector(FILE_INPUT_SELECTOR)
+            if file_input:
+                box = file_input.bounding_box()
+                if box:
+                    page.mouse.move(
+                        box["x"] + box["width"] / 2,
+                        box["y"] + box["height"] / 2,
+                        steps=15
+                    )
+                    time.sleep(random.uniform(0.3, 0.8))
+        except Exception:
+            pass
+
+        # 3) تنظیم فایل روی input
         self._log(f"انتخاب فایل: {Path(file_path).name}", "STEP", C.YLW)
         page.set_input_files(FILE_INPUT_SELECTOR, file_path)
 
-        # 4) انتظار برای ظاهر شدن دکمه «شروع اپلود»
-        self._log("صبر برای ظاهر شدن دکمه «شروع اپلود»...", "STEP", C.YLW)
+        # 4) انتظار برای ظاهر شدن دکمه «شروع آپلود»
+        self._log("صبر برای ظاهر شدن دکمه «شروع آپلود»...", "STEP", C.YLW)
         start_btn = None
-        for attempt in range(30):  # 15 ثانیه
+        for attempt in range(40):  # 20 ثانیه
             try:
                 # دکمه شروع آپلود به صورت dynamic ساخته می‌شود
                 start_btn = page.query_selector(
@@ -216,26 +553,29 @@ class UplodHandler:
                 )
                 if start_btn and start_btn.is_visible():
                     break
+                # fallback: جستجوی دکمه با value مشابه
+                start_btn = page.query_selector(
+                    '#upload_controls input[type="button"][value*="اپلود"]'
+                )
+                if start_btn and start_btn.is_visible():
+                    break
             except Exception:
                 pass
             time.sleep(0.5)
         else:
-            # fallback: جستجو با متن
             try:
                 start_btn = page.get_by_role("button", name=START_UPLOAD_BTN_TEXT)
             except Exception:
                 pass
 
         if not start_btn:
-            # شاید فایل انتخاب نشده یا رد شده
             self._dump_page_state(page)
-            raise RuntimeError("دکمه «شروع اپلود» ظاهر نشد - احتمالاً فایل رد شده است")
+            raise RuntimeError("دکمه «شروع آپلود» ظاهر نشد - احتمالاً فایل رد شده است")
 
-        self._log("دکمه «شروع اپلود» پیدا شد", "OK", C.GRN)
+        self._log("دکمه «شروع آپلود» پیدا شد", "OK", C.GRN)
 
         # 5) کلیک شروع آپلود
-        self._log("کلیک روی «شروع اپلود» ...", "STEP", C.YLW)
-        # ثبت هدر response برای گرفتن لینک نهایی
+        self._log("کلیک روی «شروع آپلود» ...", "STEP", C.YLW)
         final_urls = []
         def on_response(resp):
             try:
@@ -247,9 +587,17 @@ class UplodHandler:
         page.on("response", on_response)
 
         try:
+            # شبیه‌سازی حرکت موس قبل از کلیک
+            box = start_btn.bounding_box()
+            if box:
+                page.mouse.move(
+                    box["x"] + box["width"] / 2,
+                    box["y"] + box["height"] / 2,
+                    steps=10
+                )
+                time.sleep(random.uniform(0.2, 0.5))
             start_btn.click()
         except Exception as e:
-            # fallback: کلیک با JS
             page.evaluate(
                 f"""() => {{
                     const btn = document.querySelector('#upload_controls input[value="{START_UPLOAD_BTN_TEXT}"]');
@@ -266,6 +614,75 @@ class UplodHandler:
         link = self._extract_download_link(page, final_urls)
         result["download_link"] = link
         return result
+
+    # ---- باز کردن سایت با retry ----
+    def _open_site_with_retry(self, page: Page, max_retries: int = 3) -> bool:
+        """سایت رو با retry باز می‌کنه و در صورت نیاز pre-warm انجام می‌ده."""
+        for attempt in range(max_retries):
+            self._log(f"باز کردن سایت (تلاش {attempt+1}/{max_retries}): {SITE_URL}", "STEP", C.YLW)
+            try:
+                # مرحله 1: goto با wait_until=commit (سریع‌ترین)
+                # این کار کوکی‌های اولیه و session رو دریافت می‌کنه
+                page.goto(SITE_URL, wait_until="commit", timeout=60_000)
+
+                # مرحله 2: صبر برای load کامل
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                except Exception:
+                    pass
+
+                # مرحله 3: pre-warm - 3-5 ثانیه صبر برای حل چالش JS احتمالی
+                wait_sec = random.uniform(3.0, 5.0)
+                self._log(f"Pre-warm: صبر {wait_sec:.1f}s برای حل چالش JS...", "INFO", C.DIM)
+                time.sleep(wait_sec)
+
+                # مرحله 4: اگه صفحه redirect شده یا title عوض شده، چک کن
+                cur_title = ""
+                try:
+                    cur_title = page.title()
+                except Exception:
+                    pass
+
+                if "403" in cur_title or "Forbidden" in cur_title:
+                    self._log(f"تلاش {attempt+1}: 403 Forbidden - در حال retry...", "WRN", C.YLW)
+                    # پاک کردن کوکی‌ها و retry
+                    time.sleep(random.uniform(2.0, 4.0))
+                    continue
+
+                # مرحله 5: صبر برای networkidle (صفحه کامل لود شده)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15_000)
+                except Exception:
+                    pass
+
+                # مرحله 6: شبیه‌سازی scroll و حرکت موس
+                try:
+                    page.mouse.move(random.randint(100, 800), random.randint(100, 600), steps=15)
+                    page.evaluate("window.scrollBy(0, 100)")
+                    time.sleep(0.5)
+                    page.evaluate("window.scrollBy(0, -100)")
+                except Exception:
+                    pass
+
+                # بررسی نهایی
+                cur_title = page.title()
+                if "403" in cur_title or "Forbidden" in cur_title:
+                    self._log(f"تلاش {attempt+1}: همچنان 403 - retry...", "WRN", C.YLW)
+                    continue
+
+                self._log("سایت با موفقیت باز شد", "OK", C.GRN)
+                return True
+
+            except PWTimeout:
+                self._log(f"تلاش {attempt+1}: Timeout - retry...", "WRN", C.YLW)
+                time.sleep(random.uniform(2.0, 4.0))
+                continue
+            except Exception as e:
+                self._log(f"تلاش {attempt+1}: خطا - {e}", "WRN", C.YLW)
+                time.sleep(random.uniform(2.0, 4.0))
+                continue
+
+        return False
 
     # ---- مانیتورینگ درصد + سرعت ----
     def _monitor_progress(self, page: Page, total_size: int, file_path: str) -> dict:
@@ -287,11 +704,9 @@ class UplodHandler:
             "abort": False,
         }
 
-        # تایم‌اوت کلی
         deadline = start_ts + self.timeout
         while time.time() < deadline:
             try:
-                # خواندن درصد از width نوار پیشرفت
                 pct = -1.0
                 try:
                     inner = page.query_selector(PROGRESS_BAR_INNER)
@@ -300,7 +715,6 @@ class UplodHandler:
                         m = re.search(r"width:\s*([0-9.]+)", style)
                         if m:
                             pct = float(m.group(1))
-                        # اگر به صورت درصد نبود و عرض پیکسل بود، نسبت بگیر
                         elif "px" in style:
                             outer = page.query_selector(".progressbar-outer")
                             if outer:
@@ -311,7 +725,6 @@ class UplodHandler:
                 except Exception:
                     pass
 
-                # خواندن متن completed و speed
                 try:
                     comp_el = page.query_selector(PROGRESS_COMPLETED)
                     completed_text = comp_el.inner_text() if comp_el else ""
@@ -323,7 +736,6 @@ class UplodHandler:
                 except Exception:
                     speed_text = ""
 
-                # تخمین درصد اگر پیدا نبود
                 if pct < 0 and completed_text:
                     m = re.search(r"([\d.]+)\s*(B|KB|MB|GB)\s+of\s+([\d.]+)\s*(B|KB|MB|GB)",
                                   completed_text, re.I)
@@ -338,47 +750,39 @@ class UplodHandler:
                         if total_b > 0:
                             pct = loaded_b / total_b * 100
 
-                # اگر درصد معتبر است
                 if pct >= 0:
                     if pct > max_pct:
                         max_pct = pct
-                    # تخمین سرعت از متن (مثلا "Upload speed: 1.2 MB/s")
                     spd_bps = self._parse_speed(speed_text)
                     if spd_bps is not None and spd_bps > max_speed_bps:
                         max_speed_bps = spd_bps
 
-                    # نمایش خط زنده
                     if pct != last_pct or speed_text != last_speed:
                         self._print_live(pct, speed_text, completed_text, start_ts)
                         last_pct = pct
                         last_speed = speed_text
                         last_completed = completed_text
 
-                    # اتمام؟
                     if pct >= 99.5:
                         stable_finish_count += 1
                         if stable_finish_count >= 3:
                             self._print_live(100.0, speed_text, completed_text, start_ts)
                             self._log("آپلود به 100٪ رسید", "OK", C.GRN)
-                            # صبر برای redirect صفحه به صفحه نتیجه
                             self._wait_for_redirect(page, deadline)
                             break
                     else:
                         stable_finish_count = 0
                 else:
-                    # شاید صفحه redirect شده یا آپلود سریع تمام شده
                     cur_url = page.url
                     if "st=" in cur_url and "fn=" in cur_url:
                         self._log("آپلود کامل شد (redirect تشخیص داده شد)", "OK", C.GRN)
                         break
-                    # یا صفحه نتیجه بارگذاری شده
                     try:
                         if page.query_selector('.dlurl') or page.query_selector('a[href*="/"]'):
                             self._log("صفحه نتیجه تشخیص داده شد", "OK", C.GRN)
                             break
                     except Exception:
                         pass
-                    # یا متن abort ظاهر شده
                     try:
                         if page.query_selector(PROGRESS_BAR_INNER) is None:
                             time.sleep(0.3)
@@ -408,10 +812,8 @@ class UplodHandler:
         result["max_percent"] = round(max_pct, 2)
         result["max_speed_bps"] = round(max_speed_bps, 2)
         if duration > 0 and max_pct > 0:
-            # سرعت میانگین تقریبی
             result["average_speed_bps"] = round(total_size * (max_pct / 100) / duration, 2)
 
-        # لاگ نهایی
         self._log(
             f"پایان مانیتورینگ: max={result['max_percent']}% "
             f"avg_speed={human_size(result['average_speed_bps'])}/s "
@@ -421,7 +823,6 @@ class UplodHandler:
         return result
 
     def _wait_for_redirect(self, page: Page, deadline: float, max_wait: float = 15.0):
-        """پس از رسیدن به 100٪، صبر می‌کند تا صفحه به صفحه نتیجه redirect شود."""
         start = time.time()
         initial_url = page.url
         self._log("صبر برای redirect به صفحه نتیجه...", "INFO", C.DIM)
@@ -431,7 +832,6 @@ class UplodHandler:
                 if cur != initial_url:
                     self._log(f"صفحه به {cur} منتقل شد", "OK", C.GRN)
                     return True
-                # چک کردن وجود المان‌های صفحه نتیجه
                 try:
                     if page.query_selector('.dlurl'):
                         self._log("صفحه نتیجه بارگذاری شد", "OK", C.GRN)
@@ -445,7 +845,6 @@ class UplodHandler:
         return False
 
     def _parse_speed(self, text: str) -> Optional[float]:
-        """Parse 'Upload speed: 1.5 MB/s' -> bytes/sec."""
         if not text:
             return None
         m = re.search(r"([\d.]+)\s*(B|KB|MB|GB)/s", text, re.I)
@@ -457,10 +856,8 @@ class UplodHandler:
         return v * mult[u]
 
     def _print_live(self, pct: float, speed_text: str, completed_text: str, start_ts: float):
-        """چاپ زنده خط پیشرفت."""
         elapsed = time.time() - start_ts
         bar = render_progress_bar(pct, 30)
-        # فیلتر کردن speed text
         spd = speed_text.replace("Upload speed:", "").strip() if speed_text else ""
         comp = completed_text.replace("of", "از").strip() if completed_text else ""
         line = (
@@ -480,7 +877,7 @@ class UplodHandler:
         cur_url = page.url
         self._log(f"URL نهایی: {cur_url}", "INFO", C.DIM)
 
-        # 0) جستجوی textarea[name="download_links"] (محل اصلی لینک بعد از آپلود موفق)
+        # 0) جستجوی textarea[name="download_links"]
         try:
             ta = page.query_selector('textarea[name="download_links"]')
             if ta:
@@ -502,7 +899,6 @@ class UplodHandler:
 
         # 2) جستجو در صفحه
         try:
-            # ممکن است لینک در صفحه نمایش داده شود
             selectors = [
                 'input.dlurl',
                 'input[name="fn"]',
@@ -517,13 +913,11 @@ class UplodHandler:
                         val = el.get_attribute("value") or el.get_attribute("href") or ""
                         if not val:
                             continue
-                        # اگه مستقیم URL بود
                         if "uplod.ir/" in val:
                             mm = re.search(r"uplod\.ir/([a-z0-9]{8,})", val, re.I)
                             if mm:
                                 return f"https://uplod.ir/{mm.group(1)}"
                             return val
-                        # اگه فقط کد فایل بود
                         if re.match(r"^[a-z0-9]{10,}$", val, re.I):
                             return f"https://uplod.ir/{val}"
                 except Exception:
@@ -531,7 +925,7 @@ class UplodHandler:
         except Exception:
             pass
 
-        # 3) جستجو در URLهای response (شامل s6.uplod.ir و mock endpoint)
+        # 3) جستجو در URLهای response
         for status, u in reversed(final_urls):
             if status == 200 and "fn=" in u:
                 m = re.search(r"fn=([^&]+)", u)
@@ -541,27 +935,23 @@ class UplodHandler:
         # 4) جستجو در محتوای صفحه
         try:
             body = page.content()
-            # الگوی کد فایل: 12 کاراکتر hex
             m = re.search(r'(https?://[^\s"\']+uplod\.ir/[a-z0-9]{8,})', body, re.I)
             if m:
                 return m.group(1)
-            # یا فقط کد 12 hex
             m = re.search(r'\b([a-f0-9]{12})\b', body)
             if m:
-                # فقط در صورتی که در input.dlurl یا context مناسب باشد
                 if 'dlurl' in body or 'file_code' in body:
                     return f"https://uplod.ir/{m.group(1)}"
         except Exception:
             pass
 
-        return cur_url  # fallback: خود URL فعلی رو برگردون
+        return cur_url
 
     # ---- دیباگ ----
     def _dump_page_state(self, page: Page):
         try:
             self._log(f"URL: {page.url}", "DBG", C.DIM)
             self._log(f"title: {page.title()}", "DBG", C.DIM)
-            # چک کردن alert/error
             body_text = page.inner_text("body")[:500]
             self._log(f"body excerpt: {body_text}", "DBG", C.DIM)
         except Exception:
@@ -571,7 +961,7 @@ class UplodHandler:
 # ---------- CLI ----------
 def main():
     parser = argparse.ArgumentParser(
-        description="هندلر آپلود فایل به uplod.ir",
+        description="هندلر آپلود فایل به uplod.ir (Stealth Mode)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 مثال:
@@ -586,6 +976,8 @@ def main():
     parser.add_argument("--log", help="فایل لاگ", default=None)
     parser.add_argument("--json", help="ذخیره نتیجه در فایل JSON", default=None)
     parser.add_argument("--verbose", "-v", action="store_true", help="خروجی پرجزئیات")
+    parser.add_argument("--no-persistent", action="store_true",
+                        help="عدم استفاده از پروفایل دائمی (هر بار مرورگر تازه)")
     args = parser.parse_args()
 
     log_fh = open(args.log, "a", encoding="utf-8") if args.log else None
@@ -596,6 +988,7 @@ def main():
             timeout=args.timeout,
             log_file=log_fh,
             verbose=args.verbose,
+            persistent=not args.no_persistent,
         )
         result = handler.upload(args.file)
     except KeyboardInterrupt:
@@ -609,7 +1002,6 @@ def main():
     finally:
         if log_fh: log_fh.close()
 
-    # چاپ نتیجه نهایی
     print()
     print(f"{C.BOLD}{C.CYN}════════════════════════════════════════{C.R}")
     print(f"{C.BOLD}گزارش نهایی آپلود{C.R}")
