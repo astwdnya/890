@@ -6213,89 +6213,163 @@ async def uplod_callback(event):
     if not batch or not batch.get("files"):
         return await event.answer("❌ Session expired.", alert=True)
 
-    await event.answer("⏳ Uploading to uplod.ir...", alert=False)
+    await event.answer("⏳ Working...", alert=False)
 
-    try:
-        await event.edit("⏳ Preparing upload to uplod.ir...", buttons=None)
-    except Exception:
-        pass
+    log_lines = []
+    def log_msg(msg):
+        log_lines.append(msg)
+        logger.info(f"[UPLOD] {msg}")
+
+    async def update_status(text):
+        try:
+            await event.edit(text, buttons=None, parse_mode="md")
+        except Exception:
+            pass
 
     files = batch["files"]
     chat_id = batch["chat_id"]
     links = []
 
+    log_msg(f"📦 Found {len(files)} file(s) in batch")
+    await update_status(f"📦 Found {len(files)} file(s)\n⏳ Starting upload process...")
+
     for i, file_info in enumerate(files):
         msg_id = file_info["message_id"]
         filename = file_info["filename"]
+        status = f"📄 **File {i + 1}/{len(files)}:** `{filename}`\n"
 
         tmp_path = os.path.join(
             OUTPUT_FOLDER, f"uplod_{int(time.time())}_{i}_{filename}"
         )
+        file_size = 0
         try:
-            try:
-                await event.edit(
-                    f"⬇️ Downloading {i + 1}/{len(files)}: `{filename}`...",
-                    parse_mode="markdown",
-                    buttons=None,
-                )
-            except Exception:
-                pass
+            # ── Step 1: Download from Telegram ──
+            log_msg(f"⬇️ Downloading: {filename}")
+            await update_status(status + "⬇️ Step 1/5: Downloading file from Telegram...")
 
             msg = await event.client.get_messages(chat_id, ids=msg_id)
             if not msg:
-                logger.warning(f"[UPLOD] Message {msg_id} not found")
+                log_msg(f"❌ Message {msg_id} not found")
+                status += f"❌ Message not found (ID: {msg_id})\n"
+                await update_status(status)
                 continue
 
             await event.client.download_media(msg, file=tmp_path)
 
             if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
-                logger.warning(f"[UPLOD] Download failed for {filename}")
+                log_msg(f"❌ Download failed — file empty or missing")
+                status += "❌ Download failed — file empty or missing\n"
+                await update_status(status)
                 continue
 
+            file_size = os.path.getsize(tmp_path)
+            log_msg(f"✅ Downloaded: {filename} ({human_readable_size(file_size)})")
+            status += f"✅ Downloaded ({human_readable_size(file_size)})\n"
+            await update_status(status + "⬆️ Step 2/5: Starting uplod.ir uploader...")
+
+            # ── Step 2: Import UplodHandler ──
+            log_msg(f"📦 Importing UplodHandler...")
             try:
-                await event.edit(
-                    f"☁️ Uploading {i + 1}/{len(files)} to uplod.ir...",
-                    buttons=None,
-                )
-            except Exception:
-                pass
+                from uplod_ir_handler import UplodHandler
+            except ImportError as ie:
+                log_msg(f"❌ Failed to import UplodHandler: {ie}")
+                status += f"❌ ImportError: {ie}\n"
+                status += "❗ playwright not installed? Try: `pip install playwright && playwright install chromium`\n"
+                await update_status(status)
+                continue
+            log_msg(f"✅ UplodHandler imported")
+            status += "✅ uplod.ir handler loaded\n"
 
-            from uplod_ir_handler import UplodHandler
+            # ── Step 3: Launch browser & upload ──
+            log_msg(f"🌐 Launching browser & uploading to uplod.ir...")
+            await update_status(status + "🌐 Step 3/5: Launching browser & selecting file...")
+
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: UplodHandler(timeout=900, verbose=False).upload(tmp_path),
-            )
+            result = None
+            try:
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: UplodHandler(
+                        timeout=900, verbose=False, log_file=None
+                    ).upload(tmp_path),
+                )
+            except Exception as upload_err:
+                err_msg = f"{type(upload_err).__name__}: {upload_err}"
+                log_msg(f"❌ Upload exception: {err_msg}")
+                status += f"❌ Upload failed: `{err_msg}`\n"
+                import traceback
+                tb = traceback.format_exc()
+                log_msg(f"Traceback:\n{tb}")
+                if len(status + f"📋 Traceback:\n`{tb[:1500]}`\n") < 3800:
+                    status += f"📋 Traceback:\n`{tb[:1500]}`\n"
+                await update_status(status)
+                continue
 
+            if not result:
+                log_msg(f"❌ No result object returned from upload")
+                status += "❌ Upload returned no result\n"
+                await update_status(status)
+                continue
+
+            # ── Step 4: Parse result ──
             link = result.get("download_link", "")
+            max_pct = result.get("max_percent", 0)
+            duration = result.get("duration_sec", 0)
+            avg_speed = result.get("average_speed_bps", 0)
+            file_size_result = result.get("size_human", "")
+
+            log_msg(f"📊 Upload result: {max_pct}% | {duration}s | {human_readable_size(avg_speed)}/s")
+            log_msg(f"🔗 Link: {link if link else 'NO LINK'}")
+
             if link:
                 links.append(link)
-                logger.info(f"[UPLOD] Success: {link}")
+                status += f"✅ Upload complete!\n"
+                status += f"📊 {max_pct}% | ⏱ {duration}s | 🚀 {human_readable_size(avg_speed)}/s\n"
+                status += f"🔗 **Link:** {link}\n"
             else:
-                logger.warning(f"[UPLOD] No link returned for {filename}")
+                status += f"❌ No download link returned\n"
+                status += f"📊 max_percent={max_pct}%\n"
+                if file_size_result:
+                    status += f"📦 size={file_size_result}\n"
+                log_msg(f"❌ Result dict keys: {list(result.keys())}")
+
+            await update_status(status)
 
         except Exception as e:
-            logger.error(f"[UPLOD] Error uploading {filename}: {e}", exc_info=True)
+            err_msg = f"{type(e).__name__}: {e}"
+            log_msg(f"❌ Unhandled error: {err_msg}")
+            import traceback
+            tb = traceback.format_exc()
+            log_msg(f"Traceback:\n{tb}")
+            status += f"❌ Error: `{err_msg}`\n"
+            if len(status + f"📋 Traceback:\n`{tb[:1500]}`\n") < 3800:
+                status += f"📋 Traceback:\n`{tb[:1500]}`\n"
+            await update_status(status)
         finally:
             if os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
-                except Exception:
-                    pass
+                    log_msg(f"🧹 Cleaned up temp file: {tmp_path}")
+                except Exception as e:
+                    log_msg(f"⚠️ Failed to clean up: {e}")
 
+    # ── Final result ──
     if not links:
+        final = "❌ **Upload failed — no link received.**\n\n"
+        final += "📋 **Full log:**\n" + "\n".join(log_lines[-20:])
         try:
-            await event.edit("❌ Upload failed — no link received.", buttons=None)
+            await event.edit(final, buttons=None, parse_mode="md")
         except Exception:
             pass
         return await event.answer("❌ Upload failed.", alert=True)
 
-    msg = "✅ **Uploaded to uplod.ir:**\n\n"
+    final = f"✅ **Uploaded {len(links)} file(s) to uplod.ir:**\n\n"
     for link in links:
-        msg += f"🔗 {link}\n"
+        final += f"🔗 {link}\n"
+    final += "\n📋 **Log:**\n" + "\n".join(log_lines[-10:])
 
     try:
-        await event.edit(msg, buttons=None, parse_mode="markdown", link_preview=False)
+        await event.edit(final, buttons=None, parse_mode="md", link_preview=False)
     except Exception:
         pass
     await event.answer("✅ Upload complete!", alert=False)
