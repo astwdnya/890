@@ -6282,17 +6282,43 @@ async def uplod_callback(event):
 
             # ── Step 3: Launch browser & upload ──
             log_msg(f"🌐 Launching browser & uploading to uplod.ir...")
-            await update_status(status + "🌐 Step 3/5: Launching browser & selecting file...")
+            await update_status(status + "🌐 Step 3/5: Launching browser & uploading to `https://uplod.ir/`...\n⏳ Transfer may take a while depending on file size & network.")
+
+            # Show periodic "still alive" updates while upload runs in executor
+            async def keep_alive(status_ref):
+                dots = 0
+                while True:
+                    await asyncio.sleep(10)
+                    dots = (dots + 1) % 4
+                    bar = "⏳" + "." * dots
+                    try:
+                        await event.edit(
+                            status_ref + f"\n{bar} Still uploading... (check console for progress)",
+                            buttons=None, parse_mode="md",
+                        )
+                    except Exception:
+                        pass
 
             loop = asyncio.get_event_loop()
             result = None
+            ka_task = asyncio.create_task(keep_alive(status))
             try:
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: UplodHandler(
-                        timeout=900, verbose=False, log_file=None
-                    ).upload(tmp_path),
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda p=tmp_path: UplodHandler(
+                            timeout=120, verbose=True, log_file=None
+                        ).upload(p),
+                    ),
+                    timeout=180,
                 )
+            except asyncio.TimeoutError:
+                log_msg(f"❌ Upload timed out after 180 seconds")
+                status += "❌ Upload timed out (180s)\n"
+                status += "🌐 The site `uplod.ir` may be blocked or unreachable.\n"
+                ka_task.cancel()
+                await update_status(status)
+                continue
             except Exception as upload_err:
                 err_msg = f"{type(upload_err).__name__}: {upload_err}"
                 log_msg(f"❌ Upload exception: {err_msg}")
@@ -6302,8 +6328,11 @@ async def uplod_callback(event):
                 log_msg(f"Traceback:\n{tb}")
                 if len(status + f"📋 Traceback:\n`{tb[:1500]}`\n") < 3800:
                     status += f"📋 Traceback:\n`{tb[:1500]}`\n"
+                ka_task.cancel()
                 await update_status(status)
                 continue
+            finally:
+                ka_task.cancel()
 
             if not result:
                 log_msg(f"❌ No result object returned from upload")

@@ -36,7 +36,7 @@ except ImportError:
 SITE_URL = "https://uplod.ir/"
 UPLOAD_PAGE = "https://uplod.ir/"
 FILE_INPUT_SELECTOR = "input#file_0"
-START_UPLOAD_BTN_TEXT = "شروع اپلود"          # دکمه شروع آپلود
+START_UPLOAD_BTN_TEXT = "شروع آپلود"          # دکمه شروع آپلود
 PROGRESS_DIV_SELECTOR = ".progress_div"
 PROGRESS_BAR_INNER = ".progressbar-inner"
 PROGRESS_COMPLETED = ".progressbar-completed"
