@@ -37,8 +37,6 @@ from telethon.tl.types import (
     InputMediaUploadedDocument,
     InputWebDocument,
     DocumentAttributeImageSize,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
 )
 from FastTelethon import upload_file as fast_upload_file
 from github import (
@@ -4510,10 +4508,6 @@ async def start_cmd(event):
 
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
-    keyboard = ReplyKeyboardMarkup(
-        [[KeyboardButton("🔍 Change Search Engine")]],
-        resize=True,
-    )
     await event.reply(
         "🚀 **Ultimate Bot v5**\n\n"
         "• `/dirpy <url>` → Download video\n"
@@ -4524,13 +4518,13 @@ async def start_cmd(event):
         "• `/pdfimg <url>` → Download all images\n"
         "• `/github` → GitHub upload status\n"
         "• `/startgithub` → Enable GitHub upload\n"
-        "• `/stopgithub` → Disable GitHub upload\n\n"
+        "• `/stopgithub` → Disable GitHub upload\n"
+        "• `/setsearch` → Change default inline search engine\n\n"
         "**Inline search:** `@telformatbot hardcore` — searches your default engine\n"
         "**Override:** `ph:xxx` `xv:xxx` `ep:xxx` `xn:xxx`\n\n"
         "**During download:** ⏸ Pause  •  ❌ Cancel\n"
         "**After download:** 🗜 Compress  •  ✅ Delete",
         parse_mode="markdown",
-        buttons=keyboard,
     )
 
 
@@ -5837,6 +5831,9 @@ async def _flush_video_send_batch(
     # دکمه اشتراک‌گذاری با لینک
     buttons.append([Button.inline("🔗 Share Link", f"sharelink_{batch_key}")])
 
+    # دکمه آپلود به uplod.ir
+    buttons.append([Button.inline("📤 Upload to uplod.ir", f"uplod_{batch_key}")])
+
     if GITHUB_ENABLED:
         buttons.append([Button.inline("☁️ Upload to GitHub", f"vgh_batch_{batch_key}")])
 
@@ -6202,6 +6199,106 @@ async def sharelink_callback(event):
         )
     except Exception:
         pass
+
+
+# ====================== UPLOD HANDLER ======================
+
+async def uplod_callback(event):
+    """Upload video to uplod.ir and return download link."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+
+    batch_key = event.data.decode().replace("uplod_", "")
+    batch = video_send_pending.get(batch_key)
+    if not batch or not batch.get("files"):
+        return await event.answer("❌ Session expired.", alert=True)
+
+    await event.answer("⏳ Uploading to uplod.ir...", alert=False)
+
+    try:
+        await event.edit("⏳ Preparing upload to uplod.ir...", buttons=None)
+    except Exception:
+        pass
+
+    files = batch["files"]
+    chat_id = batch["chat_id"]
+    links = []
+
+    for i, file_info in enumerate(files):
+        msg_id = file_info["message_id"]
+        filename = file_info["filename"]
+
+        tmp_path = os.path.join(
+            OUTPUT_FOLDER, f"uplod_{int(time.time())}_{i}_{filename}"
+        )
+        try:
+            try:
+                await event.edit(
+                    f"⬇️ Downloading {i + 1}/{len(files)}: `{filename}`...",
+                    parse_mode="markdown",
+                    buttons=None,
+                )
+            except Exception:
+                pass
+
+            msg = await event.client.get_messages(chat_id, ids=msg_id)
+            if not msg:
+                logger.warning(f"[UPLOD] Message {msg_id} not found")
+                continue
+
+            await event.client.download_media(msg, file=tmp_path)
+
+            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                logger.warning(f"[UPLOD] Download failed for {filename}")
+                continue
+
+            try:
+                await event.edit(
+                    f"☁️ Uploading {i + 1}/{len(files)} to uplod.ir...",
+                    buttons=None,
+                )
+            except Exception:
+                pass
+
+            from uplod_ir_handler import UplodHandler
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: UplodHandler(timeout=900, verbose=False).upload(tmp_path),
+            )
+
+            link = result.get("download_link", "")
+            if link:
+                links.append(link)
+                logger.info(f"[UPLOD] Success: {link}")
+            else:
+                logger.warning(f"[UPLOD] No link returned for {filename}")
+
+        except Exception as e:
+            logger.error(f"[UPLOD] Error uploading {filename}: {e}", exc_info=True)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+    if not links:
+        try:
+            await event.edit("❌ Upload failed — no link received.", buttons=None)
+        except Exception:
+            pass
+        return await event.answer("❌ Upload failed.", alert=True)
+
+    msg = "✅ **Uploaded to uplod.ir:**\n\n"
+    for link in links:
+        msg += f"🔗 {link}\n"
+
+    try:
+        await event.edit(msg, buttons=None, parse_mode="markdown", link_preview=False)
+    except Exception:
+        pass
+    await event.answer("✅ Upload complete!", alert=False)
 
 
 # ====================== SUBTITLE HANDLER ======================
@@ -11811,12 +11908,6 @@ async def setsearch_callback(event):
     await event.answer(f"Default search changed to {labels[src]}", alert=True)
 
 
-async def setsearch_keyboard_handler(event):
-    if event.sender_id not in AUTHORIZED_USERS:
-        return
-    await setsearch_cmd(event)
-
-
 async def xnxx_inline_handler(event):
     try:
         if event.sender_id not in AUTHORIZED_USERS:
@@ -12741,6 +12832,9 @@ async def main():
         sharelink_callback, events.CallbackQuery(pattern=r"sharelink_(.+)")
     )
     client.add_event_handler(
+        uplod_callback, events.CallbackQuery(pattern=r"uplod_(.+)")
+    )
+    client.add_event_handler(
         subextr_callback, events.CallbackQuery(pattern=r"subextr_(.+)")
     )
     client.add_event_handler(
@@ -13115,10 +13209,6 @@ async def main():
     client.add_event_handler(
         video_receive_handler,
         events.NewMessage(incoming=True, func=lambda e: bool(e.video or e.document)),
-    )
-    client.add_event_handler(
-        setsearch_keyboard_handler,
-        events.NewMessage(pattern=r"^🔍 Change Search Engine$", incoming=True),
     )
     client.add_event_handler(snapwc_captcha_handler, events.NewMessage(incoming=True))
     client.add_event_handler(generic_url_handler, events.NewMessage(incoming=True))
