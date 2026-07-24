@@ -37,10 +37,9 @@ from telethon.tl.types import (
     InputMediaUploadedDocument,
     InputWebDocument,
     DocumentAttributeImageSize,
-    BotCommand,
-    BotCommandScopeDefault,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
-from telethon.tl.functions.bots import SetBotCommandsRequest
 from FastTelethon import upload_file as fast_upload_file
 from github import (
     upload_to_github,
@@ -4511,6 +4510,10 @@ async def start_cmd(event):
 
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("🔍 Change Search Engine")]],
+        resize=True,
+    )
     await event.reply(
         "🚀 **Ultimate Bot v5**\n\n"
         "• `/dirpy <url>` → Download video\n"
@@ -4521,13 +4524,13 @@ async def start_cmd(event):
         "• `/pdfimg <url>` → Download all images\n"
         "• `/github` → GitHub upload status\n"
         "• `/startgithub` → Enable GitHub upload\n"
-        "• `/stopgithub` → Disable GitHub upload\n"
-        "• `/setsearch` → Change default inline search engine\n\n"
+        "• `/stopgithub` → Disable GitHub upload\n\n"
         "**Inline search:** `@telformatbot hardcore` — searches your default engine\n"
         "**Override:** `ph:xxx` `xv:xxx` `ep:xxx` `xn:xxx`\n\n"
         "**During download:** ⏸ Pause  •  ❌ Cancel\n"
         "**After download:** 🗜 Compress  •  ✅ Delete",
         parse_mode="markdown",
+        buttons=keyboard,
     )
 
 
@@ -11808,6 +11811,12 @@ async def setsearch_callback(event):
     await event.answer(f"Default search changed to {labels[src]}", alert=True)
 
 
+async def setsearch_keyboard_handler(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return
+    await setsearch_cmd(event)
+
+
 async def xnxx_inline_handler(event):
     try:
         if event.sender_id not in AUTHORIZED_USERS:
@@ -13107,6 +13116,10 @@ async def main():
         video_receive_handler,
         events.NewMessage(incoming=True, func=lambda e: bool(e.video or e.document)),
     )
+    client.add_event_handler(
+        setsearch_keyboard_handler,
+        events.NewMessage(pattern=r"^🔍 Change Search Engine$", incoming=True),
+    )
     client.add_event_handler(snapwc_captcha_handler, events.NewMessage(incoming=True))
     client.add_event_handler(generic_url_handler, events.NewMessage(incoming=True))
 
@@ -13119,21 +13132,6 @@ async def main():
 
     await _load_sponsors()
     _load_user_settings()
-
-    # تنظیم منوی کامندهای بات (دکمه / در پایین چت)
-    try:
-        await client(SetBotCommandsRequest(
-            scope=BotCommandScopeDefault(),
-            lang_code="",
-            commands=[
-                BotCommand(command="start", description="🚀 Start bot & help"),
-                BotCommand(command="setsearch", description="🔍 Change default inline search engine"),
-                BotCommand(command="dirpy", description="📥 Download video from URL"),
-                BotCommand(command="admin", description="⚙️ Admin panel"),
-            ],
-        ))
-    except Exception as e:
-        logger.warning(f"[BOOT] Failed to set bot commands: {e}")
 
     logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
     logger.info(f"[BOOT] Authorized users: {AUTHORIZED_USERS}")
