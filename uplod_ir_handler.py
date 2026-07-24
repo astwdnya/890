@@ -502,6 +502,53 @@ class UplodHandler:
                 "سایت 403 Forbidden برمی‌گرداند - احتمالاً IP شما بلاک شده"
             )
 
+        # بررسی redirect به صفحه login
+        # اگر سایت ما رو به /login/ هدایت کنه، یعنی آپلود anonymous بلاک شده
+        # و باید session فعلی رو پاک کنیم و یک بار با --headed لاگین دستی انجام بدیم
+        if self._is_on_login_page(page):
+            self._log("redirect به صفحه login تشخیص داده شد!", "WRN", C.YLW)
+            # استخراج base URL از SITE_URL
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(SITE_URL)
+                base_url = f"{parsed.scheme}://{parsed.netloc}"
+            except Exception:
+                base_url = SITE_URL.rstrip("/")
+
+            # تلاش 1: پاک کردن کوکی‌های خراب و مستقیم به /upload/ رفتن
+            self._log(f"تلاش: پاک کردن کوکی‌ها و رفتن به {base_url}/upload/ ...", "STEP", C.YLW)
+            try:
+                page.context.clear_cookies()
+            except Exception:
+                pass
+            try:
+                page.goto(f"{base_url}/upload/", wait_until="domcontentloaded", timeout=60_000)
+                time.sleep(random.uniform(3.0, 5.0))
+            except Exception as e:
+                self._log(f"خطا در goto /upload/: {e}", "WRN", C.YLW)
+
+            if self._is_on_login_page(page):
+                # تلاش 2: رفتن به صفحه اصلی با پارامتر anon
+                self._log(f"تلاش 2: goto {base_url}/?utype=anon ...", "STEP", C.YLW)
+                try:
+                    page.goto(f"{base_url}/?utype=anon", wait_until="domcontentloaded", timeout=60_000)
+                    time.sleep(random.uniform(3.0, 5.0))
+                except Exception:
+                    pass
+
+            if self._is_on_login_page(page):
+                # هنوز هم login page - این یعنی سایت login اجباری کرده
+                self._dump_page_state(page)
+                raise RuntimeError(
+                    "سایت شما را به صفحه login هدایت می‌کند (آپلود anonymous مسدود شده).\n"
+                    "راه‌حل‌ها:\n"
+                    "  1. یک بار با --headed --login اجرا کنید و دستی در سایت login کنید\n"
+                    "     (session در پروفایل ذخیره می‌شود):\n"
+                    "     python3 uplod_ir_handler.py file --login --headed\n"
+                    "  2. سپس دوباره فایل رو آپلود کنید (بدون --login)\n"
+                    "  3. یا پروفایل قبلی را پاک کنید: rm -rf /tmp/uplod_ir_profile"
+                )
+
         self._log(f"عنوان صفحه: {page.title()}", "INFO", C.GRN)
         self._log(f"URL فعلی: {page.url}", "INFO", C.DIM)
 
@@ -773,14 +820,26 @@ class UplodHandler:
                     else:
                         stable_finish_count = 0
                 else:
+                    # درصد از progress bar قابل استخراج نبود
                     cur_url = page.url
-                    if "st=" in cur_url and "fn=" in cur_url:
+                    # FIX: بررسی redirect به صفحه login - نباید به عنوان "تمام شدن" تلقی شه
+                    if self._is_on_login_page(page):
+                        self._log("خطا: redirect به صفحه login در حین آپلود!", "ERR", C.RED)
+                        result["error"] = "login_required"
+                        break
+                    # FIX: بررسی دقیق completion - فقط با پارامترهای st و fn در URL
+                    if "st=" in cur_url and "fn=" in cur_url and "/login" not in cur_url:
                         self._log("آپلود کامل شد (redirect تشخیص داده شد)", "OK", C.GRN)
                         break
+                    # FIX: فقط selectors خاص برای صفحه نتیجه - حذف a[href*="/"] که خیلی loose بود
                     try:
-                        if page.query_selector('.dlurl') or page.query_selector('a[href*="/"]'):
-                            self._log("صفحه نتیجه تشخیص داده شد", "OK", C.GRN)
-                            break
+                        if (page.query_selector('textarea[name="download_links"]') or
+                            page.query_selector('.dlurl') or
+                            page.query_selector('input.dlurl')):
+                            # اطمینان از اینکه در صفحه login نیستیم
+                            if not self._is_on_login_page(page):
+                                self._log("صفحه نتیجه تشخیص داده شد", "OK", C.GRN)
+                                break
                     except Exception:
                         pass
                     try:
@@ -872,10 +931,48 @@ class UplodHandler:
         if self.verbose:
             sys.stdout.write("\n")
 
+    # ---- بررسی اینکه آیا در صفحه login هستیم ----
+    def _is_on_login_page(self, page: Page) -> bool:
+        """بررسی می‌کنه که آیا صفحه فعلی صفحه login هست یا نه."""
+        try:
+            cur_url = page.url or ""
+            if "/login" in cur_url or "/signin" in cur_url or "/register" in cur_url:
+                return True
+            # بررسی عنوان صفحه
+            try:
+                title = page.title() or ""
+                if "login" in title.lower() or "ورود" in title or "عضویت" in title:
+                    return True
+            except Exception:
+                pass
+            # بررسی وجود فرم login در صفحه
+            try:
+                # آپلود صفحه باید input#file_0 داشته باشه
+                has_file_input = page.query_selector('input#file_0') is not None
+                # صفحه login معمولاً فرم login داره
+                has_login_form = (
+                    page.query_selector('input[name="login"]') is not None or
+                    page.query_selector('input[name="password"]') is not None or
+                    page.query_selector('form[action*="login"]') is not None or
+                    page.query_selector('input[type="password"]') is not None
+                )
+                if has_login_form and not has_file_input:
+                    return True
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return False
+
     # ---- استخراج لینک دانلود ----
     def _extract_download_link(self, page: Page, final_urls: list) -> str:
-        cur_url = page.url
+        cur_url = page.url or ""
         self._log(f"URL نهایی: {cur_url}", "INFO", C.DIM)
+
+        # FIX: اگه در صفحه login هستیم، لینک دانلود وجود نداره - None برگردون
+        if self._is_on_login_page(page):
+            self._log("هشدار: در صفحه login هستیم - لینک دانلودی وجود ندارد", "WRN", C.YLW)
+            return ""
 
         # 0) جستجوی textarea[name="download_links"]
         try:
@@ -945,6 +1042,12 @@ class UplodHandler:
         except Exception:
             pass
 
+        # FIX: اگه URL فعلی صفحه login هست، None برگردون (نه خود URL رو)
+        if self._is_on_login_page(page):
+            return ""
+        # FIX: اگه URL فعلی صفحه اصلی uplod.ir هست (بدون کد فایل)، None برگردون
+        if cur_url.rstrip("/") in ("https://uplod.ir", "http://uplod.ir"):
+            return ""
         return cur_url
 
     # ---- دیباگ ----
@@ -956,6 +1059,46 @@ class UplodHandler:
             self._log(f"body excerpt: {body_text}", "DBG", C.DIM)
         except Exception:
             pass
+
+    # ---- حالت login تعاملی ----
+    def login_interactive(self) -> bool:
+        """حالت login دستی: مرورگر رو باز می‌کنه، کاربر دستی login می‌کنه،
+        session در پروفایل ذخیره می‌شه."""
+        self._log("حالت login تعاملی - مرورگر رو باز کنید و در سایت login کنید", "INFO", C.CYN)
+        self._log("بعد از login موفق، در ترمینال Enter بزنید تا session ذخیره شه", "INFO", C.CYN)
+
+        os.makedirs(PROFILE_DIR, exist_ok=True)
+
+        with sync_playwright() as p:
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--lang=en-US,en",
+                f"--user-agent={USER_AGENT}",
+            ]
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=PROFILE_DIR,
+                headless=False,  # حتماً headed
+                args=launch_args,
+                viewport={"width": 1280, "height": 900},
+                user_agent=USER_AGENT,
+                locale="en-US",
+                timezone_id="Asia/Singapore",
+                extra_http_headers=EXTRA_HTTP_HEADERS,
+            )
+            context.add_init_script(STEALTH_JS)
+            page = context.new_page()
+
+            try:
+                page.goto("https://uplod.ir/login/", wait_until="domcontentloaded", timeout=60_000)
+                self._log("صفحه login باز شد. لطفاً login کنید.", "INFO", C.GRN)
+                self._log("صبر برای اتمام login شما (Enter بزنید وقتی تمام شد)...", "INFO", C.YLW)
+                input()  # صبر برای Enter کاربر
+                self._log("Session ذخیره شد در: " + PROFILE_DIR, "OK", C.GRN)
+                return True
+            finally:
+                context.close()
 
 
 # ---------- CLI ----------
@@ -970,7 +1113,7 @@ def main():
   python3 uplod_ir_handler.py file.zip --log upload.log --timeout 1200
 """,
     )
-    parser.add_argument("file", help="مسیر فایل برای آپلود")
+    parser.add_argument("file", help="مسیر فایل برای آپلود", nargs="?", default=None)
     parser.add_argument("--headed", action="store_true", help="نمایش مرورگر")
     parser.add_argument("--timeout", type=int, default=900, help="تایم‌اوت کل به ثانیه")
     parser.add_argument("--log", help="فایل لاگ", default=None)
@@ -978,6 +1121,8 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", help="خروجی پرجزئیات")
     parser.add_argument("--no-persistent", action="store_true",
                         help="عدم استفاده از پروفایل دائمی (هر بار مرورگر تازه)")
+    parser.add_argument("--login", action="store_true",
+                        help="حالت login تعاملی - مرورگر رو باز کن و کاربر دستی login کنه")
     args = parser.parse_args()
 
     log_fh = open(args.log, "a", encoding="utf-8") if args.log else None
@@ -990,6 +1135,15 @@ def main():
             verbose=args.verbose,
             persistent=not args.no_persistent,
         )
+        # اگر --login داده شد، فقط login تعاملی انجام بده و فایل آپلود نکن
+        if args.login:
+            ok = handler.login_interactive()
+            sys.exit(0 if ok else 1)
+        # در غیر این صورت، فایل اجباری است
+        if not args.file:
+            print("{C.RED}خطا: مسیر فایل لازم است{C.R}".replace("{C.RED}", "\033[31m").replace("{C.R}", "\033[0m"))
+            print("استفاده: python3 uplod_ir_handler.py <file> [--login --headed]")
+            sys.exit(1)
         result = handler.upload(args.file)
     except KeyboardInterrupt:
         print("\n[BYE] متوقف شد")
@@ -1013,7 +1167,14 @@ def main():
     print(f"  سرعت میانگین  : {human_size(result.get('average_speed_bps',0))}/s")
     print(f"  سرعت حداکثر   : {human_size(result.get('max_speed_bps',0))}/s")
     link = result.get('download_link','')
-    if link:
+    # FIX: اگه خطای login_required هست، پیام واضح نشون بده
+    if result.get('error') == 'login_required' or (not link and result.get('max_percent', 0) == 0):
+        print(f"  {C.BOLD}{C.RED}❌ آپلود ناموفق - سایت login لازم دارد{C.R}")
+        print(f"  {C.YLW}برای رفع مشکل:{C.R}")
+        print(f"  {C.DIM}  1. یک بار با --login --headed اجرا کنید و دستی login کنید{C.R}")
+        print(f"  {C.DIM}  2. سپس دوباره بدون --login فایل رو آپلود کنید{C.R}")
+        print(f"  {C.DIM}  مثال: python3 uplod_ir_handler.py file --login --headed{C.R}")
+    elif link:
         print(f"  {C.BOLD}{C.GRN}لینک دانلود   : {link}{C.R}")
     else:
         print(f"  {C.YLW}لینک دانلود پیدا نشد - صفحه را دستی چک کنید{C.R}")
