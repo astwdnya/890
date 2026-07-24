@@ -384,6 +384,34 @@ BOT_USERNAME: str = ""
 sponsors: list = []  # هر آیتم: {"name": str, "chat_id": str, "link": str}
 pending_sponsor_name: Dict[int, str] = {}  # مرحله اول اضافه کردن اسپانسر
 
+# ── Default search engine per user ──
+USER_DEFAULT_SEARCH: Dict[int, str] = {}  # user_id -> "ph"|"xv"|"ep"|"xn"  (default: "ph")
+USER_SETTINGS_FILE = "user_settings.json"
+
+def _load_user_settings():
+    global USER_DEFAULT_SEARCH
+    try:
+        if os.path.exists(USER_SETTINGS_FILE):
+            with open(USER_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                USER_DEFAULT_SEARCH = {int(k): v for k, v in json.load(f).items()}
+    except Exception as e:
+        logger.warning(f"[SETTINGS] Error loading user settings: {e}")
+        USER_DEFAULT_SEARCH = {}
+
+def _save_user_settings():
+    try:
+        with open(USER_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(USER_DEFAULT_SEARCH, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"[SETTINGS] Error saving user settings: {e}")
+
+def get_user_default_search(user_id: int) -> str:
+    return USER_DEFAULT_SEARCH.get(user_id, "ph")
+
+def set_user_default_search(user_id: int, source: str):
+    USER_DEFAULT_SEARCH[user_id] = source
+    _save_user_settings()
+
 # نگه‌داری ویدیوهایی که منتظر فایل زیرنویس هستن
 subtitle_sessions: Dict[int, Dict] = {}  # key: chat_id
 subburn_cancel: Dict[int, bool] = {}  # key: chat_id, True = cancel requested
@@ -4490,7 +4518,10 @@ async def start_cmd(event):
         "• `/pdfimg <url>` → Download all images\n"
         "• `/github` → GitHub upload status\n"
         "• `/startgithub` → Enable GitHub upload\n"
-        "• `/stopgithub` → Disable GitHub upload\n\n"
+        "• `/stopgithub` → Disable GitHub upload\n"
+        "• `/setsearch` → Change default inline search engine\n\n"
+        "**Inline search:** `@telformatbot hardcore` — searches your default engine\n"
+        "**Override:** `ph:xxx` `xv:xxx` `ep:xxx` `xn:xxx`\n\n"
         "**During download:** ⏸ Pause  •  ❌ Cancel\n"
         "**After download:** 🗜 Compress  •  ✅ Delete",
         parse_mode="markdown",
@@ -11732,7 +11763,46 @@ INLINE_CACHE_TIME = 60
 INLINE_RESULTS_LIMIT = 20
 
 
-PH_SORT_MAP = {"new": "mr", "top": "tr", "long": "lg", "best": "tr", "views": "tr"}
+PH_SORT_MAP = {"new": "mr", "month": "mr", "top": "tr", "rating": "tr", "long": "lg", "length": "lg", "best": "tr", "views": "mv", "most": "mv"}
+
+# ── Default search engine selection ──
+
+async def setsearch_cmd(event):
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    current = get_user_default_search(event.sender_id)
+    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX"}
+    buttons = [
+        [Button.inline(f"{'✅ ' if current == k else ''}{v}", f"setsearch_{k}") for k, v in labels.items()]
+    ]
+    await event.reply(
+        f"🔍 **Default Search Engine**\n\nCurrent: **{labels.get(current, 'PornHub')}**\n\nChoose your default search engine for inline queries without prefix:",
+        parse_mode="markdown",
+        buttons=buttons,
+    )
+
+async def setsearch_callback(event):
+    user_id = event.sender_id
+    if user_id not in AUTHORIZED_USERS:
+        await event.answer("⛔ Unauthorized", alert=True)
+        return
+    data = event.data.decode()
+    if not data.startswith("setsearch_"):
+        return
+    src = data.replace("setsearch_", "")
+    if src not in ("ph", "xv", "ep", "xn"):
+        return
+    set_user_default_search(user_id, src)
+    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX"}
+    buttons = [
+        [Button.inline(f"{'✅ ' if src == k else ''}{v}", f"setsearch_{k}") for k, v in labels.items()]
+    ]
+    await event.edit(
+        f"🔍 **Default Search Engine**\n\n✅ Changed to **{labels[src]}**\n\nNow when you type `@telformatbot hardcore` without prefix, it will search **{labels[src]}**:",
+        parse_mode="markdown",
+        buttons=buttons,
+    )
+    await event.answer(f"Default search changed to {labels[src]}", alert=True)
 
 
 async def xnxx_inline_handler(event):
@@ -11758,10 +11828,11 @@ async def xnxx_inline_handler(event):
             )
             return
 
-        # تشخیص منبع: ph:xxx → PornHub, xv:xxx → XVideos, ep:xxx → Eporner, بقیه → XNXX
+        # تشخیص منبع: ph:xxx → PornHub, xv:xxx → XVideos, ep:xxx → Eporner, xn:xxx → XNXX
         is_ph = raw.lower().startswith("ph:")
         is_xv = raw.lower().startswith("xv:")
         is_ep = raw.lower().startswith("ep:")
+        is_xn = raw.lower().startswith("xn:")
         if is_ph:
             inner = raw[3:].strip()
             parsed = parse_inline_query(inner)
@@ -11772,8 +11843,31 @@ async def xnxx_inline_handler(event):
         elif is_ep:
             inner = raw[3:].strip()
             parsed = parse_inline_query(inner)
+        elif is_xn:
+            inner = raw[3:].strip()
+            parsed = parse_inline_query(inner)
         else:
-            parsed = parse_inline_query(raw)
+            # بدون پیشوند — استفاده از سرچر دیفالت کاربر
+            default_src = get_user_default_search(event.sender_id)
+            inner = raw  # اصل query بدون پیشوند
+            # شبیه‌سازی پیشوند برای مسیریابی
+            if default_src == "ph":
+                is_ph = True
+                inner = raw
+                parsed = parse_inline_query(inner)
+                ph_sort = PH_SORT_MAP.get(parsed["sort"], "")
+            elif default_src == "xv":
+                is_xv = True
+                inner = raw
+                parsed = parse_inline_query(inner)
+            elif default_src == "ep":
+                is_ep = True
+                inner = raw
+                parsed = parse_inline_query(inner)
+            else:  # "xn"
+                is_xn = True
+                inner = raw
+                parsed = parse_inline_query(inner)
 
         query = parsed["query"]
         page = parsed["page"]
@@ -11795,9 +11889,10 @@ async def xnxx_inline_handler(event):
             results = await search_eporner(
                 query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
             )
-        else:
+        else:  # XNXX
+            xnxx_page = max(0, page - 1)
             results = await search_xnxx(
-                query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
+                query, page=xnxx_page, limit=INLINE_RESULTS_LIMIT, sort=sort
             )
 
         if not results:
@@ -11878,7 +11973,7 @@ async def xnxx_inline_handler(event):
             cache_time=300,
         )
         logger.info(
-            f"[INLINE] {'PH' if is_ph else 'XNXX'}: {len(inline_results)} results for '{query}'"
+            f"[INLINE] {source}: {len(inline_results)} results for '{query}'"
         )
 
     except Exception as e:
@@ -12946,6 +13041,9 @@ async def main():
     client.add_event_handler(
         pornzog_cancel_callback, events.CallbackQuery(pattern=r"pz_cancel_.+")
     )
+    client.add_event_handler(
+        setsearch_callback, events.CallbackQuery(pattern=r"setsearch_.+")
+    )
 
     # ===== Command handlers =====
     client.add_event_handler(
@@ -12991,6 +13089,9 @@ async def main():
     client.add_event_handler(
         html_command, events.NewMessage(pattern=r"^/html(\s|$)", incoming=True)
     )
+    client.add_event_handler(
+        setsearch_cmd, events.NewMessage(pattern=r"^/setsearch(\s|$)", incoming=True)
+    )
 
     # ===== Message handlers (order matters - specific before generic) =====
     client.add_event_handler(admin_input_handler, events.NewMessage(incoming=True))
@@ -13014,6 +13115,7 @@ async def main():
     BOT_USERNAME = me.username
 
     await _load_sponsors()
+    _load_user_settings()
 
     logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
     logger.info(f"[BOOT] Authorized users: {AUTHORIZED_USERS}")
