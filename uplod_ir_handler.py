@@ -393,6 +393,17 @@ class UplodHandler:
             time.sleep(0.4)
 
         duration = time.time() - start_ts
+
+        # اگر هیچ درصدی ثبت نشده ولی صفحه نتیجه/موفقیت رو نشون میده → 100%
+        if max_pct <= 0:
+            try:
+                if (page.query_selector('textarea[name="download_links"]') or
+                    page.query_selector('h2:has-text("آپلود با موفقیت انجام شد")')):
+                    max_pct = 100.0
+                    self._log("آپلود کامل شد (صفحه نتیجه تشخیص داده شد)", "OK", C.GRN)
+            except Exception:
+                pass
+
         result["duration_sec"] = round(duration, 2)
         result["max_percent"] = round(max_pct, 2)
         result["max_speed_bps"] = round(max_speed_bps, 2)
@@ -469,6 +480,18 @@ class UplodHandler:
         cur_url = page.url
         self._log(f"URL نهایی: {cur_url}", "INFO", C.DIM)
 
+        # 0) جستجوی textarea[name="download_links"] (محل اصلی لینک بعد از آپلود موفق)
+        try:
+            ta = page.query_selector('textarea[name="download_links"]')
+            if ta:
+                val = ta.get_attribute("value") or ta.inner_text() or ""
+                val = val.strip()
+                if val:
+                    self._log(f"لینک از textarea: {val}", "OK", C.GRN)
+                    return val
+        except Exception:
+            pass
+
         # 1) جستجوی لینک در URL (مثلاً ?st=OK&fn=xxxx)
         m = re.search(r"[?&]fn=([^&]+)", cur_url)
         if m:
@@ -531,7 +554,7 @@ class UplodHandler:
         except Exception:
             pass
 
-        return ""
+        return cur_url  # fallback: خود URL فعلی رو برگردون
 
     # ---- دیباگ ----
     def _dump_page_state(self, page: Page):
