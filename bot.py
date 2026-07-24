@@ -37,7 +37,10 @@ from telethon.tl.types import (
     InputMediaUploadedDocument,
     InputWebDocument,
     DocumentAttributeImageSize,
+    BotCommand,
+    BotCommandScopeDefault,
 )
+from telethon.tl.functions.bots import SetBotCommandsRequest
 from FastTelethon import upload_file as fast_upload_file
 from github import (
     upload_to_github,
@@ -13116,6 +13119,21 @@ async def main():
 
     await _load_sponsors()
     _load_user_settings()
+
+    # تنظیم منوی کامندهای بات (دکمه / در پایین چت)
+    try:
+        await client(SetBotCommandsRequest(
+            scope=BotCommandScopeDefault(),
+            lang_code="",
+            commands=[
+                BotCommand(command="start", description="🚀 Start bot & help"),
+                BotCommand(command="setsearch", description="🔍 Change default inline search engine"),
+                BotCommand(command="dirpy", description="📥 Download video from URL"),
+                BotCommand(command="admin", description="⚙️ Admin panel"),
+            ],
+        ))
+    except Exception as e:
+        logger.warning(f"[BOOT] Failed to set bot commands: {e}")
 
     logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
     logger.info(f"[BOOT] Authorized users: {AUTHORIZED_USERS}")
