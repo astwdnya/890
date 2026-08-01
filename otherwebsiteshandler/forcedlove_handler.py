@@ -1,0 +1,1475 @@
+"""
+forcedlove_handler.py
+─────────────────────
+استخراج و دانلود ویدیو از forced.love
+
+روش کار (بر اساس تحلیل واقعی سایت — تأیید شده با تست):
+
+  سایت تحت محافظت Cloudflare Challenge است.
+  نکته مهم: curl_cffi با impersonate=chrome به جای challenge صفحه‌ی "Just a moment..."
+  برمی‌گردونه (HTTP 403). ولی impersonate=safari17_0 کار می‌کنه!
+
+  ساختار:
+    - صفحه‌ی ویدیو: /vids-<slug>.html
+    - سایت از HTML5 native <video> استفاده می‌کنه که به‌صورت dynamic با JS ساخته می‌شه
+    - URL ویدیو داخل یه <script> tag در متغیر c_s قرار داره:
+        let c_s='https://mixx.link/fl/mo//<filename>.mp4', c_p='//tab.name/.../thumb.webp';
+    - سپس JS یه host تصادفی از این لیست انتخاب می‌کنه:
+        ["mixx.link","tes0.bid","min31.work"]
+    - الگوی URL: https://<host>/fl/mo//<filename>.mp4
+
+  CDN (mixx.link / tes0.bid / min31.work):
+    - Accept-Ranges: bytes
+    - HTTP 206 برای Range requests
+    - Content-Type: video/mp4
+    - بدون توکن، بدون expiry، بدون IP-lock
+    - Referer الزامی!  بدون Referer یا با fake Referer → 403
+    - Referer باید URL صفحه‌ی forced.love باشه (نه CDN host)
+
+  نکات مهم:
+    - سایت تک‌کیفیتیه
+    - برای fetch صفحه‌ی forced.love باید از impersonate=safari17_0 استفاده کنیم
+    - برای fetch از CDN می‌تونیم از chrome یا safari استفاده کنیم (CDN محافظت نشده)
+    - کوکی‌های set شده توسط forced.love برای CDN لازم نیستن
+    - 3 host قابل تعویض هستن — اگه یکی fail بشه، می‌تونیم از بقیه استفاده کنیم
+
+استراتژی دانلود:
+  1. GET /vids-<slug>.html با safari17_0 impersonation برای دور زدن Cloudflare
+  2. استخراج c_s از <script>
+  3. multi-segment download با N workers (پیش‌فرض 16) با chrome131 impersonation
+  4. fallback به single-connection
+  5. fallback به yt-dlp روی page URL
+  6. در 403: re-fetch parent page (شاید URL عوض شده) یا switch host
+
+وابستگی‌ها:
+    pip install aiohttp aiofiles curl_cffi yt-dlp
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import shutil
+import time
+from dataclasses import dataclass
+from typing import Awaitable, Callable, List, Optional, Tuple
+from urllib.parse import urlparse, urljoin, unquote
+
+import aiofiles
+import aiohttp
+from aiohttp import ClientTimeout, CookieJar, TCPConnector
+
+try:
+    from curl_cffi.requests import AsyncSession as _CurlAsyncSession
+    _HAS_CURL_CFFI = True
+except ImportError:
+    _CurlAsyncSession = None
+    _HAS_CURL_CFFI = False
+
+logger = logging.getLogger("ForcedLoveHandler")
+
+# ─── Constants ────────────────────────────────────────────────────────────
+
+MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
+MIN_VALID_VIDEO_SIZE = 100 * 1024  # 100 KB
+PROGRESS_INTERVAL = 1.0
+CHUNK_SIZE = 1024 * 1024  # 1 MB
+MAX_RETRIES = 3
+RETRY_DELAY = 2.0
+MULTI_SEGMENT_MIN_SIZE = 5 * 1024 * 1024  # 5 MB
+
+DEFAULT_SEGMENT_WORKERS = 16
+SEGMENT_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB
+CONNECTOR_LIMIT = 32
+CONNECTOR_LIMIT_PER_HOST = 32
+
+# دامنه‌های مجاز
+_ALLOWED_HOSTS = frozenset({
+    "forced.love",
+    "www.forced.love",
+    "m.forced.love",
+})
+
+# CDN hosts (برای host rotation)
+_CDN_HOSTS = ["mixx.link", "tes0.bid", "min31.work"]
+
+# impersonation profile برای fetch صفحه‌ی forced.love
+# (safari17_0 کار می‌کنه، chrome به دلیل Cloudflare challenge fail می‌شه)
+_PAGE_IMPERSONATE = "safari17_0"
+
+# User-Agent متناسب با safari17_0
+_SAFARI_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+)
+
+# برای CDN می‌تونیم از chrome استفاده کنیم (سریع‌تر)
+_CDN_IMPERSONATE = "chrome131"
+
+_CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# هدرهای پیش‌فرض برای fetch صفحه
+_PAGE_HEADERS = {
+    "User-Agent": _SAFARI_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# هدرهای پیش‌فرض برای CDN (با chrome UA)
+_CDN_HEADERS = {
+    "User-Agent": _CHROME_UA,
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "identity",  # no gzip on binary
+    "Sec-Fetch-Dest": "video",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "cross-site",
+}
+
+ProgressCallback = Callable[[str], Awaitable[None]]
+
+
+# ─── State Manager ────────────────────────────────────────────────────────
+
+
+@dataclass
+class DownloadState:
+    paused: bool = False
+    cancelled: bool = False
+
+
+_active_downloads: dict[str, DownloadState] = {}
+
+
+def _get_state(dl_id: str) -> DownloadState:
+    if not dl_id:
+        return DownloadState()
+    if dl_id not in _active_downloads:
+        _active_downloads[dl_id] = DownloadState()
+    return _active_downloads[dl_id]
+
+
+def _is_cancelled(dl_id: str) -> bool:
+    return _get_state(dl_id).cancelled
+
+
+# ─── Utility ──────────────────────────────────────────────────────────────
+
+
+def is_forcedlove_url(url: str) -> bool:
+    """بررسی اینکه URL مربوط به forced.love هست."""
+    try:
+        host = urlparse(url).hostname or ""
+        return host in _ALLOWED_HOSTS or host.endswith(".forced.love")
+    except Exception:
+        return False
+
+
+def extract_video_slug(url: str) -> Optional[str]:
+    """
+    استخراج slug از URL.
+
+    الگو: /vids-<slug>.html
+    """
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or ""
+        m = re.search(r"/vids-([^/]+?)\.html", path)
+        if m:
+            return m.group(1)
+        return None
+    except Exception:
+        return None
+
+
+def _cleanup_file(filepath: str) -> None:
+    try:
+        if filepath and os.path.exists(filepath):
+            os.remove(filepath)
+    except OSError as e:
+        logger.warning("Failed to cleanup file %s: %s", filepath, e)
+
+
+def _format_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    if size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / 1024 / 1024:.1f} MB"
+    return f"{size_bytes / 1024 / 1024 / 1024:.2f} GB"
+
+
+def _clean_url(url: str) -> str:
+    """نرمال‌سازی URL."""
+    if not url:
+        return ""
+    url = unquote(url).replace("&amp;", "&")
+    # اگه URL با // شروع بشه (protocol-relative)، https اضافه کن
+    if url.startswith("//"):
+        url = "https:" + url
+    url = re.sub(r"[\\/]+$", "", url)
+    url = url.rstrip("',\"")
+    return url.strip()
+
+
+def _normalize_video_url(url: str) -> str:
+    """
+    نرمال‌سازی URL ویدیو:
+    - اضافه کردن پروتکل اگه نباشه
+    - اصلاح // در مسیر (site bug: /fl/mo//filename)
+    """
+    url = _clean_url(url)
+    # اصلاح // در مسیر (بعد از host)
+    # https://mixx.link/fl/mo//file.mp4 → https://mixx.link/fl/mo/file.mp4
+    # ولی فقط اگه دو // پشت سر هم باشن (نه بعد از https://)
+    m = re.match(r"^(https?://[^/]+)(/.*)$", url)
+    if m:
+        host = m.group(1)
+        path = m.group(2)
+        # جایگزینی // در مسیر با /
+        path = re.sub(r"/{2,}", "/", path)
+        url = host + path
+    return url
+
+
+def _format_progress(downloaded: int, content_length: int, start_time: float, now: float) -> str:
+    elapsed = now - start_time
+    speed = downloaded / elapsed if elapsed > 0 else 0
+    dl_mb = downloaded / 1024 / 1024
+    if content_length > 0:
+        total_mb = content_length / 1024 / 1024
+        pct = downloaded / content_length * 100
+        filled = int(pct / 5)
+        bar = "█" * filled + "░" * (20 - filled)
+        speed_mb = min(speed / 1024 / 1024, 999)
+        eta_secs = int((content_length - downloaded) / speed) if speed > 0 else 0
+        eta_m, eta_s = divmod(eta_secs, 60)
+        return (
+            f"📥 **Downloading...**\n`[{bar}]`\n"
+            f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
+            f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}"
+        )
+    return f"📥 **Downloading...**\n💾 {dl_mb:.1f} MB  •  ⚡ {speed / 1024 / 1024:.1f} MB/s"
+
+
+def _check_curl_cffi() -> bool:
+    return _HAS_CURL_CFFI
+
+
+def _switch_cdn_host(url: str, new_host: str) -> str:
+    """
+    تعویض host در URL ویدیو.
+    مثال: https://mixx.link/fl/mo/file.mp4 → https://tes0.bid/fl/mo/file.mp4
+    """
+    m = re.match(r"^(https?://)([^/]+)(/.*)$", url)
+    if m:
+        return m.group(1) + new_host + m.group(3)
+    return url
+
+
+# ─── Page Metadata Extraction ─────────────────────────────────────────────
+
+
+def _strip_site_suffix(title: str) -> str:
+    """حذف پسوندهای سایت مثل ' - Forced Sex Tube'."""
+    title = re.sub(r"\s*[-|@]\s*(?:forced(?:\s+sex\s+tube)?|forced\.love)\s*$",
+                   "", title, flags=re.IGNORECASE)
+    return title.strip()
+
+
+def _extract_title(html: str) -> str:
+    """استخراج عنوان ویدیو."""
+    # روش 1: <h1>
+    m = re.search(r'<h1[^>]*>([^<]+)</h1>', html, re.IGNORECASE)
+    if m:
+        return _strip_site_suffix(m.group(1).strip())
+
+    # روش 2: og:title
+    m = re.search(
+        r'(?:property|name)=["\']og:title["\']\s+content=["\']([^"\']+)["\']',
+        html, re.IGNORECASE,
+    )
+    if m:
+        return _strip_site_suffix(m.group(1).strip())
+
+    # روش 3: <title>
+    m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
+    if m:
+        return _strip_site_suffix(m.group(1).strip()) or "Untitled"
+
+    return "Untitled"
+
+
+def _extract_description(html: str) -> str:
+    """استخراج توضیحات ویدیو."""
+    m = re.search(
+        r'(?:property|name)=["\']og:description["\']\s+content=["\']([^"\']+)["\']',
+        html, re.IGNORECASE,
+    )
+    if not m:
+        m = re.search(
+            r'<meta\s+name=["\']description["\']\s+content=["\']([^"\']+)["\']',
+            html, re.IGNORECASE,
+        )
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
+def _extract_thumbnail(html: str) -> str:
+    """استخراج URL تصویر بندانگشتی."""
+    # روش 1: og:image
+    m = re.search(
+        r'(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+        html, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip()
+    # روش 2: c_p variable (poster)
+    m = re.search(r"c_p\s*=\s*['\"]([^'\"]+)['\"]", html)
+    if m:
+        return _clean_url(m.group(1))
+    return ""
+
+
+def _extract_duration(html: str) -> Optional[int]:
+    """استخراج مدت زمان ویدیو (به ثانیه)."""
+    # روش 1: ISO 8601 در JSON-LD
+    m = re.search(r'"duration"\s*:\s*"(PT[^"]+)"', html)
+    if m:
+        d = _parse_iso8601_duration(m.group(1))
+        if d:
+            return d
+
+    # روش 2: data-length attribute
+    m = re.search(r'data-length=["\'](\d{1,2}:\d{2}(?::\d{2})?)["\']', html)
+    if m:
+        return _parse_time_string(m.group(1))
+
+    # روش 3: thumbDuration div
+    m = re.search(r'class="thumbDuration"[^>]*>\s*(\d{1,2}:\d{2}(?::\d{2})?)\s*<', html, re.IGNORECASE)
+    if m:
+        return _parse_time_string(m.group(1))
+
+    return None
+
+
+def _parse_iso8601_duration(s: str) -> Optional[int]:
+    """تبدیل PT1H30M45S → 5445 (ثانیه)."""
+    if not s:
+        return None
+    total = 0
+    for unit, mult in [("H", 3600), ("M", 60), ("S", 1)]:
+        m = re.search(rf"(\d+){unit}", s)
+        if m:
+            total += int(m.group(1)) * mult
+    return total if total > 0 else None
+
+
+def _parse_time_string(s: str) -> Optional[int]:
+    """تبدیل "12:34" یا "1:23:45" به ثانیه."""
+    if not s:
+        return None
+    parts = s.split(":")
+    try:
+        parts_int = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if len(parts_int) == 2:
+        return parts_int[0] * 60 + parts_int[1]
+    if len(parts_int) == 3:
+        return parts_int[0] * 3600 + parts_int[1] * 60 + parts_int[2]
+    return None
+
+
+def _extract_video_source(html: str) -> Optional[dict]:
+    """
+    استخراج URL ویدیو از صفحه.
+
+    سایت URL ویدیو رو در متغیر JS به نام c_s قرار می‌ده:
+        let c_s='https://mixx.link/fl/mo//<filename>.mp4', c_p='...';
+
+    Returns:
+        dict با کلیدهای url, method یا None
+    """
+    # روش 1: استخراج از متغیر c_s
+    # الگو: c_s='...' یا c_s="..." یا let c_s='...'
+    patterns = [
+        r"""c_s\s*=\s*['"]([^'"]+\.mp4[^'"]*)['"]""",  # c_s='...mp4'
+        r"""c_s\s*=\s*['"]([^'"]+)['"]""",  # c_s='...' (هر چیزی)
+    ]
+    for pat in patterns:
+        m = re.search(pat, html)
+        if m:
+            url = _normalize_video_url(m.group(1))
+            if url and ".mp4" in url.lower():
+                logger.info("Found video URL from c_s variable: %s", url[:100])
+                return {
+                    "url": url,
+                    "method": "c_s_variable",
+                }
+
+    # روش 2: جستجوی مستقیم URL در HTML
+    # الگوی mixx.link یا tes0.bid یا min31.work
+    cdn_pattern = re.compile(
+        r'(https?://(?:mixx\.link|tes0\.bid|min31\.work)[^\s"\'<>)\]]+?\.mp4[^\s"\'<>)\]]*)',
+        re.IGNORECASE,
+    )
+    m = cdn_pattern.search(html)
+    if m:
+        url = _normalize_video_url(m.group(1))
+        logger.info("Found video URL from CDN regex: %s", url[:100])
+        return {
+            "url": url,
+            "method": "cdn_regex",
+        }
+
+    # روش 3: هر .mp4 URL در صفحه
+    mp4_pattern = re.compile(
+        r"""['"]([^'"]+\.mp4(?:\?[^'"]*)?)['"]""",
+        re.IGNORECASE,
+    )
+    for m in mp4_pattern.finditer(html):
+        url = _normalize_video_url(m.group(1))
+        # فقط از host های CDN مجاز
+        try:
+            host = urlparse(url).hostname or ""
+            if host in _CDN_HOSTS:
+                logger.info("Found video URL from generic MP4 regex: %s", url[:100])
+                return {
+                    "url": url,
+                    "method": "mp4_generic",
+                }
+        except Exception:
+            continue
+
+    logger.error("No video source found in page")
+    return None
+
+
+# ─── Fetch Page ───────────────────────────────────────────────────────────
+
+
+async def _fetch_page(url: str, referer: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """
+    GET یک صفحه‌ی HTML از forced.love.
+
+    نکته مهم: سایت تحت Cloudflare Challenge است.
+    curl_cffi با impersonate=chrome به 403 می‌خوره، ولی safari17_0 کار می‌کنه.
+
+    Returns:
+        (html, error)
+    """
+    headers = dict(_PAGE_HEADERS)
+    if referer:
+        headers["Referer"] = referer
+        headers["Sec-Fetch-Site"] = "same-origin"
+
+    # روش 1: curl_cffi با safari17_0 (اول — تنها روشی که کار می‌کنه)
+    if _check_curl_cffi():
+        try:
+            async with _CurlAsyncSession() as session:
+                resp = await session.get(
+                    url, impersonate=_PAGE_IMPERSONATE,
+                    headers=headers, allow_redirects=True, timeout=30,
+                )
+                if resp.status_code == 200 and resp.text:
+                    text = resp.text
+                    # صحت‌سنجی: نباید "Just a moment" داشته باشه (CF challenge)
+                    if "Just a moment" in text or "_cf_chl_opt" in text:
+                        logger.warning("curl_cffi safari: still got CF challenge")
+                    elif "<html" in text.lower() or "<video" in text.lower() or "c_s" in text:
+                        logger.info("Page fetched via curl_cffi safari: %s (size=%d)", url, len(text))
+                        return text, ""
+                    else:
+                        logger.warning("curl_cffi safari: 200 ولی محتوای مورد انتظار پیدا نشد")
+                else:
+                    logger.warning("curl_cffi safari fetch %s: HTTP %s", url, resp.status_code)
+        except Exception as e:
+            logger.warning(f"curl_cffi safari fetch error for {url}: {e}")
+
+    # روش 2: aiohttp (معمولاً fail می‌شه به دلیل CF، ولی برای fallback)
+    try:
+        timeout = ClientTimeout(total=30, connect=10)
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status == 200:
+                    html = await resp.text(errors="replace")
+                    if "Just a moment" not in html and "_cf_chl_opt" not in html:
+                        logger.info("Page fetched via aiohttp: %s (size=%d)", url, len(html))
+                        return html, ""
+                    logger.warning("aiohttp: got CF challenge")
+                else:
+                    logger.warning("aiohttp fetch %s: HTTP %s", url, resp.status)
+    except Exception as e:
+        logger.warning(f"aiohttp fetch error for {url}: {e}")
+
+    return None, "Failed to fetch page (Cloudflare challenge)"
+
+
+# ─── Extract Qualities (Public API) ───────────────────────────────────────
+
+
+async def extract_forcedlove_qualities(
+    url: str,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> Tuple[List[dict], str, dict]:
+    """
+    استخراج کیفیت‌های ویدیو از forced.love.
+
+    Args:
+        url: URL صفحه ویدیو (مثل https://forced.love/vids-<slug>.html)
+        progress_cb: callback async برای گزارش پیشرفت
+
+    Returns:
+        (sources, title, info)
+        sources: list of dicts (معمولاً فقط 1 آیتم)
+        title: عنوان ویدیو
+        info: dict با کلیدهای thumbnail/page_url/slug/description
+    """
+    if not is_forcedlove_url(url):
+        return [], "Invalid URL (host not allowed)", {}
+
+    slug = extract_video_slug(url)
+    if not slug:
+        return [], "Invalid URL (could not extract video slug)", {}
+
+    if progress_cb:
+        await progress_cb("🔄 **دریافت اطلاعات صفحه...**")
+
+    # مرحله 1: GET parent page (با safari17_0 برای دور زدن CF)
+    html, page_error = await _fetch_page(url)
+    if not html:
+        return [], f"خطا در دریافت صفحه: {page_error}", {}
+
+    # مرحله 2: استخراج metadata + video source
+    title = _extract_title(html)
+    description = _extract_description(html)
+    duration = _extract_duration(html)
+    thumbnail = _extract_thumbnail(html)
+
+    source_info = _extract_video_source(html)
+    if not source_info:
+        logger.error("No video source found in page")
+        return [], "URL ویدیو در صفحه پیدا نشد", {}
+
+    # ساخت sources list (فقط 1 آیتم — سایت تک‌کیفیتیه)
+    sources = [{
+        "label": "📺 MP4 (default quality)",
+        "url": source_info["url"],
+        "height": 0,
+        "quality_key": "default",
+        "method": source_info["method"],
+        "is_hd": False,
+    }]
+
+    if progress_cb:
+        labels = ", ".join(s["label"] for s in sources)
+        dur_str = ""
+        if duration:
+            mins, secs = divmod(duration, 60)
+            dur_str = f" ({mins}:{secs:02d})"
+        await progress_cb(f"✅ **پیدا شد:** {title[:50]}{dur_str}\n🎞 کیفیت‌ها: {labels}")
+
+    return sources, title, {
+        "thumbnail": thumbnail,
+        "page_url": url,
+        "video_slug": slug,
+        "description": description,
+        "duration": duration,
+        "fetch_method": "curl_cffi_safari" if _check_curl_cffi() else "aiohttp",
+        "source_type": "video/mp4",
+    }
+
+
+# ─── Download: Probe (HEAD/Range) ─────────────────────────────────────────
+
+
+async def _probe_size(url: str, referer: str) -> Tuple[int, str, str]:
+    """
+    Probe کردن سایز واقعی فایل و پشتیبانی از Range.
+
+    Returns:
+        (content_length, accept_ranges, error)
+    """
+    headers = {
+        **_CDN_HEADERS,
+        "Referer": referer,
+        "Origin": "https://forced.love",
+    }
+
+    # روش 1: curl_cffi HEAD با chrome131 (سریع‌تر)
+    if _check_curl_cffi():
+        try:
+            async with _CurlAsyncSession() as session:
+                resp = await session.head(
+                    url, impersonate=_CDN_IMPERSONATE,
+                    headers=headers, allow_redirects=True, timeout=15,
+                )
+                if resp.status_code in (200, 206):
+                    cl = int(resp.headers.get("Content-Length", 0))
+                    ar = resp.headers.get("Accept-Ranges", "").lower()
+                    ct = resp.headers.get("Content-Type", "")
+                    if ct and not ct.startswith("video/") and not ct.startswith("application/"):
+                        logger.warning("HEAD returned non-video content-type: %s", ct)
+                    if cl > 0:
+                        return cl, ar, ""
+                elif resp.status_code == 403:
+                    return 0, "", "HTTP_403"
+        except Exception as e:
+            logger.warning(f"curl_cffi HEAD failed: {e}")
+
+    # روش 2: aiohttp HEAD
+    try:
+        timeout = ClientTimeout(total=15, connect=8)
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
+            async with s.head(url, allow_redirects=True) as r:
+                if r.status in (200, 206):
+                    cl = int(r.headers.get("Content-Length", 0))
+                    ar = r.headers.get("Accept-Ranges", "").lower()
+                    if cl > 0:
+                        return cl, ar, ""
+                elif r.status == 403:
+                    return 0, "", "HTTP_403"
+    except Exception as e:
+        logger.warning(f"aiohttp HEAD failed: {e}")
+
+    # روش 3: probe با Range bytes=0-0
+    if _check_curl_cffi():
+        try:
+            async with _CurlAsyncSession() as session:
+                resp = await session.get(
+                    url, impersonate=_CDN_IMPERSONATE,
+                    headers={**headers, "Range": "bytes=0-0"},
+                    allow_redirects=True, timeout=15,
+                )
+                if resp.status_code in (200, 206):
+                    cr = resp.headers.get("Content-Range", "")
+                    m = re.search(r"/(\d+)", cr)
+                    if m:
+                        return int(m.group(1)), "bytes", ""
+                    cl = int(resp.headers.get("Content-Length", 0))
+                    if cl > 0:
+                        return cl, "bytes" if resp.status_code == 206 else "", ""
+                elif resp.status_code == 403:
+                    return 0, "", "HTTP_403"
+        except Exception as e:
+            logger.warning(f"curl_cffi probe failed: {e}")
+
+    return 0, "", "Cannot determine file size"
+
+
+# ─── Download: Multi-segment ──────────────────────────────────────────────
+
+
+async def _download_multi_segment(
+    direct_url: str,
+    filepath: str,
+    referer: str,
+    progress_cb: ProgressCallback,
+    dl_id: str = "",
+    num_workers: int = DEFAULT_SEGMENT_WORKERS,
+) -> Tuple[bool, str, int]:
+    """دانلود چند تیکه‌ای با work-queue pattern."""
+    try:
+        content_length, accept_ranges, probe_err = await _probe_size(direct_url, referer)
+        if probe_err == "HTTP_403":
+            return False, "HTTP_403", 0
+        if content_length == 0:
+            return False, "Cannot determine file size", 0
+        if content_length > MAX_DOWNLOAD_SIZE:
+            return False, f"File too large: {_format_size(content_length)}", 0
+        if accept_ranges != "bytes" or content_length < MULTI_SEGMENT_MIN_SIZE:
+            return False, "Range not supported or file too small", 0
+
+        total_mb = content_length / 1024 / 1024
+        await progress_cb(
+            f"📥 **Downloading...**\n💾 Size: {total_mb:.1f} MB\n🔥 {num_workers} parallel workers"
+        )
+
+        chunks: List[Tuple[int, int, int]] = []
+        offset = 0
+        idx = 0
+        while offset < content_length:
+            end = min(offset + SEGMENT_CHUNK_SIZE - 1, content_length - 1)
+            chunks.append((idx, offset, end))
+            offset = end + 1
+            idx += 1
+
+        total_chunks = len(chunks)
+        logger.info(
+            "[DL-FORCEDLOVE] Work-queue: %d chunks, %d workers, total=%d",
+            total_chunks, num_workers, content_length,
+        )
+
+        try:
+            with open(filepath, "wb") as f:
+                f.truncate(content_length)
+        except OSError as e:
+            logger.warning("Could not pre-allocate file: %s", e)
+
+        chunk_queue: asyncio.Queue = asyncio.Queue()
+        for c in chunks:
+            await chunk_queue.put(c)
+
+        downloaded_bytes = [0] * total_chunks
+        completed_chunks = [0]
+        failed_chunks: List[Tuple[int, str]] = []
+        start_time = time.time()
+        last_update = [0.0]
+        progress_lock = asyncio.Lock()
+        file_write_lock = asyncio.Lock()
+        first_chunk_started = [False]
+
+        async def _update_progress(force: bool = False) -> None:
+            now = time.time()
+            if not force and now - last_update[0] < PROGRESS_INTERVAL:
+                return
+            last_update[0] = now
+            total_dl = sum(downloaded_bytes)
+            elapsed = now - start_time
+            speed = total_dl / elapsed if elapsed > 0 else 0
+            dl_mb = total_dl / 1024 / 1024
+            total_mb_local = content_length / 1024 / 1024
+            pct = (total_dl / content_length * 100) if content_length > 0 else 0
+            filled = int(pct / 5)
+            bar = "█" * filled + "░" * (20 - filled)
+            speed_mb = min(speed / 1024 / 1024, 999)
+            eta_secs = int((content_length - total_dl) / speed) if speed > 0 else 0
+            eta_m, eta_s = divmod(eta_secs, 60)
+            try:
+                await progress_cb(
+                    f"📥 **Downloading...**\n`[{bar}]`\n"
+                    f"💾 {dl_mb:.1f}/{total_mb_local:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
+                    f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}\n"
+                    f"📦 {completed_chunks[0]}/{total_chunks} chunks • 🔥 {num_workers}x"
+                )
+            except Exception:
+                pass
+
+        # هدرهای مخصوص دانلود — Referer و Origin مهمه
+        download_headers = {
+            **_CDN_HEADERS,
+            "Referer": referer,
+            "Origin": "https://forced.love",
+        }
+
+        if _check_curl_cffi():
+            worker = _make_curl_worker(
+                direct_url, filepath,
+                headers=download_headers,
+                chunk_queue=chunk_queue, downloaded_bytes=downloaded_bytes,
+                completed_chunks=completed_chunks, failed_chunks=failed_chunks,
+                progress_lock=progress_lock, file_write_lock=file_write_lock,
+                first_chunk_started=first_chunk_started, update_progress=_update_progress,
+                dl_id=dl_id,
+            )
+        else:
+            worker = _make_aiohttp_worker(
+                direct_url, filepath,
+                headers=download_headers,
+                chunk_queue=chunk_queue, downloaded_bytes=downloaded_bytes,
+                completed_chunks=completed_chunks, failed_chunks=failed_chunks,
+                progress_lock=progress_lock, file_write_lock=file_write_lock,
+                first_chunk_started=first_chunk_started, update_progress=_update_progress,
+                dl_id=dl_id,
+            )
+
+        try:
+            results = await asyncio.gather(
+                *[_make_worker_task(worker, i) for i in range(num_workers)],
+                return_exceptions=True,
+            )
+        except Exception as e:
+            logger.error("[DL-FORCEDLOVE] Work-queue error: %s", e, exc_info=True)
+            _cleanup_file(filepath)
+            return False, str(e)[:200], 0
+
+        if _is_cancelled(dl_id):
+            _cleanup_file(filepath)
+            return False, "Cancelled by user", 0
+
+        worker_failures = [r for r in results if r is not True]
+        if worker_failures or failed_chunks:
+            logger.warning(
+                "[DL-FORCEDLOVE] %d workers failed, %d chunks failed",
+                len(worker_failures), len(failed_chunks),
+            )
+            _cleanup_file(filepath)
+            return False, f"Multi-segment failed: {len(failed_chunks)} chunks", 0
+
+        file_size = os.path.getsize(filepath)
+        if file_size < MIN_VALID_VIDEO_SIZE:
+            _cleanup_file(filepath)
+            return False, f"File too small ({file_size} bytes)", 0
+
+        elapsed = time.time() - start_time
+        avg_speed = file_size / elapsed / 1024 / 1024 if elapsed > 0 else 0
+        logger.info(
+            "[DL-FORCEDLOVE] Multi-segment DONE | size=%s | time=%.1fs | avg=%.1f MB/s",
+            _format_size(file_size), elapsed, avg_speed,
+        )
+        return True, "", file_size
+
+    except Exception as e:
+        logger.error("[DL-FORCEDLOVE] Multi-segment error: %s", e, exc_info=True)
+        _cleanup_file(filepath)
+        return False, str(e)[:200], 0
+
+
+async def _make_worker_task(worker_func, worker_id: int):
+    """Wrapper برای اجرای worker با exception handling."""
+    try:
+        return await worker_func(worker_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error("[DL-FORCEDLOVE] Worker %d crashed: %s", worker_id, e)
+        return False
+
+
+def _make_curl_worker(direct_url, filepath, headers,
+                       chunk_queue, downloaded_bytes, completed_chunks,
+                       failed_chunks, progress_lock, file_write_lock,
+                       first_chunk_started, update_progress, dl_id):
+    """ساخت worker function برای دانلود با curl_cffi."""
+
+    async def _worker(worker_id: int) -> bool:
+        max_retries = 3
+        while True:
+            if _is_cancelled(dl_id):
+                return False
+            try:
+                c_idx, byte_start, byte_end = chunk_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return True
+
+            chunk_size = byte_end - byte_start + 1
+
+            for attempt in range(max_retries):
+                if _is_cancelled(dl_id):
+                    return False
+                try:
+                    async with _CurlAsyncSession() as session:
+                        resp = await session.get(
+                            direct_url, impersonate=_CDN_IMPERSONATE,
+                            headers={**headers, "Range": f"bytes={byte_start}-{byte_end}"},
+                            allow_redirects=True, timeout=300,
+                        )
+                        if resp.status_code not in (200, 206):
+                            raise RuntimeError(f"HTTP {resp.status_code}")
+
+                        if not first_chunk_started[0]:
+                            first_chunk_started[0] = True
+                            await update_progress(force=True)
+
+                        chunk_data = resp.content if hasattr(resp, "content") else resp.body
+                        if isinstance(chunk_data, str):
+                            chunk_data = chunk_data.encode("utf-8", errors="replace")
+
+                        if len(chunk_data) != chunk_size:
+                            raise RuntimeError(
+                                f"Size mismatch: expected {chunk_size}, got {len(chunk_data)}"
+                            )
+
+                        async with file_write_lock:
+                            async with aiofiles.open(filepath, "r+b") as f:
+                                await f.seek(byte_start)
+                                await f.write(chunk_data)
+
+                        downloaded_bytes[c_idx] = chunk_size
+                        async with progress_lock:
+                            completed_chunks[0] += 1
+                            await update_progress()
+                        break
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(
+                        "[DL-FORCEDLOVE] W%d c%d attempt %d failed: %s",
+                        worker_id, c_idx, attempt + 1, e,
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 * (attempt + 1))
+                    else:
+                        failed_chunks.append((c_idx, str(e)[:100]))
+                        try:
+                            chunk_queue.task_done()
+                        except Exception:
+                            pass
+                        return False
+
+            try:
+                chunk_queue.task_done()
+            except Exception:
+                pass
+        return True
+
+    return _worker
+
+
+def _make_aiohttp_worker(direct_url, filepath, headers,
+                          chunk_queue, downloaded_bytes, completed_chunks,
+                          failed_chunks, progress_lock, file_write_lock,
+                          first_chunk_started, update_progress, dl_id):
+    """ساخت worker function برای دانلود با aiohttp (fallback)."""
+    shared_timeout = ClientTimeout(total=600, connect=30, sock_read=120)
+    connector = TCPConnector(
+        limit=CONNECTOR_LIMIT,
+        limit_per_host=CONNECTOR_LIMIT_PER_HOST,
+        keepalive_timeout=60,
+        enable_cleanup_closed=True,
+    )
+
+    session_holder = {"session": None}
+
+    async def _ensure_session():
+        if session_holder["session"] is None:
+            session_holder["session"] = aiohttp.ClientSession(
+                timeout=shared_timeout, headers=headers, connector=connector,
+            )
+        return session_holder["session"]
+
+    async def _worker(worker_id: int) -> bool:
+        max_retries = 3
+        session = await _ensure_session()
+
+        while True:
+            if _is_cancelled(dl_id):
+                return False
+            try:
+                c_idx, byte_start, byte_end = chunk_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return True
+
+            chunk_size = byte_end - byte_start + 1
+
+            for attempt in range(max_retries):
+                if _is_cancelled(dl_id):
+                    return False
+                try:
+                    async with session.get(
+                        direct_url,
+                        headers={"Range": f"bytes={byte_start}-{byte_end}"},
+                        allow_redirects=True,
+                    ) as resp:
+                        if resp.status not in (200, 206):
+                            raise RuntimeError(f"HTTP {resp.status}")
+                        if not first_chunk_started[0]:
+                            first_chunk_started[0] = True
+                            await update_progress(force=True)
+                        chunk_data = bytearray()
+                        async for piece in resp.content.iter_chunked(CHUNK_SIZE):
+                            if not piece:
+                                continue
+                            if _is_cancelled(dl_id):
+                                return False
+                            chunk_data.extend(piece)
+                        if len(chunk_data) != chunk_size:
+                            raise RuntimeError(
+                                f"Size mismatch: expected {chunk_size}, got {len(chunk_data)}"
+                            )
+                        async with file_write_lock:
+                            async with aiofiles.open(filepath, "r+b") as f:
+                                await f.seek(byte_start)
+                                await f.write(bytes(chunk_data))
+                        downloaded_bytes[c_idx] = chunk_size
+                        async with progress_lock:
+                            completed_chunks[0] += 1
+                            await update_progress()
+                        break
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(
+                        "[DL-FORCEDLOVE] W%d c%d attempt %d failed: %s",
+                        worker_id, c_idx, attempt + 1, e,
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 * (attempt + 1))
+                    else:
+                        failed_chunks.append((c_idx, str(e)[:100]))
+                        try:
+                            chunk_queue.task_done()
+                        except Exception:
+                            pass
+                        return False
+
+            try:
+                chunk_queue.task_done()
+            except Exception:
+                pass
+        return True
+
+    return _worker
+
+
+# ─── Download: Single connection (fallback) ───────────────────────────────
+
+
+async def _download_single(url: str, filepath: str, referer: str,
+                            progress_cb: ProgressCallback, dl_id: str = "") -> Tuple[bool, str, int]:
+    """دانلود با single connection (fallback)."""
+    headers = {
+        **_CDN_HEADERS,
+        "Referer": referer,
+        "Origin": "https://forced.love",
+    }
+
+    if _check_curl_cffi():
+        try:
+            t0 = time.time()
+            async with _CurlAsyncSession() as session:
+                resp = await session.get(
+                    url, impersonate=_CDN_IMPERSONATE, headers=headers,
+                    allow_redirects=True, timeout=3600,
+                    stream=True,
+                )
+                if resp.status_code not in (200, 206):
+                    _cleanup_file(filepath)
+                    return False, f"HTTP {resp.status_code}", 0
+
+                content_length = int(resp.headers.get("Content-Length", 0))
+                if content_length > MAX_DOWNLOAD_SIZE:
+                    _cleanup_file(filepath)
+                    return False, f"File too large: {_format_size(content_length)}", 0
+
+                downloaded = 0
+                start_time = time.time()
+                last_update = 0.0
+
+                async with aiofiles.open(filepath, "wb") as f:
+                    async for chunk in resp.aiter_content(chunk_size=CHUNK_SIZE):
+                        if _is_cancelled(dl_id):
+                            _cleanup_file(filepath)
+                            return False, "Cancelled by user", 0
+                        if not chunk:
+                            continue
+                        await f.write(chunk)
+                        downloaded += len(chunk)
+                        now = time.time()
+                        if now - last_update >= PROGRESS_INTERVAL:
+                            last_update = now
+                            await progress_cb(
+                                _format_progress(downloaded, content_length, start_time, now)
+                            )
+
+                size = os.path.getsize(filepath)
+                if size < MIN_VALID_VIDEO_SIZE:
+                    _cleanup_file(filepath)
+                    return False, f"File too small ({size} bytes)", 0
+                elapsed = time.time() - t0
+                logger.info(
+                    "[DL-FORCEDLOVE] Single (curl_cffi) DONE | size=%s | time=%.1fs",
+                    _format_size(size), elapsed,
+                )
+                return True, "", size
+
+        except Exception as e:
+            logger.warning(f"[DL-FORCEDLOVE] Single (curl_cffi) error: {e}")
+            _cleanup_file(filepath)
+
+    error = ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            timeout = ClientTimeout(total=3600, connect=30, sock_read=120)
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as s:
+                async with s.get(url, allow_redirects=True) as resp:
+                    if resp.status != 200:
+                        error = f"HTTP {resp.status}"
+                        if 400 <= resp.status < 500:
+                            _cleanup_file(filepath)
+                            return False, error, 0
+                    else:
+                        content_length = int(resp.headers.get("Content-Length", 0))
+                        if content_length > MAX_DOWNLOAD_SIZE:
+                            return False, f"File too large: {_format_size(content_length)}", 0
+                        downloaded = 0
+                        start_time = time.time()
+                        last_update = 0.0
+                        async with aiofiles.open(filepath, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                                if _is_cancelled(dl_id):
+                                    _cleanup_file(filepath)
+                                    return False, "Cancelled by user", 0
+                                await f.write(chunk)
+                                downloaded += len(chunk)
+                                now = time.time()
+                                if now - last_update >= PROGRESS_INTERVAL:
+                                    last_update = now
+                                    await progress_cb(
+                                        _format_progress(downloaded, content_length, start_time, now)
+                                    )
+                        size = os.path.getsize(filepath)
+                        if size < MIN_VALID_VIDEO_SIZE:
+                            _cleanup_file(filepath)
+                            return False, f"File too small ({size} bytes)", 0
+                        return True, "", size
+        except asyncio.CancelledError:
+            _cleanup_file(filepath)
+            raise
+        except Exception as e:
+            error = str(e)[:200]
+        if attempt < MAX_RETRIES:
+            _cleanup_file(filepath)
+            await asyncio.sleep(RETRY_DELAY * attempt)
+    _cleanup_file(filepath)
+    return False, f"Failed after {MAX_RETRIES} attempts: {error}", 0
+
+
+# ─── Download: yt-dlp (fallback نهایی) ────────────────────────────────────
+
+
+async def _download_with_ytdlp(url: str, filepath: str, progress_cb: ProgressCallback) -> Tuple[bool, str, int]:
+    """fallback نهایی با yt-dlp روی page URL."""
+    if not shutil.which("yt-dlp"):
+        return False, "yt-dlp not installed", 0
+    has_curl_cffi = _check_curl_cffi()
+    await progress_cb("📥 **Fallback: yt-dlp...**")
+
+    try:
+        cmd = [
+            "yt-dlp", "--no-warnings", "--progress", "--newline",
+            "--no-check-certificates", "-f", "best",
+            "--concurrent-fragments", "16",
+            "--retries", "10", "--fragment-retries", "10",
+            "--buffer-size", "16K",
+            "--max-filesize", str(MAX_DOWNLOAD_SIZE),
+            "--add-header", f"User-Agent:{_SAFARI_UA}",
+            "--add-header", f"Referer:https://forced.love/",
+            "-o", filepath,
+        ]
+        # yt-dlp از impersonate پشتیبانی می‌کنه (نسخه‌های جدید)
+        if has_curl_cffi:
+            cmd.extend(["--impersonate", "safari"])
+        cmd.append(url)
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        last_update = 0.0
+        while True:
+            try:
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=300)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                _cleanup_file(filepath)
+                return False, "Download timed out", 0
+            if not line:
+                break
+            text = line.decode(errors="replace").strip()
+            now = time.time()
+            if now - last_update >= PROGRESS_INTERVAL and text:
+                last_update = now
+                if "[download]" in text:
+                    msg = _parse_ytdlp_progress(text)
+                    if msg:
+                        await progress_cb(msg)
+
+        await process.wait()
+        if process.returncode != 0:
+            stderr = (await process.stderr.read()).decode(errors="replace")
+            err_msg = _extract_ytdlp_error(stderr)
+            return False, err_msg[:200], 0
+
+        actual_path = _find_output_file(filepath)
+        if not actual_path:
+            return False, "Output file not found", 0
+        size = os.path.getsize(actual_path)
+        if size > MAX_DOWNLOAD_SIZE:
+            _cleanup_file(actual_path)
+            return False, "File exceeds size limit", 0
+        if size < MIN_VALID_VIDEO_SIZE:
+            _cleanup_file(actual_path)
+            return False, f"File too small ({size} bytes)", 0
+        if actual_path != filepath:
+            try:
+                os.rename(actual_path, filepath)
+            except OSError:
+                pass
+        logger.info("[DL-FORCEDLOVE] yt-dlp DONE | size=%s", _format_size(size))
+        return True, "", size
+
+    except asyncio.CancelledError:
+        _cleanup_file(filepath)
+        raise
+    except Exception as e:
+        logger.error("[DL-FORCEDLOVE] yt-dlp error: %s", e, exc_info=True)
+        _cleanup_file(filepath)
+        return False, str(e)[:200], 0
+
+
+def _parse_ytdlp_progress(text: str) -> Optional[str]:
+    pct_match = re.search(r"(\d+\.?\d*)%", text)
+    if not pct_match:
+        return None
+    pct = pct_match.group(1)
+    size_match = re.search(r"of\s+~?\s*([\d.]+\s*\w+)", text)
+    speed_match = re.search(r"at\s+([\d.]+\s*\w+/s)", text)
+    eta_match = re.search(r"ETA\s+(\S+)", text)
+    total = size_match.group(1) if size_match else "?"
+    speed = speed_match.group(1) if speed_match else "?"
+    eta = eta_match.group(1) if eta_match else "?"
+    try:
+        pct_num = float(pct)
+        filled = int(pct_num / 5)
+        bar = "█" * filled + "░" * (20 - filled)
+    except (ValueError, TypeError):
+        bar = "░" * 20
+    return (
+        f"📥 **Downloading...**\n`[{bar}]`\n"
+        f"💾 {total}  •  ⚡ {speed}\n📊 {pct}%  •  ⏱ ETA: {eta}"
+    )
+
+
+def _extract_ytdlp_error(stderr: str) -> str:
+    if not stderr:
+        return "Unknown error"
+    for line in stderr.splitlines():
+        line = line.strip()
+        if line.startswith("ERROR:"):
+            return line[6:].strip()[:200]
+    lines = [l.strip() for l in stderr.splitlines() if l.strip()]
+    return lines[-1][:200] if lines else "Unknown error"
+
+
+def _find_output_file(filepath: str) -> Optional[str]:
+    if os.path.exists(filepath):
+        return filepath
+    base, _ = os.path.splitext(filepath)
+    for ext in (".mp4", ".mkv", ".webm", ".ts"):
+        candidate = base + ext
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+# ─── Public API: download ─────────────────────────────────────────────────
+
+
+async def download_forcedlove_video(
+    page_url: str,
+    video_url: str,
+    filepath: str,
+    progress_cb: Optional[ProgressCallback] = None,
+    dl_id: str = "",
+) -> Tuple[bool, str, int]:
+    """
+    دانلود ویدیو از forced.love.
+
+    Args:
+        page_url: URL صفحه ویدیو (برای Referer)
+        video_url: URL مستقیم MP4 (از extract_forcedlove_qualities)
+        filepath: مسیر فایل خروجی
+        progress_cb: callback async برای گزارش پیشرفت
+        dl_id: شناسه download برای cancellation support
+
+    Returns:
+        (success, error, size)
+
+    نکته مهم:
+        CDN به Referer حساسه — handler خودکار Referer و Origin رو set می‌کنه.
+        اگه 403 گرفتیم، ابتدا host رو عوض می‌کنیم، اگه نشد صفحه رو دوباره fetch می‌کنیم.
+    """
+    if not is_forcedlove_url(page_url):
+        return False, "URL host not allowed", 0
+    if not video_url:
+        return False, "Empty video URL", 0
+
+    if progress_cb is None:
+        async def _noop(msg: str) -> None: pass
+        progress_cb = _noop
+
+    if dl_id:
+        _get_state(dl_id)
+
+    referer = page_url
+
+    async def _try_download(url_to_use: str) -> Tuple[bool, str, int]:
+        """تلاش برای دانلود با URL داده شده."""
+        # روش 1: multi-segment
+        logger.info("[DL-FORCEDLOVE] Attempt 1: multi-segment (%d workers)", DEFAULT_SEGMENT_WORKERS)
+        success, error, size = await _download_multi_segment(
+            url_to_use, filepath, referer, progress_cb, dl_id=dl_id,
+        )
+        if success:
+            return True, "", size
+
+        if error == "Cancelled by user":
+            return False, error, 0
+
+        logger.info(f"[DL-FORCEDLOVE] Multi-segment failed: {error}")
+        _cleanup_file(filepath)
+
+        # روش 2: single-connection
+        logger.info("[DL-FORCEDLOVE] Attempt 2: single-connection")
+        success, error, size = await _download_single(
+            url_to_use, filepath, referer, progress_cb, dl_id=dl_id,
+        )
+        if success:
+            return True, "", size
+        logger.info(f"[DL-FORCEDLOVE] Single failed: {error}")
+        _cleanup_file(filepath)
+        return False, error, 0
+
+    # ── مرحله 1: تلاش با URL اصلی ──
+    success, error, size = await _try_download(video_url)
+    if success:
+        return True, "", size
+
+    # ─ـ مرحله 2: اگه 403 بود، host رو عوض کن ──
+    if error == "HTTP_403":
+        logger.info("[DL-FORCEDLOVE] 403 — trying CDN host rotation...")
+        if progress_cb:
+            await progress_cb("🔄 **Switching CDN host...**")
+
+        current_host = urlparse(video_url).hostname or ""
+        for alt_host in _CDN_HOSTS:
+            if alt_host == current_host:
+                continue
+            alt_url = _switch_cdn_host(video_url, alt_host)
+            logger.info("[DL-FORCEDLOVE] Trying host: %s", alt_host)
+            success, error, size = await _try_download(alt_url)
+            if success:
+                return True, "", size
+            if error == "Cancelled by user":
+                return False, error, 0
+
+    # ─ـ مرحله 3: اگه همه host ها fail شدن، صفحه رو دوباره fetch کن ──
+    if error in ("HTTP_403", "Cannot determine file size"):
+        logger.info("[DL-FORCEDLOVE] All hosts failed — refreshing page...")
+        if progress_cb:
+            await progress_cb("🔄 **Refreshing session...**")
+        fresh_html, _ = await _fetch_page(page_url)
+        if fresh_html:
+            new_source = _extract_video_source(fresh_html)
+            if new_source:
+                video_url = new_source["url"]
+                logger.info("[DL-FORCEDLOVE] Got fresh URL")
+                success, error, size = await _try_download(video_url)
+                if success:
+                    return True, "", size
+
+    # ── مرحله 4: yt-dlp ──
+    logger.info("[DL-FORCEDLOVE] Attempt 3: yt-dlp on page URL")
+    success, error, size = await _download_with_ytdlp(page_url, filepath, progress_cb)
+    if success:
+        return True, "", size
+    _cleanup_file(filepath)
+    return False, error or "All download methods failed", 0
+
+
+# ─── Wrapper (سازگار با bot architecture) ─────────────────────────────────
+
+
+async def download_forcedlove_direct(
+    url: str,
+    filepath: str,
+    progress_cb: Optional[ProgressCallback] = None,
+    video_url: str = "",
+    quality: str = "high",
+    dl_id: str = "",
+) -> Tuple[bool, str, int]:
+    """
+    Wrapper برای سازگاری با bot architecture.
+
+    Args:
+        url: URL صفحه ویدیو
+        filepath: مسیر فایل خروجی
+        progress_cb: callback async
+        video_url: اگه از قبل استخراج شده
+        quality: 'high' | 'low' (چون سایت تک‌کیفیتیه، تأثیری نداره)
+        dl_id: شناسه برای cancellation
+    """
+    if not video_url:
+        qualities, title, info = await extract_forcedlove_qualities(url, progress_cb)
+        if not qualities:
+            return False, title or "Extraction failed", 0
+        video_url = qualities[0]["url"]
+    else:
+        qualities, title, info = await extract_forcedlove_qualities(url, progress_cb)
+        if qualities:
+            for q in qualities:
+                if q.get("url") and video_url in q["url"]:
+                    video_url = q["url"]
+                    break
+            else:
+                video_url = qualities[0]["url"]
+
+    return await download_forcedlove_video(
+        url, video_url, filepath, progress_cb, dl_id=dl_id,
+    )
+
+
+# ─── Cancellation API ────────────────────────────────────────────────────
+
+
+def cancel_download(dl_id: str) -> bool:
+    """لغو یه download فعال."""
+    state = _active_downloads.get(dl_id)
+    if state:
+        state.cancelled = True
+        return True
+    return False
+
+
+def clear_download_state(dl_id: str) -> None:
+    """پاکسازی state یه download بعد از اتمام."""
+    _active_downloads.pop(dl_id, None)
+
+
+# ─── CLI (برای تست مستقل) ─────────────────────────────────────────────────
+
+
+async def _cli_main():
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python forcedlove_handler.py <url> [output.mp4] [quality]")
+        sys.exit(1)
+
+    url = sys.argv[1]
+    output = sys.argv[2] if len(sys.argv) > 2 else "/tmp/forcedlove_test.mp4"
+    quality = sys.argv[3] if len(sys.argv) > 3 else "high"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+
+    async def progress_cb(msg: str) -> None:
+        print(f"\r{msg}", end="", flush=True)
+
+    print(f"URL: {url}")
+    print(f"Output: {output}")
+    print()
+
+    success, error, size = await download_forcedlove_direct(
+        url, output, progress_cb=progress_cb, quality=quality,
+    )
+
+    print()
+    if success:
+        print(f"✅ SUCCESS — saved {size} bytes ({_format_size(size)}) to {output}")
+    else:
+        print(f"❌ FAILED — {error}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(_cli_main())
