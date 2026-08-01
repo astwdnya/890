@@ -313,6 +313,11 @@ from otherwebsiteshandler.sextvx_handler import (
     extract_sextvx_qualities,
     download_sextvx_direct,
 )
+from otherwebsiteshandler.porndos_handler import (
+    is_porndos_url,
+    extract_porndos_qualities,
+    download_porndos_direct,
+)
 from otherwebsiteshandler.hdtube_handler import (
     is_hdtube_url,
     extract_hdtube_qualities,
@@ -5315,6 +5320,15 @@ async def generic_url_handler(event):
         status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
         try:
             await process_sextvx_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_porndos_url(target_url):
+        logger.info(f"[URL] PornDos detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_porndos_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -13864,6 +13878,137 @@ async def sextvx_cancel_callback(event):
         pass
 
 
+# ─── PornDos (custom handlers: needs page_url + video_url) ───
+
+porndos_sessions: dict = {}
+
+
+async def process_porndos_request(event, url: str, status_msg):
+    qualities, title, info = await extract_porndos_qualities(url)
+    if not qualities:
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        return
+    session_id = f"pn_{event.chat_id}_{event.id}_{int(time.time())}"
+    porndos_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "info": info,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو PornDos"
+    text = f"🎬 **{title_display}**\n🌐 PornDos\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"pn_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"pn_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def porndos_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in porndos_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = porndos_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "porndos_video"
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = (
+        re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "porndos_video"
+    )
+    filename = f"{safe_title}_{int(time.time())}.mp4"
+    filepath = os.path.join(OUTPUT_FOLDER, filename)
+
+    dl_id = f"pn_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_porndos_direct(
+            entry["url"],
+            filepath,
+            progress_cb,
+            video_url=chosen["url"],
+            quality="high",
+            dl_id=dl_id,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        ul_id = f"pn_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[PORNDOS] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            clear_download_state(dl_id)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def porndos_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("pn_cancel_", "")
+    porndos_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
 youporn_sessions: dict = {}
@@ -14459,6 +14604,12 @@ async def main():
     )
     client.add_event_handler(
         sextvx_cancel_callback, events.CallbackQuery(pattern=r"st_cancel_.+")
+    )
+    client.add_event_handler(
+        porndos_quality_callback, events.CallbackQuery(pattern=r"pn_q_.+")
+    )
+    client.add_event_handler(
+        porndos_cancel_callback, events.CallbackQuery(pattern=r"pn_cancel_.+")
     )
     client.add_event_handler(
         setsearch_callback, events.CallbackQuery(pattern=r"setsearch_.+")
