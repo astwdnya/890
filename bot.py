@@ -318,6 +318,16 @@ from otherwebsiteshandler.porndos_handler import (
     extract_porndos_qualities,
     download_porndos_direct,
 )
+from otherwebsiteshandler.shahvani_handler import (
+    is_shahvani_url,
+    extract_shahvani_qualities,
+    download_shahvani_direct,
+)
+from otherwebsiteshandler.deviants_handler import (
+    is_deviants_url,
+    extract_deviants_qualities,
+    download_deviants_direct,
+)
 from otherwebsiteshandler.hdtube_handler import (
     is_hdtube_url,
     extract_hdtube_qualities,
@@ -5329,6 +5339,24 @@ async def generic_url_handler(event):
         status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
         try:
             await process_porndos_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_shahvani_url(target_url):
+        logger.info(f"[URL] Shahvani detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_shahvani_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_deviants_url(target_url):
+        logger.info(f"[URL] Deviants detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_deviants_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -14009,6 +14037,268 @@ async def porndos_cancel_callback(event):
         pass
 
 
+# ─── Shahvani (custom handlers: needs page_url + video_url) ───
+
+shahvani_sessions: dict = {}
+
+
+async def process_shahvani_request(event, url: str, status_msg):
+    qualities, title, info = await extract_shahvani_qualities(url)
+    if not qualities:
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        return
+    session_id = f"sh_{event.chat_id}_{event.id}_{int(time.time())}"
+    shahvani_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "info": info,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو Shahvani"
+    text = f"🎬 **{title_display}**\n🌐 Shahvani\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"sh_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"sh_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def shahvani_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in shahvani_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = shahvani_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "shahvani_video"
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = (
+        re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "shahvani_video"
+    )
+    filename = f"{safe_title}_{int(time.time())}.mp4"
+    filepath = os.path.join(OUTPUT_FOLDER, filename)
+
+    dl_id = f"sh_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_shahvani_direct(
+            entry["url"],
+            filepath,
+            progress_cb,
+            video_url=chosen["url"],
+            quality="high",
+            dl_id=dl_id,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        ul_id = f"sh_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[SHAHVANI] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            clear_download_state(dl_id)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def shahvani_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("sh_cancel_", "")
+    shahvani_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
+# ─── Deviants (custom handlers: needs page_url + video_url) ───
+
+deviants_sessions: dict = {}
+
+
+async def process_deviants_request(event, url: str, status_msg):
+    qualities, title, info = await extract_deviants_qualities(url)
+    if not qualities:
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        return
+    session_id = f"dv_{event.chat_id}_{event.id}_{int(time.time())}"
+    deviants_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "info": info,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو Deviants"
+    text = f"🎬 **{title_display}**\n🌐 Deviants\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"dv_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"dv_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def deviants_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in deviants_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = deviants_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "deviants_video"
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = (
+        re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "deviants_video"
+    )
+    filename = f"{safe_title}_{int(time.time())}.mp4"
+    filepath = os.path.join(OUTPUT_FOLDER, filename)
+
+    dl_id = f"dv_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_deviants_direct(
+            entry["url"],
+            filepath,
+            progress_cb,
+            video_url=chosen["url"],
+            quality="high",
+            dl_id=dl_id,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        ul_id = f"dv_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[DEVIANTS] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            clear_download_state(dl_id)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def deviants_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("dv_cancel_", "")
+    deviants_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
 youporn_sessions: dict = {}
@@ -14610,6 +14900,18 @@ async def main():
     )
     client.add_event_handler(
         porndos_cancel_callback, events.CallbackQuery(pattern=r"pn_cancel_.+")
+    )
+    client.add_event_handler(
+        shahvani_quality_callback, events.CallbackQuery(pattern=r"sh_q_.+")
+    )
+    client.add_event_handler(
+        shahvani_cancel_callback, events.CallbackQuery(pattern=r"sh_cancel_.+")
+    )
+    client.add_event_handler(
+        deviants_quality_callback, events.CallbackQuery(pattern=r"dv_q_.+")
+    )
+    client.add_event_handler(
+        deviants_cancel_callback, events.CallbackQuery(pattern=r"dv_cancel_.+")
     )
     client.add_event_handler(
         setsearch_callback, events.CallbackQuery(pattern=r"setsearch_.+")
