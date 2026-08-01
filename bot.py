@@ -278,6 +278,21 @@ from otherwebsiteshandler.xxxbp_handler import (
     cancel_download,
     clear_download_state,
 )
+from otherwebsiteshandler.sexxxx_handler import (
+    is_sexxxx_url,
+    extract_sexxxx_qualities,
+    download_sexxxx_direct,
+)
+from otherwebsiteshandler.elliniko_handler import (
+    is_elliniko_url,
+    extract_elliniko_qualities,
+    download_elliniko_direct,
+)
+from otherwebsiteshandler.rapelust_handler import (
+    is_rapelust_url,
+    extract_rapelust_qualities,
+    download_rapelust_direct,
+)
 from otherwebsiteshandler.hdtube_handler import (
     is_hdtube_url,
     extract_hdtube_qualities,
@@ -5217,6 +5232,33 @@ async def generic_url_handler(event):
         status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
         try:
             await process_xxxbp_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_sexxxx_url(target_url):
+        logger.info(f"[URL] SexXXX detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_sexxxx_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_elliniko_url(target_url):
+        logger.info(f"[URL] Elliniko detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_elliniko_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_rapelust_url(target_url):
+        logger.info(f"[URL] RapeLust detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_rapelust_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -12849,6 +12891,399 @@ async def xxxbp_cancel_callback(event):
         pass
 
 
+# ─── SexXXX (custom handlers: needs page_url + video_url) ───
+
+sexxxx_sessions: dict = {}
+
+
+async def process_sexxxx_request(event, url: str, status_msg):
+    qualities, title, info = await extract_sexxxx_qualities(url)
+    if not qualities:
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        return
+    session_id = f"sxx_{event.chat_id}_{event.id}_{int(time.time())}"
+    sexxxx_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "info": info,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو SexXXX"
+    text = f"🎬 **{title_display}**\n🌐 SexXXX\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"sxx_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"sxx_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def sexxxx_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in sexxxx_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = sexxxx_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "sexxxx_video"
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = (
+        re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "sexxxx_video"
+    )
+    filename = f"{safe_title}_{int(time.time())}.mp4"
+    filepath = os.path.join(OUTPUT_FOLDER, filename)
+
+    dl_id = f"sx_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_sexxxx_direct(
+            entry["url"],
+            filepath,
+            progress_cb,
+            video_url=chosen["url"],
+            quality="high",
+            dl_id=dl_id,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        ul_id = f"sx_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[SEXXX] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            clear_download_state(dl_id)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def sexxxx_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("sxx_cancel_", "")
+    sexxxx_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
+# ─── Elliniko (custom handlers: needs page_url + video_url) ───
+
+elliniko_sessions: dict = {}
+
+
+async def process_elliniko_request(event, url: str, status_msg):
+    qualities, title, info = await extract_elliniko_qualities(url)
+    if not qualities:
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        return
+    session_id = f"el_{event.chat_id}_{event.id}_{int(time.time())}"
+    elliniko_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "info": info,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو Elliniko"
+    text = f"🎬 **{title_display}**\n🌐 Elliniko\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"el_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"el_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def elliniko_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in elliniko_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = elliniko_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "elliniko_video"
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = (
+        re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "elliniko_video"
+    )
+    filename = f"{safe_title}_{int(time.time())}.mp4"
+    filepath = os.path.join(OUTPUT_FOLDER, filename)
+
+    dl_id = f"el_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_elliniko_direct(
+            entry["url"],
+            filepath,
+            progress_cb,
+            video_url=chosen["url"],
+            quality="high",
+            dl_id=dl_id,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        ul_id = f"el_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[ELLINIKO] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            clear_download_state(dl_id)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def elliniko_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("el_cancel_", "")
+    elliniko_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
+# ─── RapeLust (custom handlers: needs page_url + video_url) ───
+
+rapelust_sessions: dict = {}
+
+
+async def process_rapelust_request(event, url: str, status_msg):
+    qualities, title, info = await extract_rapelust_qualities(url)
+    if not qualities:
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        return
+    session_id = f"rp_{event.chat_id}_{event.id}_{int(time.time())}"
+    rapelust_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "info": info,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو RapeLust"
+    text = f"🎬 **{title_display}**\n🌐 RapeLust\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"rp_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"rp_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def rapelust_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in rapelust_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = rapelust_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "rapelust_video"
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = (
+        re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "rapelust_video"
+    )
+    filename = f"{safe_title}_{int(time.time())}.mp4"
+    filepath = os.path.join(OUTPUT_FOLDER, filename)
+
+    dl_id = f"rp_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_rapelust_direct(
+            entry["url"],
+            filepath,
+            progress_cb,
+            video_url=chosen["url"],
+            quality="high",
+            dl_id=dl_id,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        ul_id = f"rp_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[RAPELUST] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            clear_download_state(dl_id)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def rapelust_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("rp_cancel_", "")
+    rapelust_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
 youporn_sessions: dict = {}
@@ -13402,6 +13837,24 @@ async def main():
     )
     client.add_event_handler(
         xxxbp_cancel_callback, events.CallbackQuery(pattern=r"xb_cancel_.+")
+    )
+    client.add_event_handler(
+        sexxxx_quality_callback, events.CallbackQuery(pattern=r"sxx_q_.+")
+    )
+    client.add_event_handler(
+        sexxxx_cancel_callback, events.CallbackQuery(pattern=r"sxx_cancel_.+")
+    )
+    client.add_event_handler(
+        elliniko_quality_callback, events.CallbackQuery(pattern=r"el_q_.+")
+    )
+    client.add_event_handler(
+        elliniko_cancel_callback, events.CallbackQuery(pattern=r"el_cancel_.+")
+    )
+    client.add_event_handler(
+        rapelust_quality_callback, events.CallbackQuery(pattern=r"rp_q_.+")
+    )
+    client.add_event_handler(
+        rapelust_cancel_callback, events.CallbackQuery(pattern=r"rp_cancel_.+")
     )
     client.add_event_handler(
         setsearch_callback, events.CallbackQuery(pattern=r"setsearch_.+")
