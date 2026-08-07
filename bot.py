@@ -66,7 +66,8 @@ if _searcher_imdb_dir not in _sys.path:
     _sys.path.insert(0, _searcher_imdb_dir)
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality
-from searcher.imdb.videotext_burn import burn_subtitles
+# burn_subtitles disabled — ویدیو و زیرنویس به‌صورت جداگانه ارسال میشن (HTTP 413 روی فایل‌های بزرگ)
+# from searcher.imdb.videotext_burn import burn_subtitles
 from ytdlp_handler import (
     is_ytdlp_site_url,
     extract_qualities_ytdlp,
@@ -12635,7 +12636,7 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
                 sub_name = state["selected_sub"].get("file_name", "")
                 await status_msg.edit(f"✅ زیرنویس: `{sub_name}`", parse_mode="md")
             else:
-                await status_msg.edit("⚠ زیرنویس دانلود نشد، بدون burn ادامه میدیم.")
+                await status_msg.edit("⚠ زیرنویس دانلود نشد، بدون زیرنویس ادامه میدیم.")
                 with_subtitle = False
 
         last_progress = [0]
@@ -12690,54 +12691,6 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
         await status_msg.edit(f"✅ ویدیو دانلود شد ({vid_size:.1f} MB)")
 
         final_path = video_path
-        if with_subtitle and sub_path:
-            await status_msg.edit(
-                "🔥 در حال burn زیرنویس...\n⏳ این مرحله چند دقیقه طول میکشه."
-            )
-
-            burn_progress = [0, ""]
-
-            def on_burn(s):
-                check_cancel()
-                burn_progress[0] = s.progress
-                burn_progress[1] = s.status
-
-            async def update_burn():
-                while True:
-                    await asyncio.sleep(3)
-                    check_cancel()
-                    p, st = burn_progress
-                    try:
-                        await status_msg.edit(f"🔥 burn: {st} {p}%", buttons=cancel_btn)
-                    except Exception:
-                        pass
-
-            updater = asyncio.create_task(update_burn())
-
-            try:
-                final_path = await burn_subtitles(
-                    video_path=video_path,
-                    subtitle_path=sub_path,
-                    out_dir=out_dir,
-                    on_burn_progress=on_burn,
-                )
-            except Exception as burn_err:
-                logger.error(f"[IMDB] burn error: {burn_err}", exc_info=True)
-                await status_msg.edit(
-                    f"❌ burn خطا: {str(burn_err)[:500]}\n\n⏭ ارسال ویدیوی بدون subtitle...",
-                    buttons=None,
-                )
-                final_path = video_path
-            finally:
-                if updater:
-                    updater.cancel()
-                    updater = None
-
-            if not final_path or not os.path.exists(final_path):
-                await status_msg.edit("❌ burn ناموفق بود. ویدیوی بدون subtitle ارسال میشه.")
-                final_path = video_path
-            else:
-                await status_msg.edit("✅ burn کامل شد!")
 
         file_size = os.path.getsize(final_path)
         size_mb = file_size / 1024 / 1024
@@ -12745,8 +12698,8 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
             await status_msg.edit(f"⚠ فایل خیلی بزرگه ({size_mb:.1f} MB). محدودیت تلگرام 2GB.")
             return
 
-        await status_msg.edit(f"📤 در حال آپلود ({size_mb:.1f} MB)...", buttons=None)
-        caption = _imdb_dl_caption(title, season, episode, sub_name if with_subtitle else None, size_mb)
+        await status_msg.edit(f"📤 در حال آپلود ویدیو ({size_mb:.1f} MB)...", buttons=None)
+        caption = _imdb_dl_caption(title, season, episode, None, size_mb)
 
         cover = info.get("cover")
         if cover:
@@ -12764,6 +12717,20 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
             ul_id=f"imd_ul_{dl_id}",
         )
         active_downloads.pop(dl_id, None)
+
+        # ارسال زیرنویس به‌عنوان فایل جداگانه (اگه کاربر خواسته بود)
+        if with_subtitle and sub_path and os.path.exists(sub_path):
+            try:
+                sub_size_kb = os.path.getsize(sub_path) / 1024
+                sub_caption = f"📝 زیرنویس: `{sub_name}`\n💾 حجم: {sub_size_kb:.1f} KB"
+                await event.respond(
+                    file=sub_path,
+                    caption=sub_caption,
+                    parse_mode="md",
+                    force_document=True,
+                )
+            except Exception as sub_err:
+                logger.warning(f"[IMDB] subtitle send failed: {sub_err}")
 
     except asyncio.CancelledError:
         active_downloads.pop(dl_id, None)
