@@ -12536,6 +12536,7 @@ async def imdb_cb_sub(event):
         await event.answer("زیرنویس نامعتبر", alert=True)
         return
     state["selected_sub"] = state["subs"][sub_idx]
+    await event.answer(f"✅ زیرنویس: {state['selected_sub'].get('file_name', '')[:30]}", alert=False)
     asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
 
 
@@ -12551,6 +12552,7 @@ async def imdb_cb_esub(event):
         await event.answer("زیرنویس نامعتبر", alert=True)
         return
     state["selected_sub"] = state["subs"][sub_idx]
+    await event.answer(f"✅ زیرنویس: {state['selected_sub'].get('file_name', '')[:30]}", alert=False)
     asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
 
 
@@ -12560,6 +12562,7 @@ async def imdb_cb_nosub(event):
     if not state:
         await event.answer("وضعیت شما منقضی شده.", alert=True)
         return
+    await event.answer("⏭ بدون زیرنویس", alert=False)
     asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=False))
 
 
@@ -12569,6 +12572,7 @@ async def imdb_cb_enosub(event):
     if not state:
         await event.answer("وضعیت شما منقضی شده.", alert=True)
         return
+    await event.answer("⏭ بدون زیرنویس", alert=False)
     asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=False))
 
 
@@ -12602,8 +12606,6 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
     out_dir = os.path.join(IMDB_OUTPUT_FOLDER, f"{user_id}_{int(time.time())}")
     os.makedirs(out_dir, exist_ok=True)
 
-    status_msg = await event.respond("📊 آماده‌سازی...")
-
     dl_id = f"imd_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
@@ -12613,14 +12615,28 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
     final_path = None
     updater = None
     cover_path = None
+    status_msg = None
 
     def check_cancel():
         if active_downloads.get(dl_id, {}).get("cancelled"):
             raise asyncio.CancelledError()
 
     try:
+        status_msg = await event.respond("📊 آماده‌سازی...")
+
         label = f"S{season:02d}E{episode:02d}" if season and episode else ""
         await status_msg.edit(f"📥 دانلود {label} با کیفیت {quality}...", buttons=cancel_btn)
+
+        sub_name = None
+        if with_subtitle and state.get("selected_sub"):
+            await status_msg.edit("📝 دانلود زیرنویس...")
+            sub_path = await download_subtitle(state["selected_sub"], out_dir)
+            if sub_path:
+                sub_name = state["selected_sub"].get("file_name", "")
+                await status_msg.edit(f"✅ زیرنویس: `{sub_name}`", parse_mode="md")
+            else:
+                await status_msg.edit("⚠ زیرنویس دانلود نشد، بدون burn ادامه میدیم.")
+                with_subtitle = False
 
         last_progress = [0]
 
@@ -12654,17 +12670,6 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
 
         vid_size = os.path.getsize(video_path) / 1024 / 1024
         await status_msg.edit(f"✅ ویدیو دانلود شد ({vid_size:.1f} MB)")
-
-        sub_name = None
-        if with_subtitle and state.get("selected_sub"):
-            await status_msg.edit("📝 دانلود زیرنویس...")
-            sub_path = await download_subtitle(state["selected_sub"], out_dir)
-            if sub_path:
-                sub_name = state["selected_sub"].get("file_name", "")
-                await status_msg.edit(f"✅ زیرنویس: `{sub_name}`", parse_mode="md")
-            else:
-                await status_msg.edit("⚠ زیرنویس دانلود نشد، بدون burn ادامه میدیم.")
-                with_subtitle = False
 
         final_path = video_path
         if with_subtitle and sub_path:
