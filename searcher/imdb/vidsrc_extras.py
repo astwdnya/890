@@ -303,6 +303,9 @@ async def download_with_quality(
                     continue
 
             logger.error("all streams failed: %s", last_err)
+            # به‌جای None، exception پرتاب کن تا caller بتونه خطا رو به کاربر نشون بده
+            if last_err:
+                raise RuntimeError(f"دانلود ناموفق بود ({len(info.stream_urls)} سرور امتحان شد). آخرین خطا: {last_err}")
             return None
 
 
