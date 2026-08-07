@@ -12947,7 +12947,7 @@ async def xnxx_inline_handler(event):
 
             await event.answer(
                 imdb_results,
-                cache_time=300,
+                cache_time=30,
             )
             logger.info(f"[INLINE] IMDB: {len(imdb_results)} results for '{query}'")
             return
@@ -13018,7 +13018,7 @@ async def xnxx_inline_handler(event):
 
         await event.answer(
             inline_results,
-            cache_time=300,
+            cache_time=30,
         )
         logger.info(
             f"[INLINE] {source}: {len(inline_results)} results for '{query}'"
