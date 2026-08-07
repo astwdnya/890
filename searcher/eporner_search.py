@@ -213,9 +213,9 @@ def _build_search_url(query: str, page: int, sort: str) -> str:
     encoded = quote_plus(query)
 
     if page <= 1:
-        path = f"{_BASE_URL}/search/{encoded}/"
+        path = f"{_BASE_URL}/tag/{encoded}/"
     else:
-        path = f"{_BASE_URL}/search/{encoded}/{page}/"
+        path = f"{_BASE_URL}/tag/{encoded}/{page}/"
 
     order_val = _SORT_MAP.get(sort)
     if order_val:

@@ -59,6 +59,14 @@ from searcher.xnxx_search import search_xnxx, parse_inline_query
 from searcher.pornhub_search import search_pornhub
 from searcher.xvideos_search import search_xvideos
 from searcher.eporner_search import search_eporner
+import sys as _sys
+import os as _os
+_searcher_imdb_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "searcher", "imdb")
+if _searcher_imdb_dir not in _sys.path:
+    _sys.path.insert(0, _searcher_imdb_dir)
+from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
+from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality
+from searcher.imdb.videotext_burn import burn_subtitles
 from ytdlp_handler import (
     is_ytdlp_site_url,
     extract_qualities_ytdlp,
@@ -12217,7 +12225,7 @@ async def setsearch_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
     current = get_user_default_search(event.sender_id)
-    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX"}
+    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX", "imd": "IMDB"}
     buttons = [
         [Button.inline(f"{'✅ ' if current == k else ''}{v}", f"setsearch_{k}") for k, v in labels.items()]
     ]
@@ -12236,10 +12244,10 @@ async def setsearch_callback(event):
     if not data.startswith("setsearch_"):
         return
     src = data.replace("setsearch_", "")
-    if src not in ("ph", "xv", "ep", "xn"):
+    if src not in ("ph", "xv", "ep", "xn", "imd"):
         return
     set_user_default_search(user_id, src)
-    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX"}
+    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX", "imd": "IMDB"}
     buttons = [
         [Button.inline(f"{'✅ ' if src == k else ''}{v}", f"setsearch_{k}") for k, v in labels.items()]
     ]
@@ -12249,6 +12257,513 @@ async def setsearch_callback(event):
         buttons=buttons,
     )
     await event.answer(f"Default search changed to {labels[src]}", alert=True)
+
+
+# ====================== IMDB (vidsrc) SEARCH & DOWNLOAD ======================
+
+imdb_states: Dict[int, dict] = {}
+IMDB_OUTPUT_FOLDER = os.path.join(OUTPUT_FOLDER, "imdb")
+
+
+def _imdb_format_caption(info: dict, eps=None) -> str:
+    title = info.get("title", "Unknown")
+    year = info.get("year")
+    end_year = info.get("end_year")
+    title_type = info.get("title_type", "")
+    plot = info.get("plot", "")
+    lines = [f"🎬 **{title}**"]
+    if year:
+        if end_year:
+            lines.append(f"📅 {year}–{end_year}")
+        else:
+            lines.append(f"📅 {year}")
+    if title_type:
+        lines.append(f"🎞 {title_type}")
+    if plot:
+        if len(plot) > 400:
+            plot = plot[:400] + "..."
+        lines.append(f"\n📝 {plot}")
+    if eps:
+        lines.append(f"\n📺 {eps['total_seasons']} فصل · {eps['total_episodes']} قسمت")
+    return "\n".join(lines)
+
+
+def _imdb_dl_caption(title: str, season, episode, subtitle_name, file_size_mb: float) -> str:
+    lines = []
+    if season and episode:
+        lines.append(f"🎬 **{title}** - S{season:02d}E{episode:02d}")
+    else:
+        lines.append(f"🎬 **{title}**")
+    if subtitle_name:
+        lines.append(f"📝 زیرنویس هاردکد: `{subtitle_name}`")
+    lines.append(f"💾 حجم: {file_size_mb:.1f} MB")
+    return "\n".join(lines)
+
+
+def _imdb_seasons_buttons(eps) -> list:
+    buttons = []
+    row = []
+    for s in sorted(eps["seasons"].keys(), key=lambda x: -x):
+        ep_count = len(eps["seasons"][s])
+        row.append(Button.inline(f"فصل {s} ({ep_count} ق)", f"imd_season_{s}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([Button.inline("✖ بستن", "imd_close")])
+    return buttons
+
+
+def _imdb_quality_buttons(qualities: list, is_episode: bool) -> list:
+    buttons = []
+    row = []
+    for q in qualities:
+        label = q["label"]
+        if q.get("resolution"):
+            label += f" ({q['resolution']})"
+        row.append(Button.inline(label, f"imd_eq_{q['label']}" if is_episode else f"imd_q_{q['label']}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([Button.inline("⏭ بدون زیرنویس", "imd_enosub" if is_episode else "imd_nosub")])
+    buttons.append([Button.inline("✖ بستن", "imd_close")])
+    return buttons
+
+
+def _imdb_sub_buttons(subs: list, is_episode: bool) -> list:
+    buttons = []
+    if subs:
+        for i, s in enumerate(subs[:5]):
+            label = f"📄 {s['file_name'][:40]} (↓{s['downloads']})"
+            buttons.append([Button.inline(label, f"imd_esub_{i}" if is_episode else f"imd_sub_{i}")])
+    buttons.append([Button.inline("⏭ بدون زیرنویس", "imd_enosub" if is_episode else "imd_nosub")])
+    buttons.append([Button.inline("✖ بستن", "imd_close")])
+    return buttons
+
+
+async def imdb_cb_title(event):
+    data = event.data.decode()
+    imdb_id = data.replace("imd_sel_", "")
+    user_id = event.sender_id
+
+    await event.edit("⏳ در حال دریافت اطلاعات...", buttons=None)
+
+    info = await get_title_info(imdb_id)
+    if not info:
+        await event.edit("❌ دریافت اطلاعات ناموفق بود.")
+        return
+
+    is_series = info.get("is_series", False)
+    caption = _imdb_format_caption(info)
+
+    if is_series:
+        eps = await get_tv_episodes(imdb_id)
+        if not eps or not eps.get("seasons"):
+            await event.edit("❌ اطلاعات فصل/قسمت در دسترس نیست.")
+            return
+        imdb_states[user_id] = {"imdb_id": imdb_id, "info": info, "eps": eps}
+        buttons = _imdb_seasons_buttons(eps)
+        cover = info.get("cover")
+        if cover:
+            try:
+                await event.delete()
+                await event.respond(cover, text=caption, parse_mode="md", buttons=buttons)
+                return
+            except Exception:
+                pass
+        await event.edit(caption, buttons=buttons, parse_mode="md")
+    else:
+        imdb_states[user_id] = {"imdb_id": imdb_id, "info": info}
+        await event.edit(f"{caption}\n\n⏳ در حال گرفتن لیست کیفیت‌ها...", parse_mode="md")
+        qualities = await get_qualities(imdb_id)
+        if not qualities:
+            await event.edit(f"{caption}\n\n❌ کیفیت‌ها در دسترس نیست.", parse_mode="md")
+            return
+        imdb_states[user_id]["qualities"] = qualities
+        q_buttons = _imdb_quality_buttons(qualities, is_episode=False)
+        cover = info.get("cover")
+        if cover:
+            try:
+                await event.delete()
+                await event.respond(
+                    cover,
+                    text=f"{caption}\n\n🎯 کیفیت رو انتخاب کن:",
+                    parse_mode="md",
+                    buttons=q_buttons,
+                )
+                return
+            except Exception:
+                pass
+        await event.edit(f"{caption}\n\n🎯 کیفیت رو انتخاب کن:", buttons=q_buttons, parse_mode="md")
+
+
+async def imdb_cb_season(event):
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("وضعیت شما منقضی شده. دوباره سرچ کنید.", alert=True)
+        return
+    data = event.data.decode()
+    season = int(data.replace("imd_season_", ""))
+    eps = state["eps"]
+    if season not in eps["seasons"]:
+        await event.answer("فصل نامعتبر", alert=True)
+        return
+    state["selected_season"] = season
+    episodes = sorted(eps["seasons"][season])
+    buttons = []
+    row = []
+    for ep in episodes:
+        row.append(Button.inline(str(ep), f"imd_ep_{season}_{ep}"))
+        if len(row) == 5:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([Button.inline("↩ برگشت به فصل‌ها", "imd_back")])
+    buttons.append([Button.inline("✖ بستن", "imd_close")])
+    await event.edit(f"📺 فصل {season} - یکی از قسمت‌ها رو انتخاب کن:", buttons=buttons)
+
+
+async def imdb_cb_back(event):
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("وضعیت شما منقضی شده.", alert=True)
+        return
+    await event.edit("📺 یکی از فصل‌ها رو انتخاب کن:", buttons=_imdb_seasons_buttons(state["eps"]))
+
+
+async def imdb_cb_close(event):
+    user_id = event.sender_id
+    imdb_states.pop(user_id, None)
+    try:
+        await event.delete()
+    except Exception:
+        await event.edit("✖ بسته شد", buttons=None)
+
+
+async def imdb_cb_episode(event):
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("وضعیت شما منقضی شده.", alert=True)
+        return
+    data = event.data.decode()
+    parts = data.split("_")
+    season = int(parts[2])
+    episode = int(parts[3])
+    imdb_id = state["imdb_id"]
+    title = state["info"].get("title", "Unknown")
+    state["selected_season"] = season
+    state["selected_episode"] = episode
+    await event.edit(
+        f"🎬 **{title}** - S{season:02d}E{episode:02d}\n\n⏳ در حال گرفتن لیست کیفیت‌ها...",
+        parse_mode="md",
+    )
+    qualities = await get_qualities(imdb_id, season, episode)
+    if not qualities:
+        await event.edit("❌ کیفیت‌ها در دسترس نیست.")
+        return
+    state["qualities"] = qualities
+    await event.edit(
+        f"🎬 **{title}** - S{season:02d}E{episode:02d}\n\n🎯 کیفیت رو انتخاب کن:",
+        buttons=_imdb_quality_buttons(qualities, is_episode=True),
+        parse_mode="md",
+    )
+
+
+async def imdb_cb_quality(event):
+    data = event.data.decode()
+    quality_label = data.replace("imd_q_", "")
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("وضعیت شما منقضی شده.", alert=True)
+        return
+    state["quality"] = quality_label
+    await event.edit(
+        f"✅ کیفیت: **{quality_label}**\n\n📝 زیرنویس فارسی:\n⏳ در حال جستجوی زیرنویس...",
+        parse_mode="md",
+    )
+    subs = await search_subtitles(state["imdb_id"], "per")
+    state["subs"] = subs
+    await event.edit(
+        f"✅ کیفیت: **{quality_label}**\n\n📝 زیرنویس فارسی:\n"
+        + (f"📄 {len(subs)} زیرنویس پیدا شد:" if subs else "❌ زیرنویسی پیدا نشد"),
+        buttons=_imdb_sub_buttons(subs, is_episode=False),
+        parse_mode="md",
+    )
+
+
+async def imdb_cb_equality(event):
+    data = event.data.decode()
+    quality_label = data.replace("imd_eq_", "")
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("وضعیت شما منقضی شده.", alert=True)
+        return
+    state["quality"] = quality_label
+    season = state["selected_season"]
+    episode = state["selected_episode"]
+    await event.edit(
+        f"✅ کیفیت: **{quality_label}**\n\n📝 زیرنویس فارسی:\n⏳ در حال جستجوی زیرنویس...",
+        parse_mode="md",
+    )
+    subs = await search_subtitles(state["imdb_id"], "per", season, episode)
+    state["subs"] = subs
+    await event.edit(
+        f"✅ کیفیت: **{quality_label}**\n\n📝 زیرنویس فارسی:\n"
+        + (f"📄 {len(subs)} زیرنویس پیدا شد:" if subs else "❌ زیرنویسی پیدا نشد"),
+        buttons=_imdb_sub_buttons(subs, is_episode=True),
+        parse_mode="md",
+    )
+
+
+async def imdb_cb_sub(event):
+    data = event.data.decode()
+    sub_idx = int(data.replace("imd_sub_", ""))
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("وضعیت شما منقضی شده.", alert=True)
+        return
+    if sub_idx >= len(state.get("subs", [])):
+        await event.answer("زیرنویس نامعتبر", alert=True)
+        return
+    state["selected_sub"] = state["subs"][sub_idx]
+    asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
+
+
+async def imdb_cb_esub(event):
+    data = event.data.decode()
+    sub_idx = int(data.replace("imd_esub_", ""))
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("وضعیت شما منقضی شده.", alert=True)
+        return
+    if sub_idx >= len(state.get("subs", [])):
+        await event.answer("زیرنویس نامعتبر", alert=True)
+        return
+    state["selected_sub"] = state["subs"][sub_idx]
+    asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
+
+
+async def imdb_cb_nosub(event):
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("وضعیت شما منقضی شده.", alert=True)
+        return
+    asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=False))
+
+
+async def imdb_cb_enosub(event):
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("وضعیت شما منقضی شده.", alert=True)
+        return
+    asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=False))
+
+
+async def _imdb_download_cover(url: str, out_dir: str) -> Optional[str]:
+    try:
+        async with aiohttp.ClientSession(timeout=ClientTimeout(total=20)) as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    path = os.path.join(out_dir, "cover.jpg")
+                    with open(path, "wb") as f:
+                        f.write(await resp.read())
+                    return path
+    except Exception as e:
+        logger.warning(f"[IMDB] cover download failed: {e}")
+    return None
+
+
+async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("وضعیت شما منقضی شده.", alert=True)
+        return
+
+    imdb_id = state["imdb_id"]
+    info = state["info"]
+    title = info.get("title", "Unknown")
+    quality = state.get("quality", "Auto")
+    season = state.get("selected_season")
+    episode = state.get("selected_episode")
+
+    out_dir = os.path.join(IMDB_OUTPUT_FOLDER, f"{user_id}_{int(time.time())}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    status_msg = await event.respond("📊 آماده‌سازی...")
+
+    dl_id = f"imd_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    video_path = None
+    sub_path = None
+    final_path = None
+    updater = None
+    cover_path = None
+
+    def check_cancel():
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError()
+
+    try:
+        label = f"S{season:02d}E{episode:02d}" if season and episode else ""
+        await status_msg.edit(f"📥 دانلود {label} با کیفیت {quality}...", buttons=cancel_btn)
+
+        last_progress = [0]
+
+        def vid_progress(done, total):
+            check_cancel()
+            last_progress[0] = (done, total)
+
+        async def update_vid():
+            while True:
+                await asyncio.sleep(5)
+                check_cancel()
+                if last_progress[0]:
+                    d, t = last_progress[0]
+                    pct = d * 100 // t if t else 0
+                    try:
+                        await status_msg.edit(f"📥 دانلود سگمنت: {d}/{t} ({pct}%)", buttons=cancel_btn)
+                    except Exception:
+                        pass
+
+        updater = asyncio.create_task(update_vid())
+
+        video_path = await download_with_quality(
+            imdb_id, quality, out_dir, season, episode, progress_cb=vid_progress
+        )
+        updater.cancel()
+        updater = None
+
+        if not video_path or not os.path.exists(video_path):
+            await status_msg.edit("❌ دانلود ویدیو ناموفق بود.")
+            return
+
+        vid_size = os.path.getsize(video_path) / 1024 / 1024
+        await status_msg.edit(f"✅ ویدیو دانلود شد ({vid_size:.1f} MB)")
+
+        sub_name = None
+        if with_subtitle and state.get("selected_sub"):
+            await status_msg.edit("📝 دانلود زیرنویس...")
+            sub_path = await download_subtitle(state["selected_sub"], out_dir)
+            if sub_path:
+                sub_name = state["selected_sub"].get("file_name", "")
+                await status_msg.edit(f"✅ زیرنویس: `{sub_name}`", parse_mode="md")
+            else:
+                await status_msg.edit("⚠ زیرنویس دانلود نشد، بدون burn ادامه میدیم.")
+                with_subtitle = False
+
+        final_path = video_path
+        if with_subtitle and sub_path:
+            await status_msg.edit(
+                "🔥 در حال burn زیرنویس...\n⏳ این مرحله چند دقیقه طول میکشه."
+            )
+
+            burn_progress = [0, ""]
+
+            def on_burn(s):
+                check_cancel()
+                burn_progress[0] = s.progress
+                burn_progress[1] = s.status
+
+            async def update_burn():
+                while True:
+                    await asyncio.sleep(3)
+                    check_cancel()
+                    p, st = burn_progress
+                    try:
+                        await status_msg.edit(f"🔥 burn: {st} {p}%", buttons=cancel_btn)
+                    except Exception:
+                        pass
+
+            updater = asyncio.create_task(update_burn())
+
+            final_path = await burn_subtitles(
+                video_path=video_path,
+                subtitle_path=sub_path,
+                out_dir=out_dir,
+                on_burn_progress=on_burn,
+            )
+            updater.cancel()
+            updater = None
+
+            if not final_path or not os.path.exists(final_path):
+                await status_msg.edit("❌ burn ناموفق بود. ویدیوی بدون subtitle ارسال میشه.")
+                final_path = video_path
+            else:
+                await status_msg.edit("✅ burn کامل شد!")
+
+        file_size = os.path.getsize(final_path)
+        size_mb = file_size / 1024 / 1024
+        if size_mb > 1900:
+            await status_msg.edit(f"⚠ فایل خیلی بزرگه ({size_mb:.1f} MB). محدودیت تلگرام 2GB.")
+            return
+
+        await status_msg.edit(f"📤 در حال آپلود ({size_mb:.1f} MB)...", buttons=None)
+        caption = _imdb_dl_caption(title, season, episode, sub_name if with_subtitle else None, size_mb)
+
+        cover = info.get("cover")
+        if cover:
+            cover_path = await _imdb_download_cover(cover, out_dir)
+
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=final_path,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            thumb_filepath=cover_path,
+            ul_id=f"imd_ul_{dl_id}",
+        )
+        active_downloads.pop(dl_id, None)
+
+    except asyncio.CancelledError:
+        active_downloads.pop(dl_id, None)
+        try:
+            await status_msg.edit("❌ دانلود لغو شد.", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        active_downloads.pop(dl_id, None)
+        logger.error(f"[IMDB] download failed: {e}", exc_info=True)
+        try:
+            await status_msg.edit(f"❌ خطا: {e}", buttons=None)
+        except Exception:
+            pass
+    finally:
+        if updater:
+            updater.cancel()
+        imdb_states.pop(user_id, None)
+        for p in [cover_path, sub_path, video_path]:
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+        if final_path and final_path != video_path and os.path.exists(final_path):
+            try:
+                os.unlink(final_path)
+            except Exception:
+                pass
+        try:
+            os.rmdir(out_dir)
+        except Exception:
+            pass
 
 
 async def xnxx_inline_handler(event):
@@ -12274,11 +12789,12 @@ async def xnxx_inline_handler(event):
             )
             return
 
-        # تشخیص منبع: ph:xxx → PornHub, xv:xxx → XVideos, ep:xxx → Eporner, xn:xxx → XNXX
+        # تشخیص منبع: ph:xxx → PornHub, xv:xxx → XVideos, ep:xxx → Eporner, xn:xxx → XNXX, imd:xxx → IMDB
         is_ph = raw.lower().startswith("ph:")
         is_xv = raw.lower().startswith("xv:")
         is_ep = raw.lower().startswith("ep:")
         is_xn = raw.lower().startswith("xn:")
+        is_imd = raw.lower().startswith("imd:")
         if is_ph:
             inner = raw[3:].strip()
             parsed = parse_inline_query(inner)
@@ -12292,6 +12808,8 @@ async def xnxx_inline_handler(event):
         elif is_xn:
             inner = raw[3:].strip()
             parsed = parse_inline_query(inner)
+        elif is_imd:
+            inner = raw[4:].strip()
         else:
             # بدون پیشوند — استفاده از سرچر دیفالت کاربر
             default_src = get_user_default_search(event.sender_id)
@@ -12310,19 +12828,29 @@ async def xnxx_inline_handler(event):
                 is_ep = True
                 inner = raw
                 parsed = parse_inline_query(inner)
+            elif default_src == "imd":
+                is_imd = True
+                inner = raw
             else:  # "xn"
                 is_xn = True
                 inner = raw
                 parsed = parse_inline_query(inner)
 
-        query = parsed["query"]
-        page = parsed["page"]
-        sort = parsed["sort"]
+        if is_imd:
+            query = inner
+            page = 1
+            sort = ""
+        else:
+            query = parsed["query"]
+            page = parsed["page"]
+            sort = parsed["sort"]
 
-        source = "EP" if is_ep else ("XV" if is_xv else ("PH" if is_ph else "XNXX"))
+        source = "IMDB" if is_imd else ("EP" if is_ep else ("XV" if is_xv else ("PH" if is_ph else "XNXX")))
         logger.info(f"[INLINE] {source}: q='{query}' page={page} sort={sort}")
 
-        if is_ph:
+        if is_imd:
+            results = await search_imdb(query, limit=INLINE_RESULTS_LIMIT)
+        elif is_ph:
             ph_page = max(1, page) if page > 0 else 1
             results = await search_pornhub(
                 query, page=ph_page, limit=INLINE_RESULTS_LIMIT, sort=ph_sort
@@ -12348,6 +12876,80 @@ async def xnxx_inline_handler(event):
                 switch_pm_parameter="search",
                 cache_time=30,
             )
+            return
+
+        if is_imd:
+            imdb_results = []
+            builder = event.builder
+            for i, item in enumerate(results):
+                title = item.get("title", "Untitled")[:128]
+                imdb_id = item.get("imdb_id", "")
+                year = item.get("year") or ""
+                kind = item.get("kind") or ""
+                stars = item.get("stars") or ""
+                cover = item.get("cover") or ""
+                is_series = item.get("is_series", False)
+
+                description = " · ".join(
+                    [p for p in (str(year) if year else "", kind, stars) if p]
+                ) or "—"
+
+                message_text = (
+                    f"🎬 **{title}**\n\n"
+                    + (f"📅 Year: {year}\n" if year else "")
+                    + (f"🎞 Kind: {kind}\n" if kind else "")
+                    + (f"👥 Stars: {stars}\n" if stars else "")
+                    + f"\n🔗 https://www.imdb.com/title/{imdb_id}/"
+                )
+
+                buttons = [
+                    [
+                        Button.inline(
+                            "📥 دانلود" + (" 📺" if is_series else " 🎬"),
+                            f"imd_sel_{imdb_id}",
+                        )
+                    ]
+                ]
+
+                try:
+                    if cover:
+                        imdb_results.append(
+                            builder.photo(
+                                file=cover,
+                                text=message_text,
+                                buttons=buttons,
+                                parse_mode="md",
+                                link_preview=False,
+                            )
+                        )
+                    else:
+                        imdb_results.append(
+                            builder.article(
+                                title=title,
+                                description=description,
+                                text=message_text,
+                                buttons=buttons,
+                                parse_mode="md",
+                                link_preview=False,
+                            )
+                        )
+                except Exception:
+                    imdb_results.append(
+                        builder.article(
+                            title=title,
+                            description=description,
+                            text=message_text,
+                            buttons=buttons,
+                            parse_mode="md",
+                            link_preview=False,
+                        )
+                    )
+
+            await event.answer(
+                imdb_results,
+                cache_time=300,
+            )
+            logger.info(f"[INLINE] IMDB: {len(imdb_results)} results for '{query}'")
             return
 
         inline_results = []
@@ -15887,6 +16489,19 @@ async def main():
 
     # Inline search handler
     client.add_event_handler(xnxx_inline_handler, events.InlineQuery())
+
+    # IMDB (vidsrc) search & download callbacks
+    client.add_event_handler(imdb_cb_title, events.CallbackQuery(pattern=r"imd_sel_"))
+    client.add_event_handler(imdb_cb_season, events.CallbackQuery(pattern=r"imd_season_"))
+    client.add_event_handler(imdb_cb_episode, events.CallbackQuery(pattern=r"imd_ep_"))
+    client.add_event_handler(imdb_cb_back, events.CallbackQuery(pattern=r"imd_back$"))
+    client.add_event_handler(imdb_cb_close, events.CallbackQuery(pattern=r"imd_close$"))
+    client.add_event_handler(imdb_cb_quality, events.CallbackQuery(pattern=r"imd_q_"))
+    client.add_event_handler(imdb_cb_equality, events.CallbackQuery(pattern=r"imd_eq_"))
+    client.add_event_handler(imdb_cb_sub, events.CallbackQuery(pattern=r"imd_sub_"))
+    client.add_event_handler(imdb_cb_esub, events.CallbackQuery(pattern=r"imd_esub_"))
+    client.add_event_handler(imdb_cb_nosub, events.CallbackQuery(pattern=r"imd_nosub$"))
+    client.add_event_handler(imdb_cb_enosub, events.CallbackQuery(pattern=r"imd_enosub$"))
 
     me = await client.get_me()
     global BOT_USERNAME
