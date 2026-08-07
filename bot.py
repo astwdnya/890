@@ -12658,11 +12658,21 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
 
         updater = asyncio.create_task(update_vid())
 
-        video_path = await download_with_quality(
-            imdb_id, quality, out_dir, season, episode, progress_cb=vid_progress
-        )
-        updater.cancel()
-        updater = None
+        try:
+            video_path = await download_with_quality(
+                imdb_id, quality, out_dir, season, episode, progress_cb=vid_progress
+            )
+        except Exception as dl_err:
+            logger.error(f"[IMDB] video download error: {dl_err}", exc_info=True)
+            await status_msg.edit(
+                f"❌ دانلود ویدیو ناموفق بود.\n\n{str(dl_err)[:2000]}",
+                buttons=None,
+            )
+            return
+        finally:
+            if updater:
+                updater.cancel()
+                updater = None
 
         if not video_path or not os.path.exists(video_path):
             await status_msg.edit("❌ دانلود ویدیو ناموفق بود.")
@@ -12696,14 +12706,24 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
 
             updater = asyncio.create_task(update_burn())
 
-            final_path = await burn_subtitles(
-                video_path=video_path,
-                subtitle_path=sub_path,
-                out_dir=out_dir,
-                on_burn_progress=on_burn,
-            )
-            updater.cancel()
-            updater = None
+            try:
+                final_path = await burn_subtitles(
+                    video_path=video_path,
+                    subtitle_path=sub_path,
+                    out_dir=out_dir,
+                    on_burn_progress=on_burn,
+                )
+            except Exception as burn_err:
+                logger.error(f"[IMDB] burn error: {burn_err}", exc_info=True)
+                await status_msg.edit(
+                    f"❌ burn خطا: {str(burn_err)[:500]}\n\n⏭ ارسال ویدیوی بدون subtitle...",
+                    buttons=None,
+                )
+                final_path = video_path
+            finally:
+                if updater:
+                    updater.cancel()
+                    updater = None
 
             if not final_path or not os.path.exists(final_path):
                 await status_msg.edit("❌ burn ناموفق بود. ویدیوی بدون subtitle ارسال میشه.")
