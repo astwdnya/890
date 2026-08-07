@@ -12664,9 +12664,12 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
             )
         except Exception as dl_err:
             logger.error(f"[IMDB] video download error: {dl_err}", exc_info=True)
+            ep_ctx = f" S{season}E{episode}" if season and episode else ""
             await status_msg.edit(
-                f"❌ دانلود ویدیو ناموفق بود.\n\n{str(dl_err)[:2000]}",
+                f"❌ دانلود ویدیو ناموفق بود ({imdb_id}{ep_ctx} | {quality}):\n\n"
+                f"<code>{str(dl_err)[:1500]}</code>",
                 buttons=None,
+                parse_mode="html",
             )
             return
         finally:
@@ -12675,7 +12678,12 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
                 updater = None
 
         if not video_path or not os.path.exists(video_path):
-            await status_msg.edit("❌ دانلود ویدیو ناموفق بود.")
+            await status_msg.edit(
+                f"❌ دانلود ویدیو ناموفق بود.\n\n"
+                f"DEBUG: video_path={video_path!r} — این معمولاً یعنی ربات با کد قدیمی در حال اجراست؛ "
+                f"ری‌استارتش کنید.",
+                buttons=None,
+            )
             return
 
         vid_size = os.path.getsize(video_path) / 1024 / 1024
