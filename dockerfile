@@ -1,9 +1,13 @@
-# ================== Dockerfile for Render.com ==================
-FROM mcr.microsoft.com/playwright/python:v1.58.0-noble
+# ================== Dockerfile for Railway.app ==================
+# Image پایه پایتون سبک
+FROM python:3.12-slim
 
-# نصب ffmpeg و وابستگی‌های سیستم
-RUN apt-get update && apt-get install -y \
+# نصب وابستگی‌های سیستم (ffmpeg + curl + chromium deps برای playwright)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    curl \
+    ca-certificates \
+    # ─── chromium deps برای playwright (بدون نصب chromium کامل) ───
     fonts-liberation \
     libnss3 \
     libatk-bridge2.0-0 \
@@ -13,16 +17,21 @@ RUN apt-get update && apt-get install -y \
     libxdamage1 \
     libxrandr2 \
     libgbm1 \
-    libasound2t64 \
+    libasound2 \
     libxshmfence1 \
-    libssl-dev \
+    libxss1 \
+    libgtk-3-0 \
+    # ─── وابستگی‌های curl_cffi (libcurl-impersonate) ───
+    libcurl4 \
+    libbrotli1 \
+    libzstd1 \
     && rm -rf /var/lib/apt/lists/*
 
 # تنظیمات محیطی
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PLAYWRIGHT_SKIP_FFMPEG_INSTALL=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # محدودیت RAM برای Python GC
 ENV PYTHONMALLOC=malloc
@@ -37,7 +46,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir yt-dlp[default,curl-cffi] && \
     playwright install chromium --with-deps
 
-# کپی کد بات
+# کپی کد ربات
 COPY bot.py .
 COPY FastTelethon.py .
 COPY github.py .
@@ -59,6 +68,5 @@ RUN mkdir -p output_files && chmod -R 777 output_files
 
 EXPOSE 10000
 
-# ulimit -v برای محدود کردن virtual memory به 500MB
-# اگه Render از این پشتیبانی نکنه، پایتون خودش resource limit میزنه
+# اجرای ربات
 CMD ["python", "-u", "bot.py"]

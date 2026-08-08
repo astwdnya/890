@@ -11,3 +11,5 @@ python-dotenv>=1.0.0
 cryptography>=41.0.0
 httpx>=0.25.0
 wasmtime>=20.0.0
+# ─── وابستگی‌های سرچ IMDB / vidsrcme ───
+curl_cffi>=0.7.0
