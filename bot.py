@@ -65,7 +65,12 @@ _searcher_imdb_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
 if _searcher_imdb_dir not in _sys.path:
     _sys.path.insert(0, _searcher_imdb_dir)
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
-from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality
+from searcher.imdb.vidsrc_extras import search_subtitles, download_subtitle
+# ─── استفاده از playwright برای دور زدن rate limit/IP block ───
+# vidsrc_extras.download_with_quality و get_qualities با curl_cffi کار می‌کردن ولی
+# روی سرورهای datacenter (Railway) 429/403 می‌خوردن. نسخه playwright از browser
+# واقعی استفاده می‌کنه و این مشکل رو نداره.
+from searcher.imdb.vidsrc_pw import get_qualities_via_pw as get_qualities, download_via_pw as download_with_quality
 # burn_subtitles disabled — ویدیو و زیرنویس به‌صورت جداگانه ارسال میشن (HTTP 413 روی فایل‌های بزرگ)
 # from searcher.imdb.videotext_burn import burn_subtitles
 from ytdlp_handler import (
