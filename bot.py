@@ -65,14 +65,8 @@ _searcher_imdb_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
 if _searcher_imdb_dir not in _sys.path:
     _sys.path.insert(0, _searcher_imdb_dir)
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
-from searcher.imdb.vidsrc_extras import search_subtitles, download_subtitle
-# ─── استفاده از playwright برای دور زدن rate limit/IP block ───
-# vidsrc_extras.download_with_quality و get_qualities با curl_cffi کار می‌کردن ولی
-# روی سرورهای datacenter (Railway) 429/403 می‌خوردن. نسخه playwright از browser
-# واقعی استفاده می‌کنه و این مشکل رو نداره.
-from searcher.imdb.vidsrc_pw import get_qualities_via_pw as get_qualities, download_via_pw as download_with_quality
-# burn_subtitles disabled — ویدیو و زیرنویس به‌صورت جداگانه ارسال میشن (HTTP 413 روی فایل‌های بزرگ)
-# from searcher.imdb.videotext_burn import burn_subtitles
+from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality
+from searcher.imdb.videotext_burn import burn_subtitles
 from ytdlp_handler import (
     is_ytdlp_site_url,
     extract_qualities_ytdlp,
@@ -371,6 +365,11 @@ from otherwebsiteshandler.jebacina_handler import (
     is_jebacina_url,
     extract_jebacina_qualities,
     download_jebacina_direct,
+)
+from otherwebsiteshandler.ersties_handler import (
+    is_ersties_url,
+    extract_ersties_qualities,
+    download_ersties_direct,
 )
 from otherwebsiteshandler.hdtube_handler import (
     is_hdtube_url,
@@ -4868,7 +4867,9 @@ def _normalize_subdomain(url: str) -> str:
     return url
 
 async def generic_url_handler(event):
-    if event.sender_id not in AUTHORIZED_USERS or event.raw_text.startswith("/"):
+    if getattr(event, "_inline_auto", False):
+        pass
+    elif event.sender_id not in AUTHORIZED_USERS or event.raw_text.startswith("/"):
         return
     if (
         event.chat_id in user_state
@@ -4879,7 +4880,8 @@ async def generic_url_handler(event):
     if msg_id in processing_messages:
         return
     processing_messages.add(msg_id)
-    urls = re.findall(r'https?://[^\s<>"\']+', event.raw_text)
+    raw_text = (event.raw_text or "").replace(INLINE_MARKER, "")
+    urls = re.findall(r'https?://[^\s<>"\']+', raw_text)
     if not urls:
         processing_messages.discard(msg_id)
         return
@@ -5452,12 +5454,22 @@ async def generic_url_handler(event):
 
     if is_jebacina_url(target_url):
         logger.info(f"[URL] Jebacina detected | url={target_url[:120]}")
-        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیتها...")
         try:
             await process_jebacina_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
+
+    if is_ersties_url(target_url):
+        logger.info(f"[URL] Ersties detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیتها...")
+        try:
+            await process_ersties_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
 
     if is_eporner_url(target_url):
         logger.info(f"[URL] Eporner detected | url={target_url[:120]}")
@@ -12221,6 +12233,8 @@ luxuretv_sessions: Dict[str, dict] = {}
 
 INLINE_CACHE_TIME = 60
 INLINE_RESULTS_LIMIT = 20
+INLINE_MARKER = "\u200b\u2063\u200b\u200b"
+INLINE_AUTO_DELAY = 2.5
 
 
 PH_SORT_MAP = {"new": "mr", "month": "mr", "top": "tr", "rating": "tr", "long": "lg", "length": "lg", "best": "tr", "views": "mv", "most": "mv"}
@@ -12641,7 +12655,7 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
                 sub_name = state["selected_sub"].get("file_name", "")
                 await status_msg.edit(f"✅ زیرنویس: `{sub_name}`", parse_mode="md")
             else:
-                await status_msg.edit("⚠ زیرنویس دانلود نشد، بدون زیرنویس ادامه میدیم.")
+                await status_msg.edit("⚠ زیرنویس دانلود نشد، بدون burn ادامه میدیم.")
                 with_subtitle = False
 
         last_progress = [0]
@@ -12684,14 +12698,11 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
                 updater = None
 
         if not video_path or not os.path.exists(video_path):
-            ep_ctx = f" S{season:02d}E{episode:02d}" if season and episode else ""
             await status_msg.edit(
-                f"❌ دانلود ویدیو ناموفق بود ({imdb_id}{ep_ctx} | {quality}).\n\n"
-                f"🎬 <b>{title}</b>\n"
-                f"اگر اخیراً ربات رو آپدیت کردید، حتماً <b>ری‌استارتش کنید</b> تا کد جدید بارگذاری بشه.\n"
-                f"<code>video_path={video_path!r}</code>",
+                f"❌ دانلود ویدیو ناموفق بود.\n\n"
+                f"DEBUG: video_path={video_path!r} — این معمولاً یعنی ربات با کد قدیمی در حال اجراست؛ "
+                f"ری‌استارتش کنید.",
                 buttons=None,
-                parse_mode="html",
             )
             return
 
@@ -12699,6 +12710,54 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
         await status_msg.edit(f"✅ ویدیو دانلود شد ({vid_size:.1f} MB)")
 
         final_path = video_path
+        if with_subtitle and sub_path:
+            await status_msg.edit(
+                "🔥 در حال burn زیرنویس...\n⏳ این مرحله چند دقیقه طول میکشه."
+            )
+
+            burn_progress = [0, ""]
+
+            def on_burn(s):
+                check_cancel()
+                burn_progress[0] = s.progress
+                burn_progress[1] = s.status
+
+            async def update_burn():
+                while True:
+                    await asyncio.sleep(3)
+                    check_cancel()
+                    p, st = burn_progress
+                    try:
+                        await status_msg.edit(f"🔥 burn: {st} {p}%", buttons=cancel_btn)
+                    except Exception:
+                        pass
+
+            updater = asyncio.create_task(update_burn())
+
+            try:
+                final_path = await burn_subtitles(
+                    video_path=video_path,
+                    subtitle_path=sub_path,
+                    out_dir=out_dir,
+                    on_burn_progress=on_burn,
+                )
+            except Exception as burn_err:
+                logger.error(f"[IMDB] burn error: {burn_err}", exc_info=True)
+                await status_msg.edit(
+                    f"❌ burn خطا: {str(burn_err)[:500]}\n\n⏭ ارسال ویدیوی بدون subtitle...",
+                    buttons=None,
+                )
+                final_path = video_path
+            finally:
+                if updater:
+                    updater.cancel()
+                    updater = None
+
+            if not final_path or not os.path.exists(final_path):
+                await status_msg.edit("❌ burn ناموفق بود. ویدیوی بدون subtitle ارسال میشه.")
+                final_path = video_path
+            else:
+                await status_msg.edit("✅ burn کامل شد!")
 
         file_size = os.path.getsize(final_path)
         size_mb = file_size / 1024 / 1024
@@ -12706,8 +12765,8 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
             await status_msg.edit(f"⚠ فایل خیلی بزرگه ({size_mb:.1f} MB). محدودیت تلگرام 2GB.")
             return
 
-        await status_msg.edit(f"📤 در حال آپلود ویدیو ({size_mb:.1f} MB)...", buttons=None)
-        caption = _imdb_dl_caption(title, season, episode, None, size_mb)
+        await status_msg.edit(f"📤 در حال آپلود ({size_mb:.1f} MB)...", buttons=None)
+        caption = _imdb_dl_caption(title, season, episode, sub_name if with_subtitle else None, size_mb)
 
         cover = info.get("cover")
         if cover:
@@ -12725,20 +12784,6 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
             ul_id=f"imd_ul_{dl_id}",
         )
         active_downloads.pop(dl_id, None)
-
-        # ارسال زیرنویس به‌عنوان فایل جداگانه (اگه کاربر خواسته بود)
-        if with_subtitle and sub_path and os.path.exists(sub_path):
-            try:
-                sub_size_kb = os.path.getsize(sub_path) / 1024
-                sub_caption = f"📝 زیرنویس: `{sub_name}`\n💾 حجم: {sub_size_kb:.1f} KB"
-                await event.respond(
-                    file=sub_path,
-                    caption=sub_caption,
-                    parse_mode="md",
-                    force_document=True,
-                )
-            except Exception as sub_err:
-                logger.warning(f"[IMDB] subtitle send failed: {sub_err}")
 
     except asyncio.CancelledError:
         active_downloads.pop(dl_id, None)
@@ -13001,7 +13046,7 @@ async def xnxx_inline_handler(event):
                 f"🎚 Quality: {quality}\n"
                 f"📌 Source: {source_tag}\n\n"
                 f"🔗 {url}"
-            )
+            ) + INLINE_MARKER
 
             thumb = None
             if thumb_url:
@@ -13043,6 +13088,36 @@ async def xnxx_inline_handler(event):
             )
         except Exception:
             pass
+
+
+async def inline_auto_handler(event):
+    """پردازش خودکار پیام‌های ارسالی از طریق نتایج اینلاین.
+
+    وقتی کاربر نتیجه‌ای را از اینلاین انتخاب می‌کند، ربات آن را می‌فرستد
+    (پیام outgoing). این هندلر آن را تشخیص می‌دهد، مارکر نامرئی را حذف
+    می‌کند و بعد از چند ثانیه همان جریان لینک عادی را روی همان پیام اجرا
+    می‌کند (استخراج کیفیت‌ها + دکمه‌ها) تا کاربر مجبور نباشد لینک را جدا
+    دوباره برای ربات بفرستد.
+    """
+    raw = event.raw_text or ""
+    if INLINE_MARKER not in raw:
+        return
+    try:
+        await event.edit(raw.replace(INLINE_MARKER, ""))
+    except Exception:
+        pass
+    await asyncio.sleep(INLINE_AUTO_DELAY)
+
+    event._inline_auto = True
+
+    async def _fake_reply(*args, **kwargs):
+        return event
+
+    event.reply = _fake_reply
+    try:
+        await generic_url_handler(event)
+    except Exception as e:
+        logger.error(f"[INLINE-AUTO] Error: {e}", exc_info=True)
 
 
 # ====================== YT-DLP GENERIC HANDLER ======================
@@ -15779,6 +15854,139 @@ async def jebacina_cancel_callback(event):
         pass
 
 
+# ─── Ersties (custom handlers: needs page_url + hls_url) ───
+
+ersties_sessions: dict = {}
+
+
+async def process_ersties_request(event, url: str, status_msg):
+    async def progress_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    qualities, title, info = await extract_ersties_qualities(
+        url,
+        progress_cb=progress_cb,
+    )
+    if not qualities:
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        return
+    session_id = f"es_{event.chat_id}_{event.id}_{int(time.time())}"
+    ersties_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو Ersties"
+    text = f"🎬 **{title_display}**\n🌐 Ersties\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"es_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"es_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def ersties_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in ersties_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = ersties_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "ersties_video"
+    url = entry["url"]
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "ersties_video"
+    filepath = os.path.join(OUTPUT_FOLDER, f"es_{safe_title}_{int(time.time())}.mp4")
+
+    dl_id = f"es_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_ersties_direct(
+            url=url,
+            filepath=filepath,
+            progress_cb=progress_cb,
+            video_url=chosen.get("url", ""),
+            quality=chosen.get("quality_key", "720p"),
+            dl_id=dl_id,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        ul_id = f"es_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[ERSTIES] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def ersties_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("es_cancel_", "")
+    ersties_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
 youporn_sessions: dict = {}
@@ -16430,6 +16638,12 @@ async def main():
         jebacina_cancel_callback, events.CallbackQuery(pattern=r"jb_cancel_.+")
     )
     client.add_event_handler(
+        ersties_quality_callback, events.CallbackQuery(pattern=r"es_q_.+")
+    )
+    client.add_event_handler(
+        ersties_cancel_callback, events.CallbackQuery(pattern=r"es_cancel_.+")
+    )
+    client.add_event_handler(
         setsearch_callback, events.CallbackQuery(pattern=r"setsearch_.+")
     )
 
@@ -16497,6 +16711,7 @@ async def main():
 
     # Inline search handler
     client.add_event_handler(xnxx_inline_handler, events.InlineQuery())
+    client.add_event_handler(inline_auto_handler, events.NewMessage(outgoing=True))
 
     # IMDB (vidsrc) search & download callbacks
     client.add_event_handler(imdb_cb_title, events.CallbackQuery(pattern=r"imd_sel_"))
