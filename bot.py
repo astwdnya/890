@@ -382,6 +382,14 @@ from otherwebsiteshandler.xfetish_handler import (
     extract_xfetish_qualities,
     download_xfetish_direct,
 )
+from otherwebsiteshandler.erome_handler import (
+    is_erome_url,
+    extract_erome_media,
+    download_all_videos,
+    download_all_photos,
+    download_all_media,
+    active_downloads as erome_active_downloads,
+)
 from otherwebsiteshandler.hdtube_handler import (
     is_hdtube_url,
     extract_hdtube_qualities,
@@ -5494,6 +5502,15 @@ async def generic_url_handler(event):
         status_msg = await event.reply("🔍 در حال استخراج کیفیتها...")
         try:
             await process_xfetish_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_erome_url(target_url):
+        logger.info(f"[URL] Erome detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج محتوا...")
+        try:
+            await process_erome_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -16298,6 +16315,181 @@ async def xfetish_cancel_callback(event):
         pass
 
 
+# ─── Erome (album: videos + photos) ───
+
+erome_sessions: dict = {}
+
+
+async def process_erome_request(event, url: str, status_msg):
+    async def progress_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    media = await extract_erome_media(url, progress_cb=progress_cb)
+    if media.get("error"):
+        await safe_edit(status_msg, f"❌ {media['error']}")
+        return
+    if not media.get("has_videos") and not media.get("has_photos"):
+        await safe_edit(status_msg, "❌ ویدیو یا عکسی در این آلبوم پیدا نشد")
+        return
+    session_id = f"er_{event.chat_id}_{event.id}_{int(time.time())}"
+    erome_sessions[session_id] = {
+        "media": media,
+        "chat_id": event.chat_id,
+    }
+    title_display = (media.get("title") or "آلبوم Erome")[:60]
+    parts = []
+    if media.get("has_videos"):
+        parts.append(f"🎬 {len(media['videos'])} ویدیو")
+    if media.get("has_photos"):
+        parts.append(f"🖼 {len(media['photos'])} عکس")
+    text = f"📂 **{title_display}**\n🌐 Erome\n\n🎞 {', '.join(parts)}\n\nکدوم رو دانلود کنم؟"
+    buttons = [
+        [Button.inline("📥 همه (ویدیو و عکس)", f"er_pick_{session_id}_all")],
+        [Button.inline("🎬 فقط ویدیوها", f"er_pick_{session_id}_videos")],
+        [Button.inline("🖼 فقط عکس‌ها", f"er_pick_{session_id}_photos")],
+        [Button.inline("❌ لغو", f"er_cancel_{session_id}")],
+    ]
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def erome_pick_callback(event):
+    data = event.data.decode()
+    mode = data.rsplit("_", 1)[-1]
+    session_id = data[len("er_pick_"):].rsplit("_", 1)[0]
+    if session_id not in erome_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = erome_sessions.pop(session_id)
+    media = entry["media"]
+    if mode == "videos" and not media.get("has_videos"):
+        await event.answer("🎬 ویدیویی در این آلبوم نیست", alert=True)
+        return
+    if mode == "photos" and not media.get("has_photos"):
+        await event.answer("🖼 عکسی در این آلبوم نیست", alert=True)
+        return
+
+    title = media.get("title") or "erome_album"
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:40].strip() or "erome_album"
+    out_dir = os.path.join(OUTPUT_FOLDER, f"erome_{safe_title}_{int(time.time())}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    dl_id = f"er_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    erome_active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit("⏬ **در حال دانلود...**", buttons=cancel_btn)
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        if mode == "videos":
+            video_results = await download_all_videos(
+                media, out_dir, progress_cb=progress_cb, dl_id=dl_id
+            )
+            photo_results = []
+        elif mode == "photos":
+            photo_results = await download_all_photos(
+                media, out_dir, progress_cb=progress_cb, dl_id=dl_id
+            )
+            video_results = []
+        else:
+            out = await download_all_media(
+                media, out_dir, progress_cb=progress_cb, dl_id=dl_id
+            )
+            video_results = out.get("videos", [])
+            photo_results = out.get("photos", [])
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+
+        ok_videos = [r for r in video_results if r.get("success")]
+        ok_photos = [r for r in photo_results if r.get("success")]
+        if not ok_videos and not ok_photos:
+            err = next(
+                (r.get("error") for r in (video_results + photo_results) if r.get("error")),
+                "Unknown error",
+            )
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err[:100]}`")
+            return
+
+        sent_v = sent_p = 0
+        for i, r in enumerate(ok_videos, 1):
+            await safe_edit(status_msg, f"📤 **در حال آپلود ویدیو {i}/{len(ok_videos)}...**")
+            ul_id = f"er_ul_{event.chat_id}_{event.id}_{i}_{int(time.time())}"
+            caption = f"🎬 **{title[:80]}**\n🎞 ویدیو {i}/{len(ok_videos)}\n📦 {human_readable_size(r.get('size', 0))}"
+            try:
+                await send_file_with_progress(
+                    client=event.client,
+                    chat_id=entry["chat_id"],
+                    filepath=r["filepath"],
+                    caption=caption,
+                    status_msg=status_msg,
+                    buttons=None,
+                    supports_streaming=True,
+                    ul_id=ul_id,
+                )
+                sent_v += 1
+            except Exception as e:
+                logger.error(f"[EROME] upload video failed: {e}", exc_info=True)
+        for i, r in enumerate(ok_photos, 1):
+            await safe_edit(status_msg, f"📤 **در حال ارسال عکس {i}/{len(ok_photos)}...**")
+            try:
+                await event.client.send_file(
+                    entry["chat_id"],
+                    r["filepath"],
+                    caption=f"📸 {title[:80]}\n🖼 عکس {i}/{len(ok_photos)}",
+                )
+                sent_p += 1
+            except Exception as e:
+                logger.error(f"[EROME] upload photo failed: {e}", exc_info=True)
+
+        if sent_v or sent_p:
+            summary = f"✅ **ارسال شد:** {sent_v} ویدیو و {sent_p} عکس"
+        else:
+            summary = "❌ چیزی ارسال نشد"
+        await safe_edit(status_msg, summary)
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[EROME] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        erome_active_downloads.pop(dl_id, None)
+        try:
+            if os.path.isdir(out_dir):
+                shutil.rmtree(out_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+async def erome_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("er_cancel_", "")
+    erome_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
 youporn_sessions: dict = {}
@@ -16965,6 +17157,12 @@ async def main():
     )
     client.add_event_handler(
         xfetish_cancel_callback, events.CallbackQuery(pattern=r"xf_cancel_.+")
+    )
+    client.add_event_handler(
+        erome_pick_callback, events.CallbackQuery(pattern=r"er_pick_.+")
+    )
+    client.add_event_handler(
+        erome_cancel_callback, events.CallbackQuery(pattern=r"er_cancel_.+")
     )
     client.add_event_handler(
         setsearch_callback, events.CallbackQuery(pattern=r"setsearch_.+")
