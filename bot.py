@@ -371,6 +371,16 @@ from otherwebsiteshandler.ersties_handler import (
     extract_ersties_qualities,
     download_ersties_direct,
 )
+from otherwebsiteshandler.whoreshub_handler import (
+    is_whoreshub_url,
+    extract_whoreshub_qualities,
+    download_whoreshub_direct,
+)
+from otherwebsiteshandler.xfetish_handler import (
+    is_xfetish_url,
+    extract_xfetish_qualities,
+    download_xfetish_direct,
+)
 from otherwebsiteshandler.hdtube_handler import (
     is_hdtube_url,
     extract_hdtube_qualities,
@@ -4880,8 +4890,7 @@ async def generic_url_handler(event):
     if msg_id in processing_messages:
         return
     processing_messages.add(msg_id)
-    raw_text = (event.raw_text or "").replace(INLINE_MARKER, "")
-    urls = re.findall(r'https?://[^\s<>"\']+', raw_text)
+    urls = re.findall(r'https?://[^\s<>"\']+', event.raw_text)
     if not urls:
         processing_messages.discard(msg_id)
         return
@@ -5466,6 +5475,24 @@ async def generic_url_handler(event):
         status_msg = await event.reply("🔍 در حال استخراج کیفیتها...")
         try:
             await process_ersties_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_whoreshub_url(target_url):
+        logger.info(f"[URL] WhoresHub detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیتها...")
+        try:
+            await process_whoreshub_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_xfetish_url(target_url):
+        logger.info(f"[URL] XFetish detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیتها...")
+        try:
+            await process_xfetish_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -12233,8 +12260,6 @@ luxuretv_sessions: Dict[str, dict] = {}
 
 INLINE_CACHE_TIME = 60
 INLINE_RESULTS_LIMIT = 20
-INLINE_MARKER = "\u200b\u2063\u200b\u200b"
-INLINE_AUTO_DELAY = 2.5
 
 
 PH_SORT_MAP = {"new": "mr", "month": "mr", "top": "tr", "rating": "tr", "long": "lg", "length": "lg", "best": "tr", "views": "mv", "most": "mv"}
@@ -13046,7 +13071,7 @@ async def xnxx_inline_handler(event):
                 f"🎚 Quality: {quality}\n"
                 f"📌 Source: {source_tag}\n\n"
                 f"🔗 {url}"
-            ) + INLINE_MARKER
+            )
 
             thumb = None
             if thumb_url:
@@ -13064,6 +13089,7 @@ async def xnxx_inline_handler(event):
                     url=url,
                     thumb=thumb,
                     text=message_text,
+                    buttons=[[Button.inline("⚡️ شروع دانلود", "inl_start")]],
                     parse_mode="md",
                     id=str(i),
                 )
@@ -13090,34 +13116,39 @@ async def xnxx_inline_handler(event):
             pass
 
 
-async def inline_auto_handler(event):
-    """پردازش خودکار پیام‌های ارسالی از طریق نتایج اینلاین.
-
-    وقتی کاربر نتیجه‌ای را از اینلاین انتخاب می‌کند، ربات آن را می‌فرستد
-    (پیام outgoing). این هندلر آن را تشخیص می‌دهد، مارکر نامرئی را حذف
-    می‌کند و بعد از چند ثانیه همان جریان لینک عادی را روی همان پیام اجرا
-    می‌کند (استخراج کیفیت‌ها + دکمه‌ها) تا کاربر مجبور نباشد لینک را جدا
-    دوباره برای ربات بفرستد.
+async def inline_start_callback(event):
+    """وقتی کاربر روی «⚡️ شروع دانلود» می‌زند، همان لینک به‌صورت یک پیام
+    داخل ربات ارسال می‌شود و جریان عادی لینک شروع می‌شود (ربات با
+    دکمه‌های کیفیت جواب می‌دهد) — دقیقاً مثل اینکه کاربر خودش لینک را
+    فرستاده باشد.
     """
-    raw = event.raw_text or ""
-    if INLINE_MARKER not in raw:
+    if event.sender_id not in AUTHORIZED_USERS:
+        await event.answer("⛔ Unauthorized", alert=True)
         return
     try:
-        await event.edit(raw.replace(INLINE_MARKER, ""))
+        msg = await event.get_message()
     except Exception:
-        pass
-    await asyncio.sleep(INLINE_AUTO_DELAY)
-
-    event._inline_auto = True
-
-    async def _fake_reply(*args, **kwargs):
-        return event
-
-    event.reply = _fake_reply
+        msg = None
+    if msg is None:
+        await event.answer("❌ پیام پیدا نشد", alert=True)
+        return
+    urls = re.findall(r'https?://[^\s<>"\']+', msg.text or "")
+    if not urls:
+        await event.answer("❌ لینکی در پیام پیدا نشد", alert=True)
+        return
+    link = urls[0]
+    await event.answer("⚡️ ارسال شد", alert=False)
     try:
-        await generic_url_handler(event)
+        sent = await event.client.send_message(event.chat_id, link)
     except Exception as e:
-        logger.error(f"[INLINE-AUTO] Error: {e}", exc_info=True)
+        logger.error(f"[INLINE-START] send failed: {e}")
+        await event.answer("❌ ارسال لینک ناموفق بود", alert=True)
+        return
+    sent._inline_auto = True
+    try:
+        await generic_url_handler(sent)
+    except Exception as e:
+        logger.error(f"[INLINE-START] Error: {e}", exc_info=True)
 
 
 # ====================== YT-DLP GENERIC HANDLER ======================
@@ -15987,6 +16018,272 @@ async def ersties_cancel_callback(event):
         pass
 
 
+# ─── WhoresHub (custom handlers: needs page_url + video_url) ───
+
+whoreshub_sessions: dict = {}
+
+
+async def process_whoreshub_request(event, url: str, status_msg):
+    async def progress_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    qualities, title, info = await extract_whoreshub_qualities(
+        url,
+        progress_cb=progress_cb,
+    )
+    if not qualities:
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        return
+    session_id = f"wh_{event.chat_id}_{event.id}_{int(time.time())}"
+    whoreshub_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو WhoresHub"
+    text = f"🎬 **{title_display}**\n🌐 WhoresHub\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"wh_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"wh_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def whoreshub_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in whoreshub_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = whoreshub_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "whoreshub_video"
+    url = entry["url"]
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "whoreshub_video"
+    filepath = os.path.join(OUTPUT_FOLDER, f"wh_{safe_title}_{int(time.time())}.mp4")
+
+    dl_id = f"wh_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_whoreshub_direct(
+            url=url,
+            filepath=filepath,
+            progress_cb=progress_cb,
+            video_url=chosen.get("url", ""),
+            quality=chosen.get("quality_key", "high"),
+            dl_id=dl_id,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        ul_id = f"wh_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[WHORESHUB] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def whoreshub_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("wh_cancel_", "")
+    whoreshub_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
+# ─── XFetish (custom handlers: needs page_url + video_url) ───
+
+xfetish_sessions: dict = {}
+
+
+async def process_xfetish_request(event, url: str, status_msg):
+    async def progress_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    qualities, title, info = await extract_xfetish_qualities(
+        url,
+        progress_cb=progress_cb,
+    )
+    if not qualities:
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        return
+    session_id = f"xf_{event.chat_id}_{event.id}_{int(time.time())}"
+    xfetish_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو XFetish"
+    text = f"🎬 **{title_display}**\n🌐 XFetish\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"xf_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"xf_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def xfetish_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in xfetish_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = xfetish_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "xfetish_video"
+    url = entry["url"]
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "xfetish_video"
+    filepath = os.path.join(OUTPUT_FOLDER, f"xf_{safe_title}_{int(time.time())}.mp4")
+
+    dl_id = f"xf_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_xfetish_direct(
+            url=url,
+            filepath=filepath,
+            progress_cb=progress_cb,
+            video_url=chosen.get("url", ""),
+            quality=chosen.get("quality_key", "high"),
+            dl_id=dl_id,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        ul_id = f"xf_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[XFETISH] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def xfetish_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("xf_cancel_", "")
+    xfetish_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
 youporn_sessions: dict = {}
@@ -16644,6 +16941,18 @@ async def main():
         ersties_cancel_callback, events.CallbackQuery(pattern=r"es_cancel_.+")
     )
     client.add_event_handler(
+        whoreshub_quality_callback, events.CallbackQuery(pattern=r"wh_q_.+")
+    )
+    client.add_event_handler(
+        whoreshub_cancel_callback, events.CallbackQuery(pattern=r"wh_cancel_.+")
+    )
+    client.add_event_handler(
+        xfetish_quality_callback, events.CallbackQuery(pattern=r"xf_q_.+")
+    )
+    client.add_event_handler(
+        xfetish_cancel_callback, events.CallbackQuery(pattern=r"xf_cancel_.+")
+    )
+    client.add_event_handler(
         setsearch_callback, events.CallbackQuery(pattern=r"setsearch_.+")
     )
 
@@ -16711,7 +17020,9 @@ async def main():
 
     # Inline search handler
     client.add_event_handler(xnxx_inline_handler, events.InlineQuery())
-    client.add_event_handler(inline_auto_handler, events.NewMessage(outgoing=True))
+    client.add_event_handler(
+        inline_start_callback, events.CallbackQuery(pattern=r"^inl_start$")
+    )
 
     # IMDB (vidsrc) search & download callbacks
     client.add_event_handler(imdb_cb_title, events.CallbackQuery(pattern=r"imd_sel_"))
