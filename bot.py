@@ -12,6 +12,7 @@ import logging
 import time
 import json
 import shutil
+import uuid
 from urllib.parse import quote
 from typing import Optional, Tuple, Dict
 
@@ -12260,6 +12261,19 @@ luxuretv_sessions: Dict[str, dict] = {}
 
 INLINE_CACHE_TIME = 60
 INLINE_RESULTS_LIMIT = 20
+INLINE_PICK_TTL = 30 * 60  # توکن‌های دکمه شروع دانلود ۳۰ دقیقه معتبرند
+inline_pick_urls: dict = {}
+
+
+def _store_inline_pick(url: str) -> str:
+    """ذخیره URL نتیجه اینلاین با یک توکن کوتاه برای دکمه شروع دانلود."""
+    now = time.time()
+    expired = [k for k, v in inline_pick_urls.items() if now - v.get("ts", 0) > INLINE_PICK_TTL]
+    for k in expired:
+        inline_pick_urls.pop(k, None)
+    token = uuid.uuid4().hex[:12]
+    inline_pick_urls[token] = {"url": url, "ts": now}
+    return token
 
 
 PH_SORT_MAP = {"new": "mr", "month": "mr", "top": "tr", "rating": "tr", "long": "lg", "length": "lg", "best": "tr", "views": "mv", "most": "mv"}
@@ -13082,6 +13096,7 @@ async def xnxx_inline_handler(event):
                     attributes=[DocumentAttributeImageSize(w=320, h=180)],
                 )
 
+            pick_token = _store_inline_pick(url)
             inline_results.append(
                 builder.article(
                     title=title,
@@ -13089,7 +13104,7 @@ async def xnxx_inline_handler(event):
                     url=url,
                     thumb=thumb,
                     text=message_text,
-                    buttons=[[Button.inline("⚡️ شروع دانلود", "inl_start")]],
+                    buttons=[[Button.inline("⚡️ شروع دانلود", f"inl_{pick_token}")]],
                     parse_mode="md",
                     id=str(i),
                 )
@@ -13121,22 +13136,21 @@ async def inline_start_callback(event):
     داخل ربات ارسال می‌شود و جریان عادی لینک شروع می‌شود (ربات با
     دکمه‌های کیفیت جواب می‌دهد) — دقیقاً مثل اینکه کاربر خودش لینک را
     فرستاده باشد.
+
+    نکته: از get_message استفاده نمی‌کنیم چون پیام‌های ارسالی از طریق
+    اینلاین آیدی متفاوتی در چت می‌گیرند و برای ربات قابل fetch نیستند؛
+    به جایش URL در زمان ساخت نتیجه در inline_pick_urls ذخیره شده و
+    توکن آن داخل دیتای دکمه قرار دارد.
     """
     if event.sender_id not in AUTHORIZED_USERS:
         await event.answer("⛔ Unauthorized", alert=True)
         return
-    try:
-        msg = await event.get_message()
-    except Exception:
-        msg = None
-    if msg is None:
-        await event.answer("❌ پیام پیدا نشد", alert=True)
+    token = event.data.decode().replace("inl_", "")
+    entry = inline_pick_urls.get(token)
+    if not entry:
+        await event.answer("❌ لینک منقضی شد. دوباره از اینلاین انتخاب کن.", alert=True)
         return
-    urls = re.findall(r'https?://[^\s<>"\']+', msg.text or "")
-    if not urls:
-        await event.answer("❌ لینکی در پیام پیدا نشد", alert=True)
-        return
-    link = urls[0]
+    link = entry["url"]
     await event.answer("⚡️ ارسال شد", alert=False)
     try:
         sent = await event.client.send_message(event.chat_id, link)
@@ -17021,7 +17035,7 @@ async def main():
     # Inline search handler
     client.add_event_handler(xnxx_inline_handler, events.InlineQuery())
     client.add_event_handler(
-        inline_start_callback, events.CallbackQuery(pattern=r"^inl_start$")
+        inline_start_callback, events.CallbackQuery(pattern=r"^inl_")
     )
 
     # IMDB (vidsrc) search & download callbacks
