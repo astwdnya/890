@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import time
 from typing import Awaitable, Callable, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin, unquote
@@ -508,10 +509,11 @@ async def _download_single_curl_cffi(url, filepath, referer, cookies, progress_c
 
 
 async def _download_with_page_session(page_url, video_url, filepath, quality_key, progress_cb, dl_id=""):
-    """Fetch صفحه و دانلود ویدیو با همون session.
+    """Fetch صفحه و دانلود ویدیو streaming با همون session.
 
     نکته مهم: x-fetish.tube نیاز داره که صفحه و ویدیو با همون session fetch بشن.
     اگه session جدید ساخته بشه، cookies درست کار نمی‌کنن و 403 می‌گیریم.
+    این نسخه streaming هست (مموری buffer نمی‌کنه).
     """
     if not _check_curl_cffi():
         return False, "curl_cffi not installed", 0
@@ -552,28 +554,78 @@ async def _download_with_page_session(page_url, video_url, filepath, quality_key
 
             logger.info(f"[DL-XF] Using URL: {target_url[:100]}")
 
-            # 3. Download video with same session (cookies persist!)
+            # 3. Probe content-length first
+            probe = await s.get(
+                target_url,
+                impersonate="chrome",
+                headers={"Accept": "*/*", "Referer": page_url, "Range": "bytes=0-0"},
+                allow_redirects=True,
+                timeout=20,
+            )
+            content_length = 0
+            if probe.status_code in (200, 206):
+                cr = probe.headers.get("Content-Range", "")
+                m_cr = re.search(r"/(\d+)", cr)
+                if m_cr:
+                    content_length = int(m_cr.group(1))
+                else:
+                    content_length = int(probe.headers.get("Content-Length", 0))
+
+            if content_length > MAX_DOWNLOAD_SIZE:
+                return False, f"File too large: {_format_size(content_length)}", 0
+
+            # 4. Stream download with progress
             if progress_cb:
                 await progress_cb("📥 **Downloading...**")
 
-            video_resp = await s.get(target_url, impersonate="chrome", headers={
-                "Accept": "*/*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": page_url,
-            }, allow_redirects=True, timeout=300)
+            video_resp = await s.get(
+                target_url,
+                impersonate="chrome",
+                headers={"Accept": "*/*", "Accept-Language": "en-US,en;q=0.9", "Referer": page_url},
+                allow_redirects=True,
+                timeout=300,
+                stream=True,
+            )
 
             if video_resp.status_code != 200:
                 return False, f"Video download: HTTP {video_resp.status_code}", 0
 
-            data = video_resp.content if hasattr(video_resp, "content") else video_resp.body
-            if not data or len(data) < MIN_VALID_VIDEO_SIZE:
-                return False, f"File too small ({len(data) if data else 0} bytes)", 0
+            start_time = time.time()
+            last_update = 0.0
+            downloaded = 0
 
             async with aiofiles.open(filepath, "wb") as f:
-                await f.write(data)
+                # curl_cffi streaming: iterate over content
+                try:
+                    for chunk in video_resp.iter_content(chunk_size=CHUNK_SIZE):
+                        if active_downloads.get(dl_id, {}).get("cancelled"):
+                            _cleanup_file(filepath)
+                            return False, "Cancelled by user", 0
+                        if chunk:
+                            await f.write(chunk)
+                            downloaded += len(chunk)
+                            now = time.time()
+                            if progress_cb and now - last_update >= PROGRESS_INTERVAL:
+                                last_update = now
+                                msg = _format_progress(downloaded, content_length, start_time, now)
+                                try:
+                                    await progress_cb(msg)
+                                except Exception:
+                                    pass
+                except Exception:
+                    # Fallback: not streaming, write content directly
+                    data = video_resp.content if hasattr(video_resp, "content") else video_resp.body
+                    if not data:
+                        return False, "Empty response", 0
+                    await f.write(bytes(data))
+                    downloaded = len(data)
 
-            size = len(data)
-            logger.info(f"[DL-XF] Download DONE | size={_format_size(size)}")
+            size = os.path.getsize(filepath)
+            if size < MIN_VALID_VIDEO_SIZE:
+                _cleanup_file(filepath)
+                return False, f"File too small ({size} bytes)", 0
+
+            logger.info(f"[DL-XF] Page-session DONE | size={_format_size(size)}")
             return True, "", size
 
     except asyncio.CancelledError:
@@ -808,22 +860,24 @@ async def _download_multi_segment(direct_url, filepath, referer, cookies, progre
 
 
 async def _download_with_ytdlp(url, filepath, progress_cb, quality_key=""):
-    if not shutil.which("yt-dlp"):
-        return False, "yt-dlp not installed", 0
+    """دانلود با yt-dlp به عنوان Python module (نه binary)."""
+    # از sys.executable -m yt_dlp استفاده می‌کنیم چون yt-dlp binary ممکنه در PATH نباشه
     await progress_cb("📥 **Fallback: yt-dlp...**")
     try:
         cmd = [
-            "yt-dlp", "--no-warnings", "--progress", "--newline",
+            sys.executable, "-m", "yt_dlp",
+            "--no-warnings", "--progress", "--newline",
             "--no-check-certificates", "-f", "best",
             "--concurrent-fragments", "16", "--retries", "10", "--fragment-retries", "10",
             "--buffer-size", "16K", "--max-filesize", str(MAX_DOWNLOAD_SIZE),
             "--add-header", f"User-Agent:{_USER_AGENT}",
-            "--add-header", f"Referer:https://x-fetish.tube/",
+            "--add-header", "Referer:https://x-fetish.tube/",
             "--extractor-args", "generic:impersonate",
             "-o", filepath, url,
         ]
         process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         last_update = 0.0
+        stderr_lines = []
         while True:
             try:
                 line = await asyncio.wait_for(process.stdout.readline(), timeout=300)
@@ -845,14 +899,14 @@ async def _download_with_ytdlp(url, filepath, progress_cb, quality_key=""):
                         try:
                             pct_num = float(pct)
                             filled = int(pct_num / 5)
-                            bar = "█" * filled + "░" * (20 - filled)
+                            bar = "\u2588" * filled + "\u2591" * (20 - filled)
                         except (ValueError, TypeError):
-                            bar = "░" * 20
-                        await progress_cb(f"📥 **Downloading (yt-dlp)...**\n`[{bar}]`\n📊 {pct}%")
+                            bar = "\u2591" * 20
+                        await progress_cb(f"\U0001f4e5 **Downloading (yt-dlp)...**\n`[{bar}]`\n\U0001f4ca {pct}%")
         await process.wait()
         if process.returncode != 0:
             stderr = (await process.stderr.read()).decode(errors="replace")
-            return False, stderr[-200:], 0
+            return False, stderr[-300:], 0
         actual_path = filepath
         if not os.path.exists(actual_path):
             base, _ = os.path.splitext(filepath)
@@ -898,28 +952,27 @@ async def download_xfetish_video(page_url, video_url, filepath, progress_cb=None
     if not cookies:
         cookies = {}
 
-    # ── روش 1: fetch صفحه + download با همون session ──
-    # نکته مهم: x-fetish.tube نیاز داره که صفحه و ویدیو با همون session fetch بشن.
-    logger.info("[DL-XF] Attempt 1: single-session download (page + video)")
+    # ── روش 1: page-session streaming download ──
+    logger.info("[DL-XF] Attempt 1: page-session streaming download")
     success, error, size = await _download_with_page_session(page_url, video_url, filepath, quality_key, progress_cb, dl_id=dl_id)
     if success:
         return True, "", size
     if error == "Cancelled by user":
         return False, error, 0
-    logger.info(f"[DL-XF] Single-session failed: {error}")
+    logger.info(f"[DL-XF] Page-session failed: {error}")
     _cleanup_file(filepath)
 
-    # ── روش 2: yt-dlp ──
-    logger.info("[DL-XF] Attempt 2: yt-dlp on page URL")
-    success, error, size = await _download_with_ytdlp(page_url, filepath, progress_cb, quality_key=quality_key)
+    # ── روش 2: multi-segment download ──
+    logger.info("[DL-XF] Attempt 2: multi-segment download")
+    success, error, size = await _download_multi_segment(video_url, filepath, referer, cookies, progress_cb, dl_id=dl_id)
     if success:
         return True, "", size
     if error == "Cancelled by user":
         return False, error, 0
     if error == "HTTP_403":
-        logger.info("[DL-XF] 403, refreshing session...")
+        logger.info("[DL-XF] 403, refreshing session for fresh URL...")
         if progress_cb:
-            await progress_cb("🔄 **Refreshing session...**")
+            await progress_cb("\U0001f504 **Refreshing session...**")
         try:
             new_sources, _, new_info = await extract_xfetish_qualities(page_url, progress_cb=None)
             if new_sources:
@@ -933,17 +986,17 @@ async def download_xfetish_video(page_url, video_url, filepath, progress_cb=None
                 video_url = new_video_url
                 new_cookies = new_info.get("cookies", {})
                 cookies.update(new_cookies)
-                logger.info("[DL-XF] Got fresh URL")
+                logger.info("[DL-XF] Got fresh URL, retrying multi-segment")
+                success, error, size = await _download_multi_segment(video_url, filepath, referer, cookies, progress_cb, dl_id=dl_id)
+                if success:
+                    return True, "", size
         except Exception as e:
             logger.warning(f"[DL-XF] refresh failed: {e}")
-        success, error, size = await _download_multi_segment(video_url, filepath, referer, cookies, progress_cb, dl_id=dl_id)
-        if success:
-            return True, "", size
     logger.info(f"[DL-XF] Multi-segment failed: {error}")
     _cleanup_file(filepath)
 
-    # ─ـ روش 2: yt-dlp ──
-    logger.info("[DL-XF] Attempt 2: yt-dlp on page URL")
+    # ── روش 3: yt-dlp fallback ──
+    logger.info("[DL-XF] Attempt 3: yt-dlp on page URL")
     success, error, size = await _download_with_ytdlp(page_url, filepath, progress_cb, quality_key=quality_key)
     if success:
         return True, "", size
