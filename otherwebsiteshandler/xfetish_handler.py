@@ -595,9 +595,9 @@ async def _download_with_page_session(page_url, video_url, filepath, quality_key
             downloaded = 0
 
             async with aiofiles.open(filepath, "wb") as f:
-                # curl_cffi streaming: iterate over content
+                # curl_cffi streaming: iterate over content using aiter_content
                 try:
-                    for chunk in video_resp.iter_content(chunk_size=CHUNK_SIZE):
+                    async for chunk in video_resp.aiter_content(chunk_size=CHUNK_SIZE):
                         if active_downloads.get(dl_id, {}).get("cancelled"):
                             _cleanup_file(filepath)
                             return False, "Cancelled by user", 0
@@ -612,11 +612,12 @@ async def _download_with_page_session(page_url, video_url, filepath, quality_key
                                     await progress_cb(msg)
                                 except Exception:
                                     pass
-                except Exception:
+                except Exception as stream_err:
+                    logger.warning(f"[DL-XF] Stream iteration error: {stream_err}")
                     # Fallback: not streaming, write content directly
                     data = video_resp.content if hasattr(video_resp, "content") else video_resp.body
                     if not data:
-                        return False, "Empty response", 0
+                        return False, f"Download failed: {stream_err}", 0
                     await f.write(bytes(data))
                     downloaded = len(data)
 
