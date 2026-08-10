@@ -198,26 +198,58 @@ def _extract_duration(html: str) -> Optional[int]:
 
 
 def _extract_flashvars(html: str) -> dict:
+    """استخراج flashvars block از HTML.
+
+    نکته: بعضی صفحات از var flashvars = {...} استفاده می‌کنن،
+    بعضی دیگه فقط key:value pairs دارن بدون flashvars wrapper.
+    """
     flashvars = {}
+
+    # روش 1: var flashvars = {...} (standard KT Player)
     fv_match = re.search(r'var\s+flashvars\s*=\s*\{([^}]+(?:\{[^}]*\}[^{}]*)*)\}', html, re.DOTALL)
-    if not fv_match:
+    if fv_match:
+        block = fv_match.group(0)
+        title_match = re.search(r"video_title\s*:\s*'((?:[^'\\]|\\.)*)'", block)
+        if title_match:
+            title_val = title_match.group(1).replace("\\'", "'").replace("\\/", "/").replace("&amp;", "&")
+            flashvars["video_title"] = title_val
+            block_for_pairs = block[:title_match.start()] + block[title_match.end():]
+        else:
+            block_for_pairs = block
+        pairs = re.findall(r"(\w+)\s*:\s*'([^']*)'", block_for_pairs)
+        pairs += re.findall(r'(\w+)\s*:\s*"([^"]*)"', block_for_pairs)
+        pairs += re.findall(r"(\w+)\s*:\s*([0-9]+)", block_for_pairs)
+        for k, v in pairs:
+            if k.startswith("//") or k.startswith("/*"):
+                continue
+            v_decoded = v.replace("\\/", "/").replace("&amp;", "&")
+            flashvars[k] = v_decoded
         return flashvars
-    block = fv_match.group(0)
-    title_match = re.search(r"video_title\s*:\s*'((?:[^'\\]|\\.)*)'", block)
-    if title_match:
-        title_val = title_match.group(1).replace("\\'", "'").replace("\\/", "/").replace("&amp;", "&")
-        flashvars["video_title"] = title_val
-        block_for_pairs = block[:title_match.start()] + block[title_match.end():]
-    else:
-        block_for_pairs = block
-    pairs = re.findall(r"(\w+)\s*:\s*'([^']*)'", block_for_pairs)
-    pairs += re.findall(r'(\w+)\s*:\s*"([^"]*)"', block_for_pairs)
-    pairs += re.findall(r"(\w+)\s*:\s*([0-9]+)", block_for_pairs)
-    for k, v in pairs:
-        if k.startswith("//") or k.startswith("/*"):
-            continue
-        v_decoded = v.replace("\\/", "/").replace("&amp;", "&")
-        flashvars[k] = v_decoded
+
+    # روش 2: fallback — استخراج مستقیم از HTML بدون flashvars wrapper
+    # بعضی صفحات فقط key:value pairs دارن (مثل: video_url: '...', video_url_fhd: '1')
+    for key in ["video_url", "video_url_text", "video_alt_url", "video_alt_url_text",
+                "video_alt_url2", "video_alt_url2_text", "video_url_fhd", "video_url_hd",
+                "postfix", "video_title", "preview_url"]:
+        # pattern: key: 'value' یا key: "value" یا key: value
+        m = re.search(rf"{key}\s*:\s*['\"]([^'\"]*)['\"]", html, re.IGNORECASE)
+        if not m:
+            m = re.search(rf"{key}\s*:\s*([0-9]+)", html, re.IGNORECASE)
+        if m:
+            val = m.group(1).replace("\\/", "/").replace("&amp;", "&")
+            flashvars[key] = val
+
+    # اگر چیزی پیدا نشد، از v-acctoken URLs استفاده کن
+    if not flashvars:
+        vacctoken_pattern = re.compile(
+            r'(https?://[^\s"\'<>\)\]]+?/get_file/[^\s"\'<>\)\]]+?\.mp4[^\s"\'<>\)\]]*?\?v-acctoken=[a-zA-Z0-9+/=_-]+)',
+            re.IGNORECASE,
+        )
+        for m in vacctoken_pattern.finditer(html):
+            url = m.group(1)
+            if "preview" not in url.lower():
+                flashvars.setdefault("video_urls", []).append(url)
+
     return flashvars
 
 
@@ -256,6 +288,30 @@ def _extract_video_sources(html: str) -> List[dict]:
 
     # Method 2: from flashvars (video_url)
     flashvars = _extract_flashvars(html)
+
+    # If flashvars has video_urls list (from fallback), use them
+    if flashvars.get("video_urls"):
+        for url in flashvars["video_urls"]:
+            url = _clean_url(url)
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            url_lower = url.lower()
+            if "_1080p" in url_lower or "_fhd" in url_lower:
+                label, height, quality_key, is_hd = "📺 MP4 1080p", 1080, "1080p", True
+            elif "_720p" in url_lower or "_hd" in url_lower:
+                label, height, quality_key, is_hd = "📺 MP4 720p", 720, "720p", True
+            elif "_480p" in url_lower:
+                label, height, quality_key, is_hd = "📺 MP4 480p", 480, "480p", False
+            else:
+                label, height, quality_key, is_hd = "📺 MP4 (default)", 480, "480p", False
+            sources.append({
+                "label": label, "url": url, "height": height,
+                "quality_key": quality_key, "method": "flashvars_fallback", "is_hd": is_hd,
+            })
+            logger.info("Found via fallback: %s (%s)", quality_key, url[:100])
+
+    # Standard flashvars video_url
     if flashvars.get("video_url"):
         url = _clean_url(flashvars["video_url"])
         if _is_main_video_url(url) and url not in seen_urls:
