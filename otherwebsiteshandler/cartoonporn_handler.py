@@ -36,7 +36,7 @@ _DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 * 1024
 SESSION_TTL = 30 * 60
 MAX_RETRIES = 3
 RETRY_DELAY = 2.0
@@ -255,7 +255,7 @@ async def _extract_with_ytdlp(url: str) -> Tuple[List[dict], str]:
         return [], "yt-dlp not installed"
 
     cmd = [
-        "yt-dlp", "--dump-json", "--no-warnings",
+        "yt-dlp", "--dump-json", "--no-warnings", "-N", "32", "--concurrent-fragments", "32",
         "--no-download", "--no-playlist",
         "--user-agent", _USER_AGENT, url,
     ]
@@ -499,7 +499,7 @@ async def _download_with_ytdlp(
 
     cmd = [
         "yt-dlp",
-        "--no-warnings", "--no-playlist",
+        "--no-warnings", "-N", "32", "--concurrent-fragments", "32", "--no-playlist",
         "--format", format_selector,
         "--output", filepath,
         "--user-agent", _USER_AGENT,

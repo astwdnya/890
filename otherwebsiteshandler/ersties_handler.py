@@ -77,7 +77,7 @@ _USER_AGENT = (
 
 # ─── Constants ─────────────────────────────────────────────────────────────
 
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 * 1024  # 2 GB
 MIN_VALID_VIDEO_SIZE = 100 * 1024  # 100 KB
 PROGRESS_INTERVAL = 1.0
 
@@ -585,7 +585,7 @@ async def _download_with_ytdlp(url, filepath, progress_cb, quality_key=""):
         cmd = [
             "yt-dlp", "--no-warnings", "--progress", "--newline",
             "--no-check-certificates", "-f", format_selector,
-            "--concurrent-fragments", "16",
+            "-N", "32", "--concurrent-fragments", "32",
             "--retries", "10", "--fragment-retries", "10",
             "--max-filesize", str(MAX_DOWNLOAD_SIZE),
             "--add-header", f"User-Agent:{_USER_AGENT}",

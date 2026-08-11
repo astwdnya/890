@@ -38,7 +38,7 @@ _ANTI_BOT_JS = """
 
 _LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 * 1024  # 2 GB
 MIN_FILE_SIZE = 1024  # 1 KB
 CHUNK_SIZE = 2 * 1024 * 1024  # 2 MB per range request
 CF_WAIT_TIMEOUT = 45  # ثانیه صبر برای Cloudflare

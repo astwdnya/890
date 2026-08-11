@@ -40,7 +40,7 @@ _DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 * 1024
 SESSION_TTL = 30 * 60
 MAX_RETRIES = 3
 RETRY_DELAY = 2.0
@@ -133,7 +133,9 @@ def _format_progress(downloaded, content_length, start_time, now) -> str:
         filled = int(pct / 5)
         bar = "█" * filled + "░" * (20 - filled)
         return (
-            f"📥 **Downloading...**\n`[{bar}]`\n"
+            f"📥 **Downloading...**
+(هندلر)
+`[{bar}]`\n"
             f"💾 {dl_mb:.1f}/{total_mb:.1f} MB"
             f"  •  ⚡ {speed / 1024 / 1024:.1f} MB/s\n📊 {pct:.1f}%"
         )

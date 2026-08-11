@@ -28,7 +28,7 @@ _USER_AGENT = (
 )
 
 # حداکثر حجم: 2 گیگابایت
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 * 1024
 
 # حداکثر عمر session: 30 دقیقه
 SESSION_TTL = 30 * 60
@@ -132,7 +132,7 @@ def _ytdlp_base_cmd() -> List[str]:
     """ساخت command پایه yt-dlp با flag های لازم."""
     return [
         "yt-dlp",
-        "--no-warnings",
+        "--no-warnings", "-N", "32", "--concurrent-fragments", "32",
         "--no-playlist",
         "--user-agent",
         _USER_AGENT,

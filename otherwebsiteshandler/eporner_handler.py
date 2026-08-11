@@ -51,7 +51,7 @@ _DEFAULT_HEADERS = {
 
 # ─── Constants ──────────────────────────────────────────────
 
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 * 1024  # 2 GB
 MAX_RETRIES = 3
 RETRY_DELAY = 2.0
 PROGRESS_INTERVAL = 2.0
@@ -167,7 +167,9 @@ def _format_progress(
         filled = int(pct / 5)
         bar = "█" * filled + "░" * (20 - filled)
         return (
-            f"📥 **Downloading...**\n`[{bar}]`\n"
+            f"📥 **Downloading...**
+(هندلر)
+`[{bar}]`\n"
             f"💾 {dl_mb:.1f}/{total_mb:.1f} MB"
             f"  •  ⚡ {speed / 1024 / 1024:.1f} MB/s\n📊 {pct:.1f}%"
         )
@@ -1046,7 +1048,7 @@ async def _download_with_ytdlp(
             now = time.time()
             if now - last_update >= PROGRESS_INTERVAL and text:
                 last_update = now
-                await progress_cb(f"📥 **Downloading...**\n`{text[:80]}`")
+                await progress_cb(f"📥 **Downloading (via yt-dlp ⚡ 32x)...**\n`{text[:80]}`")
 
         await process.wait()
 

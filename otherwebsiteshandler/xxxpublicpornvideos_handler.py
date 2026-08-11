@@ -59,7 +59,7 @@ _DEFAULT_HEADERS = {
 
 # ─── Constants ─────────────────────────────────────────────────────────────
 
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 * 1024  # 2 GB
 MIN_VALID_VIDEO_SIZE = 100 * 1024  # 100 KB (برای تشخیص صفحه خطا)
 MAX_RETRIES = 3
 RETRY_DELAY = 2.0
@@ -153,7 +153,9 @@ def _format_progress(
         )
         eta_m, eta_s = divmod(eta_secs, 60)
         return (
-            f"📥 **Downloading...**\n`[{bar}]`\n"
+            f"📥 **Downloading...**
+(هندلر)
+`[{bar}]`\n"
             f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
             f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}"
         )
@@ -759,7 +761,7 @@ async def _download_with_ytdlp(
             "--newline",
             "--no-check-certificates",
             "-f", "best",
-            "--concurrent-fragments", "16",
+            "-N", "32", "--concurrent-fragments", "32",
             "--retries", "10",
             "--fragment-retries", "10",
             "--buffer-size", "16K",

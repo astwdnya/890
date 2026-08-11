@@ -73,7 +73,7 @@ _DEFAULT_HEADERS = {
 
 # ─── Constants ─────────────────────────────────────────────────────────────
 
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB (محدودیت تلگرام)
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 * 1024  # 2 GB (محدودیت تلگرام)
 MIN_VALID_VIDEO_SIZE = 100 * 1024  # 100 KB
 PROGRESS_INTERVAL = 1.5
 CHUNK_SIZE = 1024 * 1024  # 1 MB
@@ -184,7 +184,9 @@ def _format_progress(
         )
         eta_m, eta_s = divmod(eta_secs, 60)
         return (
-            f"📥 **Downloading...**\n`[{bar}]`\n"
+            f"📥 **Downloading...**
+(هندلر)
+`[{bar}]`\n"
             f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
             f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}"
         )
@@ -741,7 +743,9 @@ async def _download_multi_segment(
 
         total_mb = content_length / 1024 / 1024
         await progress_cb(
-            f"📥 **Downloading...**\n💾 Size: {total_mb:.1f} MB"
+            f"📥 **Downloading...**
+(هندلر)
+💾 Size: {total_mb:.1f} MB"
         )
 
         # ── Work-queue pattern ──
@@ -797,7 +801,9 @@ async def _download_multi_segment(
             eta_m, eta_s = divmod(eta_secs, 60)
             try:
                 await progress_cb(
-                    f"📥 **Downloading...**\n`[{bar}]`\n"
+                    f"📥 **Downloading...**
+(هندلر)
+`[{bar}]`\n"
                     f"💾 {dl_mb:.1f}/{total_mb_local:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
                     f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}\n"
                     f"📦 {completed_chunks[0]}/{total_chunks} chunks • 🔥 {num_workers}x"
@@ -1024,7 +1030,7 @@ async def _download_with_ytdlp(
             "--newline",
             "--no-check-certificates",
             "-f", format_selector,
-            "--concurrent-fragments", "8",
+            "-N", "32", "--concurrent-fragments", "32",
             "--retries", "10",
             "--fragment-retries", "10",
             "--buffer-size", "16K",

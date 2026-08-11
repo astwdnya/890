@@ -32,7 +32,7 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 * 1024
 
 _SITE_DOMAIN = "redtube.com"
 _SITE_URL = "https://www.redtube.com"
@@ -330,7 +330,7 @@ async def _download_with_ytdlp(
             now = time.time()
             if now - last_update >= 2.0 and text:
                 last_update = now
-                await progress_cb(f"📥 **Downloading...**\n`{text[:80]}`")
+                await progress_cb(f"📥 **Downloading (via yt-dlp ⚡ 32x)...**\n`{text[:80]}`")
 
         await process.wait()
         if process.returncode != 0:

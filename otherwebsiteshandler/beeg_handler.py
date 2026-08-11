@@ -37,7 +37,7 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 * 1024
 MIN_VALID_VIDEO_SIZE = 100 * 1024
 PROGRESS_INTERVAL = 1.0
 
@@ -229,7 +229,9 @@ async def _download_with_ffmpeg(video_url, filepath, progress_cb, dl_id="", refe
                         dl_mb = current_size / 1024 / 1024
                         speed_mb = min(speed / 1024 / 1024, 999)
                         try:
-                            await progress_cb(f"📥 **Downloading...**\n💾 {dl_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s")
+                            await progress_cb(f"📥 **Downloading...**
+(هندلر)
+💾 {dl_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s")
                         except:
                             pass
             except asyncio.CancelledError:
