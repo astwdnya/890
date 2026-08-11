@@ -263,11 +263,18 @@ def _extract_video_sources(html: str) -> List[dict]:
 
     # Method 1: v-acctoken URLs (preferred — these are the signed URLs)
     vacctoken_pattern = re.compile(
-        r'(https?://[^\s"\'<>\)\]]+?/get_file/[^\s"\'<>\)\]]+?\.mp4[^\s"\'<>\)\]]*?\?v-acctoken=[a-zA-Z0-9+/=_-]+)',
+        r'((?:https?://[^\s"\'<>\)\]]+?)?/(?:get_file|[0-9])/[^\s"\'<>\)\]]+?\.mp4[^\s"\'<>\)\]]*?\?v-acctoken=[^\s"\'<>\)\];]+)',
         re.IGNORECASE,
     )
     for m in vacctoken_pattern.finditer(html):
-        url = _clean_url(m.group(1))
+        raw_url = m.group(1)
+        if raw_url.startswith("/"):
+            if not raw_url.startswith("/get_file/"):
+                raw_url = "/get_file" + raw_url
+            url = "https://www.whoreshub.com" + raw_url
+        else:
+            url = raw_url
+        url = _clean_url(url)
         if not _is_main_video_url(url) or url in seen_urls:
             continue
         seen_urls.add(url)
