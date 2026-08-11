@@ -69,6 +69,14 @@ def _is_main_video_url(url: str) -> bool:
     if "/contents/videos_screenshots/" in url_lower: return False
     if "/get_file/" not in url_lower and ".mp4" not in url_lower: return False
     if "_preview.mp4" in url_lower: return False
+    # نکته مهم: x-fetish.tube یه GIF placeholder به‌جای ویدیوی اصلی می‌فرسته
+    # که URL اون بدون suffix هست (مثلاً 668241.mp4 نه 668241_720p.mp4)
+    # ویدیوی واقعی همیشه یه suffix داره: _720p, _1080p, _hd, _fhd, _single_hd
+    # URL بدون suffix (668241.mp4) یه GIF 37 بایتی هست!
+    filename = url_lower.split("/")[-1].split("?")[0]
+    # اگه فقط {id}.mp4 باشه (بدون suffix)، اون رو skip کن
+    if re.match(r'^\d+\.mp4$', filename):
+        return False
     return True
 
 
@@ -262,6 +270,7 @@ async def _fetch_and_download(page_url, filepath, quality_key, progress_cb, dl_i
             if progress_cb:
                 await progress_cb("📥 **Downloading...**")
 
+            # نکته: curl_cffi timeout بزرگ برای ویدیوهای بزرگ
             video_resp = await s.get(target_url, impersonate="chrome", headers={
                 "Accept": "*/*",
                 "Accept-Language": "en-US,en;q=0.9",
@@ -270,6 +279,30 @@ async def _fetch_and_download(page_url, filepath, quality_key, progress_cb, dl_i
 
             if video_resp.status_code != 200:
                 return False, f"Video download: HTTP {video_resp.status_code}", 0
+
+            # نکته مهم: بررسی Content-Type — اگه image/gif بود یعنی URL اشتباهه
+            ct = video_resp.headers.get("content-type", "")
+            if "image" in ct.lower() or "text/html" in ct.lower():
+                logger.warning("Got non-video content-type: %s for URL: %s", ct, target_url[:100])
+                # اگه URL اشتباه بود، URL دیگه از sources رو امتحان کن
+                for q in sources:
+                    if q["url"] != target_url:
+                        logger.info("Trying alternative URL: %s", q["url"][:100])
+                        video_resp2 = await s.get(q["url"], impersonate="chrome", headers={
+                            "Accept": "*/*",
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Referer": page_url,
+                        }, allow_redirects=True, timeout=600)
+                        ct2 = video_resp2.headers.get("content-type", "")
+                        if video_resp2.status_code == 200 and "video" in ct2.lower():
+                            data = video_resp2.content if hasattr(video_resp2, "content") else video_resp2.body
+                            if data and len(data) >= MIN_VALID_VIDEO_SIZE:
+                                async with aiofiles.open(filepath, "wb") as f:
+                                    await f.write(data)
+                                size = len(data)
+                                logger.info("Download DONE (alt URL) | size=%s", _format_size(size))
+                                return True, "", size
+                return False, f"Got {ct} instead of video — all URLs are placeholders", 0
 
             data = video_resp.content if hasattr(video_resp, "content") else video_resp.body
             if not data or len(data) < MIN_VALID_VIDEO_SIZE:
