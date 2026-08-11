@@ -16304,6 +16304,7 @@ async def whoreshub_quality_callback(event):
             video_url=chosen.get("url", ""),
             quality=chosen.get("quality_key", "high"),
             dl_id=dl_id,
+            all_sources=qualities,
         )
         if active_downloads.get(dl_id, {}).get("cancelled"):
             raise asyncio.CancelledError("Download cancelled by user")
