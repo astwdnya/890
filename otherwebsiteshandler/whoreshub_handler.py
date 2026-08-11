@@ -395,6 +395,74 @@ async def _fetch_page(url, jar=None):
 # ─── Main API: extract qualities ──────────────────────────────────────────
 
 
+async def _extract_via_dirpy(url: str, progress_cb=None):
+    """
+    استخراج لینک‌های ویدیو با Dirpy Studio برای زدن دور 403 Cloudflare/Nginx.
+    """
+    try:
+        dirpy_url = f"https://dirpy.com/studio?url={quote_plus(url)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Referer": "https://dirpy.com/"
+        }
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(dirpy_url, timeout=15) as resp:
+                if resp.status != 200:
+                    return [], f"Dirpy HTTP {resp.status}", {}
+                html = await resp.text(errors="replace")
+                
+                title = "WhoresHub Video"
+                title_m = re.search(r"<title>(.*?)</title>", html, re.I)
+                if title_m:
+                    t = title_m.group(1).replace("Dirpy Studio", "").strip(" -|\t\n")
+                    if t: title = t
+
+                sources = []
+                seen_urls = set()
+                pattern = re.compile(
+                    r'((?:https?://[^\s"\'<>\)\]]+?)?/(?:get_file|[0-9])/[^\s"\'<>\)\]]+?\.mp4[^\s"\'<>\)\]]*?\?v-acctoken=[^\s"\'<>\)\];]+)',
+                    re.IGNORECASE,
+                )
+                for m in pattern.finditer(html):
+                    raw_url = m.group(1)
+                    if raw_url.startswith("/"):
+                        if not raw_url.startswith("/get_file/"):
+                            raw_url = "/get_file" + raw_url
+                        u = "https://www.whoreshub.com" + raw_url
+                    else:
+                        u = raw_url
+                    u = _clean_url(u)
+                    if u in seen_urls: continue
+                    seen_urls.add(u)
+                    
+                    url_lower = u.lower()
+                    if "_1080p" in url_lower:
+                        label, height, quality_key, is_hd = "📺 MP4 1080p", 1080, "1080p", True
+                    elif "_720p" in url_lower:
+                        label, height, quality_key, is_hd = "📺 MP4 720p", 720, "720p", True
+                    elif "_480p" in url_lower:
+                        label, height, quality_key, is_hd = "📺 MP4 480p", 480, "480p", False
+                    else:
+                        label, height, quality_key, is_hd = "📺 MP4 (default)", 480, "480p", False
+                        
+                    sources.append({
+                        "label": label, "url": u, "height": height,
+                        "quality_key": quality_key, "method": "dirpy_whoreshub", "is_hd": is_hd,
+                    })
+
+                sources.sort(key=lambda x: x["height"], reverse=True)
+                info = {"title": title, "page_url": url, "fetch_method": "dirpy"}
+                
+                if progress_cb and sources:
+                    labels = ", ".join(s["label"] for s in sources)
+                    await progress_cb(f"✅ **پیدا شد (Dirpy Bypass):** {title[:50]}\n🎞 کیفیت‌ها: {labels}")
+                    
+                return sources, title, info
+    except Exception as e:
+        logger.error(f"WhoresHub Dirpy error: {e}")
+        return [], f"Dirpy error: {e}", {}
+
+
 async def extract_whoreshub_qualities(url, progress_cb=None):
     if not is_whoreshub_url(url):
         return [], "Invalid URL", {}
@@ -405,16 +473,20 @@ async def extract_whoreshub_qualities(url, progress_cb=None):
     jar = CookieJar(unsafe=True)
     html, jar, error = await _fetch_page(url, jar)
 
-    if not html:
-        return [], f"خطا در دریافت صفحه: {error}", {}
+    sources = []
+    if html:
+        sources = _extract_video_sources(html)
+
+    if not sources:
+        logger.info("WhoresHub direct fetch returned no valid sources, attempting Dirpy bypass...")
+        sources, title, info = await _extract_via_dirpy(url, progress_cb)
+        if sources:
+            return sources, title, info
+        return [], f"خطا در دریافت صفحه: {error or 'URL ویدیو پیدا نشد'}", {}
 
     title = _extract_title(html)
     thumbnail = _extract_thumbnail(html)
     duration = _extract_duration(html)
-    sources = _extract_video_sources(html)
-
-    if not sources:
-        return [], "URL ویدیو در صفحه پیدا نشد", {}
 
     cookies = {}
     if jar:
@@ -535,7 +607,7 @@ async def _download_multi_segment(direct_url, filepath, referer, cookies, progre
             except Exception:
                 pass
 
-        shared_timeout = ClientTimeout(total=600, connect=30, sock_read=120)
+        shared_timeout = ClientTimeout(total=None, connect=30, sock_read=120, sock_connect=30)
         connector = TCPConnector(limit=CONNECTOR_LIMIT, limit_per_host=CONNECTOR_LIMIT_PER_HOST, keepalive_timeout=60, enable_cleanup_closed=True)
         shared_session = aiohttp.ClientSession(timeout=shared_timeout, headers=headers, cookies=cookies, connector=connector)
         shared_file = await aiofiles.open(filepath, "r+b")
@@ -767,7 +839,16 @@ async def _download_with_ytdlp(url, filepath, progress_cb, quality_key=""):
 # ─── Public API ────────────────────────────────────────────────────────────
 
 
-async def download_whoreshub_video(page_url, video_url, filepath, progress_cb=None, cookies=None, dl_id="", quality_key=""):
+async def download_whoreshub_video(
+    page_url,
+    video_url,
+    filepath,
+    progress_cb=None,
+    cookies=None,
+    dl_id="",
+    quality_key="",
+    all_sources=None,
+):
     if not is_whoreshub_url(page_url):
         return False, "URL host not allowed", 0
     if not video_url:
@@ -781,61 +862,70 @@ async def download_whoreshub_video(page_url, video_url, filepath, progress_cb=No
     if not cookies:
         cookies = {}
 
-    # ── روش 1: multi-segment ──
-    logger.info(f"[DL-WH] Attempt 1: multi-segment ({MULTI_SEGMENT_WORKERS} workers)")
-    success, error, size = await _download_multi_segment(video_url, filepath, referer, cookies, progress_cb, dl_id=dl_id)
-    if success:
-        return True, "", size
-    if error == "Cancelled by user":
-        return False, error, 0
-    if error == "HTTP_403":
-        logger.info("[DL-WH] 403, refreshing session...")
-        if progress_cb:
-            await progress_cb("🔄 **Refreshing session...**")
-        try:
-            new_sources, _, new_info = await extract_whoreshub_qualities(page_url, progress_cb=None)
-            if new_sources:
-                new_video_url = None
-                for q in new_sources:
-                    if q.get("quality_key") == quality_key:
-                        new_video_url = q["url"]
-                        break
-                if not new_video_url:
-                    new_video_url = new_sources[0]["url"]
-                video_url = new_video_url
-                new_cookies = new_info.get("cookies", {})
-                cookies.update(new_cookies)
-                logger.info("[DL-WH] Got fresh URL")
-        except Exception as e:
-            logger.warning(f"[DL-WH] refresh failed: {e}")
-        success, error, size = await _download_multi_segment(video_url, filepath, referer, cookies, progress_cb, dl_id=dl_id)
+    urls_to_try = []
+    seen = set()
+    if video_url:
+        urls_to_try.append((video_url, quality_key))
+        seen.add(video_url)
+
+    if all_sources:
+        for s in all_sources:
+            u = s.get("url")
+            qk = s.get("quality_key", "")
+            if u and u not in seen:
+                urls_to_try.append((u, qk))
+                seen.add(u)
+
+    logger.info(f"[DL-WH] Will try {len(urls_to_try)} quality URL(s) for direct download")
+
+    for try_url, try_quality in urls_to_try:
+        logger.info(f"[DL-WH] Attempting direct multi-segment on quality '{try_quality}'...")
+        success, error, size = await _download_multi_segment(
+            try_url, filepath, referer, cookies, progress_cb, dl_id=dl_id
+        )
         if success:
             return True, "", size
-    logger.info(f"[DL-WH] Multi-segment failed: {error}")
-    _cleanup_file(filepath)
+        if error == "Cancelled by user":
+            return False, error, 0
 
-    # ── روش 2: single-connection ──
-    logger.info("[DL-WH] Attempt 2: single-connection")
-    success, error, size = await _download_single_aiohttp(video_url, filepath, referer, cookies, progress_cb, dl_id=dl_id)
-    if success:
-        return True, "", size
-    logger.info(f"[DL-WH] Single failed: {error}")
-    _cleanup_file(filepath)
+        _cleanup_file(filepath)
 
-    # ─ـ روش 3: yt-dlp ──
-    logger.info("[DL-WH] Attempt 3: yt-dlp on page URL")
+        logger.info(f"[DL-WH] Attempting direct single-connection on quality '{try_quality}'...")
+        success, error, size = await _download_single_aiohttp(
+            try_url, filepath, referer, cookies, progress_cb, dl_id=dl_id
+        )
+        if success:
+            return True, "", size
+        if error == "Cancelled by user":
+            return False, error, 0
+
+        _cleanup_file(filepath)
+        logger.warning(f"[DL-WH] Quality '{try_quality}' failed ({error}), trying next quality URL if available...")
+
+    # ── روش 3: yt-dlp ──
+    logger.info("[DL-WH] All direct quality URLs failed, falling back to yt-dlp on page URL")
     success, error, size = await _download_with_ytdlp(page_url, filepath, progress_cb, quality_key=quality_key)
     if success:
         return True, "", size
+
     _cleanup_file(filepath)
     return False, error or "All download methods failed", 0
 
 
-async def download_whoreshub_direct(url, filepath, progress_cb=None, video_url="", quality="high", dl_id=""):
-    if not video_url:
+async def download_whoreshub_direct(
+    url,
+    filepath,
+    progress_cb=None,
+    video_url="",
+    quality="high",
+    dl_id="",
+    all_sources=None,
+):
+    if not video_url or not all_sources:
         qualities, title, info = await extract_whoreshub_qualities(url, progress_cb)
         if not qualities:
             return False, title or "Extraction failed", 0
+        all_sources = qualities
         selected = None
         for q in qualities:
             if q.get("quality_key") == quality:
@@ -851,12 +941,21 @@ async def download_whoreshub_direct(url, filepath, progress_cb=None, video_url="
                 selected = qualities[0]
         video_url = selected["url"]
         quality_key = selected.get("quality_key", "")
-        cookies = info.get("cookies", {})
-    else:
-        qualities, title, info = await extract_whoreshub_qualities(url, progress_cb)
         cookies = info.get("cookies", {}) if info else {}
+    else:
         quality_key = quality
-    return await download_whoreshub_video(url, video_url, filepath, progress_cb, cookies=cookies, dl_id=dl_id, quality_key=quality_key)
+        cookies = {}
+
+    return await download_whoreshub_video(
+        url,
+        video_url,
+        filepath,
+        progress_cb,
+        cookies=cookies,
+        dl_id=dl_id,
+        quality_key=quality_key,
+        all_sources=all_sources,
+    )
 
 
 # ─── Self-test ─────────────────────────────────────────────────────────────
