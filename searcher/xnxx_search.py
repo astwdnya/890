@@ -62,7 +62,7 @@ class XnxxVideo:
 async def search_xnxx(
     query: str,
     page: int = 0,
-    limit: int = 20,
+    limit: int = 0,
     sort: str = "relevance",
 ) -> List[dict]:
     """
@@ -115,7 +115,7 @@ async def search_xnxx(
 
     results = _parse_search_results(html)
 
-    if limit and len(results) > limit:
+    if limit > 0 and len(results) > limit:
         results = results[:limit]
 
     logger.info(

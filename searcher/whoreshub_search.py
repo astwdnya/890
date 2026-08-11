@@ -100,7 +100,7 @@ class WhoresHubVideo:
 async def search_whoreshub(
     query: str,
     page: int = 0,
-    limit: int = 50,
+    limit: int = 0,
     sort: str = "relevance",
 ) -> List[dict]:
     """
@@ -109,7 +109,7 @@ async def search_whoreshub(
     Args:
         query: عبارت جستجو
         page: شماره صفحه (0 = صفحه اول)
-        limit: حداکثر تعداد نتایج
+        limit: حداکثر تعداد نتایج (0 = همه ویدیوهای صفحه)
         sort: مرتب‌سازی (relevance, latest, views, rating, duration, comments, favourites)
 
     Returns:
@@ -121,17 +121,12 @@ async def search_whoreshub(
     query = query.strip()
     encoded = quote_plus(query)
 
-    # ساخت AJAX URL
-    # صفحه 0 = صفحه اول (from_videos+from_albums شروع از 1 می‌شه، ولی صفحه 0 یعنی بدون پارامتر)
     sort_by = _SORT_MAP.get(sort.lower(), "")
 
     params = f"mode=async&function=get_block&block_id={_BLOCK_ID}&q={encoded}"
     if sort_by:
         params += f"&sort_by={sort_by}"
 
-    # page 0 = صفحه اول (بدون from_videos)
-    # page 1 = صفحه دوم (from_videos=2)
-    # page N = from_videos=N+1
     if page > 0:
         params += f"&from_videos={page + 1}&from_albums={page + 1}"
 
@@ -147,7 +142,7 @@ async def search_whoreshub(
 
     results = _parse_search_results(html)
 
-    if limit and len(results) > limit:
+    if limit > 0 and len(results) > limit:
         results = results[:limit]
 
     logger.info(

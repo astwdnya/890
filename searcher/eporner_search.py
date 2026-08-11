@@ -125,7 +125,7 @@ def parse_inline_query(raw_query: str) -> dict:
 async def search_eporner(
     query: str,
     page: int = 1,
-    limit: int = 20,
+    limit: int = 0,
     sort: str = "relevance",
 ) -> List[dict]:
     """
@@ -134,7 +134,7 @@ async def search_eporner(
     Args:
         query: عبارت جستجو (حداقل 2 کاراکتر)
         page: شماره صفحه (از 1 شروع میشه)
-        limit: حداکثر تعداد نتایج
+        limit: حداکثر تعداد نتایج (0 = همه ویدیوهای صفحه)
         sort: نوع مرتب‌سازی (relevance, new, top, long, views)
 
     Returns:
@@ -145,7 +145,6 @@ async def search_eporner(
 
     query = query.strip()
     page = max(1, page)
-    limit = max(1, min(limit, _RESULTS_PER_PAGE))
 
     search_url = _build_search_url(query, page, sort)
 
@@ -160,7 +159,7 @@ async def search_eporner(
 
     results = _parse_search_results(html)
 
-    if len(results) > limit:
+    if limit > 0 and len(results) > limit:
         results = results[:limit]
 
     logger.info(

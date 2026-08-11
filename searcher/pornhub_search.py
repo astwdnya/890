@@ -54,13 +54,16 @@ class PornhubVideo:
         return asdict(self)
 
 
+__all__ = ["search_pornhub", "search_pornhub_multi_page", "PornhubVideo"]
+
+
 # ─── Search ─────────────────────────────────────────────────
 
 
 async def search_pornhub(
     query: str,
     page: int = 1,
-    limit: int = 20,
+    limit: int = 0,
     sort: str = "",
     hd: bool = False,
 ) -> List[dict]:
@@ -70,7 +73,7 @@ async def search_pornhub(
     Args:
         query: عبارت جستجو
         page: شماره صفحه (از 1)
-        limit: حداکثر نتایج
+        limit: حداکثر نتایج (0 = همه ویدیوهای صفحه)
         sort: مرتب‌سازی
             "" = مرتبط‌ترین (default)
             "mr" = جدیدترین
@@ -104,11 +107,54 @@ async def search_pornhub(
 
     results = _parse_search_results(html)
 
-    if limit and len(results) > limit:
+    if limit > 0 and len(results) > limit:
         results = results[:limit]
 
     logger.info("Found %d results for '%s'", len(results), query)
     return [r.to_dict() for r in results]
+
+
+async def search_pornhub_multi_page(
+    query: str,
+    pages: int = 3,
+    limit: int = 50,
+    sort: str = "",
+    hd: bool = False,
+) -> List[dict]:
+    """
+    سرچ چند صفحه‌ای از PornHub (تا limit نتیجه).
+
+    Args:
+        query: عبارت جستجو
+        pages: تعداد صفحات (از 1)
+        limit: حداکثر کل نتایج
+        sort: مرتب‌سازی
+        hd: فقط HD
+    """
+    if not query or len(query.strip()) < 2:
+        return []
+
+    tasks = [
+        search_pornhub(query, page=p, limit=limit, sort=sort, hd=hd)
+        for p in range(1, pages + 1)
+    ]
+    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    combined = []
+    seen_ids = set()
+    for page_results in all_results:
+        if isinstance(page_results, Exception):
+            logger.warning("Page search failed: %s", page_results)
+            continue
+        for video in page_results:
+            vid = video.get("vkey", "")
+            if vid and vid not in seen_ids:
+                seen_ids.add(vid)
+                combined.append(video)
+            elif not vid:
+                combined.append(video)
+
+    return combined[:limit]
 
 
 # ─── HTTP ───────────────────────────────────────────────────
