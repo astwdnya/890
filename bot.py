@@ -390,6 +390,16 @@ from otherwebsiteshandler.erome_handler import (
     download_all_media,
     active_downloads as erome_active_downloads,
 )
+from otherwebsiteshandler.beeg_handler import (
+    is_beeg_url,
+    extract_beeg_qualities,
+    download_beeg_direct,
+)
+from otherwebsiteshandler.spankbang_handler import (
+    is_spankbang_url,
+    extract_spankbang_qualities,
+    download_spankbang_direct,
+)
 from otherwebsiteshandler.hdtube_handler import (
     is_hdtube_url,
     extract_hdtube_qualities,
@@ -5511,6 +5521,24 @@ async def generic_url_handler(event):
         status_msg = await event.reply("🔍 در حال استخراج محتوا...")
         try:
             await process_erome_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_beeg_url(target_url):
+        logger.info(f"[URL] Beeg detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_beeg_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_spankbang_url(target_url):
+        logger.info(f"[URL] SpankBang detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_spankbang_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -16490,6 +16518,266 @@ async def erome_cancel_callback(event):
         pass
 
 
+# ─── Beeg (same flow as XFetish: needs page_url + video_url) ───
+
+beeg_sessions: dict = {}
+
+
+async def process_beeg_request(event, url: str, status_msg):
+    async def progress_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    qualities, title, info = await extract_beeg_qualities(url, progress_cb=progress_cb)
+    if not qualities:
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        return
+    session_id = f"bee_{event.chat_id}_{event.id}_{int(time.time())}"
+    beeg_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو Beeg"
+    text = f"🎬 **{title_display}**\n🌐 Beeg\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"bee_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"bee_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def beeg_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in beeg_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = beeg_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "beeg_video"
+    url = entry["url"]
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "beeg_video"
+    filepath = os.path.join(OUTPUT_FOLDER, f"bee_{safe_title}_{int(time.time())}.mp4")
+
+    dl_id = f"bee_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_beeg_direct(
+            url=url,
+            filepath=filepath,
+            progress_cb=progress_cb,
+            video_url=chosen.get("url", ""),
+            quality=chosen.get("quality_key", "high"),
+            dl_id=dl_id,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        ul_id = f"bee_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[BEEG] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def beeg_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("bee_cancel_", "")
+    beeg_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
+# ─── SpankBang (same flow as XFetish: needs page_url + video_url) ───
+
+spankbang_sessions: dict = {}
+
+
+async def process_spankbang_request(event, url: str, status_msg):
+    async def progress_cb(text):
+        try:
+            await status_msg.edit(text, parse_mode="markdown")
+        except Exception:
+            pass
+
+    qualities, title, info = await extract_spankbang_qualities(url, progress_cb=progress_cb)
+    if not qualities:
+        err_detail = f" — `{title[:150]}`" if title else ""
+        await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
+        return
+    session_id = f"sb_{event.chat_id}_{event.id}_{int(time.time())}"
+    spankbang_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+    }
+    title_display = title[:60] if title else "ویدیو SpankBang"
+    text = f"🎬 **{title_display}**\n🌐 SpankBang\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"sb_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"sb_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def spankbang_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in spankbang_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = spankbang_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "spankbang_video"
+    url = entry["url"]
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "spankbang_video"
+    filepath = os.path.join(OUTPUT_FOLDER, f"sb_{safe_title}_{int(time.time())}.mp4")
+
+    dl_id = f"sb_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_spankbang_direct(
+            url=url,
+            filepath=filepath,
+            progress_cb=progress_cb,
+            video_url=chosen.get("url", ""),
+            quality=chosen.get("quality_key", "high"),
+            dl_id=dl_id,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success or not os.path.exists(filepath) or size < 1024:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+        ul_id = f"sb_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=filepath,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[SPANKBANG] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def spankbang_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("sb_cancel_", "")
+    spankbang_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
 # ─── YouPorn (custom handlers: passes format_id + page_url) ───
 
 youporn_sessions: dict = {}
@@ -17163,6 +17451,18 @@ async def main():
     )
     client.add_event_handler(
         erome_cancel_callback, events.CallbackQuery(pattern=r"er_cancel_.+")
+    )
+    client.add_event_handler(
+        beeg_quality_callback, events.CallbackQuery(pattern=r"bee_q_.+")
+    )
+    client.add_event_handler(
+        beeg_cancel_callback, events.CallbackQuery(pattern=r"bee_cancel_.+")
+    )
+    client.add_event_handler(
+        spankbang_quality_callback, events.CallbackQuery(pattern=r"sb_q_.+")
+    )
+    client.add_event_handler(
+        spankbang_cancel_callback, events.CallbackQuery(pattern=r"sb_cancel_.+")
     )
     client.add_event_handler(
         setsearch_callback, events.CallbackQuery(pattern=r"setsearch_.+")
