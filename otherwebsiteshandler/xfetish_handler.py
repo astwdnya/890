@@ -32,8 +32,12 @@ _USER_AGENT = (
 
 MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024
 MIN_VALID_VIDEO_SIZE = 100 * 1024
+CHUNK_SIZE = 1024 * 1024
+PROGRESS_INTERVAL = 1.0
 
 _ALLOWED_HOSTS = frozenset({"x-fetish.tube", "www.x-fetish.tube"})
+
+active_downloads: dict = {}
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 
@@ -59,6 +63,26 @@ def _format_size(size_bytes: int) -> str:
     if size_bytes < 1024*1024: return f"{size_bytes/1024:.1f} KB"
     if size_bytes < 1024*1024*1024: return f"{size_bytes/1024/1024:.1f} MB"
     return f"{size_bytes/1024/1024/1024:.2f} GB"
+
+
+def _format_progress(downloaded: int, content_length: int, start_time: float, now: float) -> str:
+    elapsed = now - start_time
+    speed = downloaded / elapsed if elapsed > 0 else 0
+    dl_mb = downloaded / 1024 / 1024
+    if content_length > 0:
+        total_mb = content_length / 1024 / 1024
+        pct = downloaded / content_length * 100
+        filled = int(pct / 5)
+        bar = "█" * filled + "░" * (20 - filled)
+        speed_mb = min(speed / 1024 / 1024, 999)
+        eta_secs = int((content_length - downloaded) / speed) if speed > 0 else 0
+        eta_m, eta_s = divmod(eta_secs, 60)
+        return (
+            f"📥 **Downloading...**\n`[{bar}]`\n"
+            f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
+            f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}"
+        )
+    return f"📥 **Downloading...**\n💾 {dl_mb:.1f} MB  •  ⚡ {speed / 1024 / 1024:.1f} MB/s"
 
 
 def _is_main_video_url(url: str) -> bool:
@@ -220,14 +244,58 @@ def _extract_video_sources(html: str) -> List[dict]:
 # ─── Combined: Fetch page + Extract + Download (same session) ────────────
 
 
+async def _stream_download_response(s, page_url, target_url, filepath, progress_cb, dl_id=""):
+    """دانلود تکه‌ای (Stream) ویدیو با aiter_content تا از تایم‌اوت و مصرف زیاد RAM جلوگیری شود."""
+    video_resp = await s.get(target_url, impersonate="chrome", headers={
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": page_url,
+    }, allow_redirects=True, timeout=30, stream=True)
+
+    if video_resp.status_code != 200:
+        return False, f"HTTP {video_resp.status_code}", 0
+
+    ct = video_resp.headers.get("content-type", "").lower()
+    if "image" in ct or "text/html" in ct:
+        return False, f"Got invalid content-type: {ct}", 0
+
+    content_length = int(video_resp.headers.get("content-length", 0))
+    if content_length > MAX_DOWNLOAD_SIZE:
+        return False, f"File too large: {_format_size(content_length)}", 0
+
+    start_time = time.time()
+    last_update = 0.0
+    downloaded = 0
+
+    async with aiofiles.open(filepath, "wb") as f:
+        async for chunk in video_resp.aiter_content(chunk_size=CHUNK_SIZE):
+            if active_downloads.get(dl_id, {}).get("cancelled"):
+                _cleanup_file(filepath)
+                return False, "Cancelled by user", 0
+            if chunk:
+                await f.write(chunk)
+                downloaded += len(chunk)
+                now = time.time()
+                if progress_cb and now - last_update >= PROGRESS_INTERVAL:
+                    last_update = now
+                    msg = _format_progress(downloaded, content_length, start_time, now)
+                    try:
+                        await progress_cb(msg)
+                    except Exception:
+                        pass
+
+    size = os.path.getsize(filepath)
+    if size < MIN_VALID_VIDEO_SIZE:
+        _cleanup_file(filepath)
+        return False, f"File too small ({size} bytes)", 0
+
+    logger.info("Download DONE | size=%s", _format_size(size))
+    return True, "", size
+
+
 async def _fetch_and_download(page_url, filepath, quality_key, progress_cb, dl_id=""):
     """
-    Fetch صفحه، استخراج URL ویدیو، و دانلود — همه با همون session.
-
-    این تنها روشی هست که برای x-fetish.tube کار می‌کنه چون:
-    1. Cloudflare نیاز به TLS fingerprinting داره (curl_cffi)
-    2. CDN نیاز به cookies از همون session داره
-    3. URL فقط برای یه request کار می‌کنه
+    Fetch صفحه، استخراج URL ویدیو، و دانلود استریم با همان session.
     """
     if progress_cb:
         await progress_cb("🔄 **دریافت اطلاعات صفحه...**")
@@ -255,68 +323,28 @@ async def _fetch_and_download(page_url, filepath, quality_key, progress_cb, dl_i
             if not sources:
                 return False, "URL ویدیو در صفحه پیدا نشد", 0
 
-            # 3. Select quality
-            target_url = None
+            # ترتیب‌بندی: انتخاب کیفیت درخواستی یا جایگزین‌ها
+            ordered_urls = []
             for q in sources:
                 if q.get("quality_key") == quality_key:
-                    target_url = q["url"]
-                    break
-            if not target_url:
-                target_url = sources[0]["url"]
+                    ordered_urls.insert(0, q["url"])
+                else:
+                    ordered_urls.append(q["url"])
 
-            logger.info("Using URL: %s", target_url[:100])
+            # 3. تست و دانلود تک‌تک URLها به روش Streaming
+            last_err = ""
+            for target_url in ordered_urls:
+                logger.info("Trying stream URL: %s", target_url[:100])
+                if progress_cb:
+                    await progress_cb("📥 **Downloading...**")
 
-            # 4. Download video with same session (cookies persist!)
-            if progress_cb:
-                await progress_cb("📥 **Downloading...**")
+                success, err, size = await _stream_download_response(s, page_url, target_url, filepath, progress_cb, dl_id=dl_id)
+                if success:
+                    return True, "", size
+                logger.warning("Stream failed for URL %s: %s", target_url[:100], err)
+                last_err = err
 
-            # نکته: curl_cffi timeout بزرگ برای ویدیوهای بزرگ
-            video_resp = await s.get(target_url, impersonate="chrome", headers={
-                "Accept": "*/*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": page_url,
-            }, allow_redirects=True, timeout=600)
-
-            if video_resp.status_code != 200:
-                return False, f"Video download: HTTP {video_resp.status_code}", 0
-
-            # نکته مهم: بررسی Content-Type — اگه image/gif بود یعنی URL اشتباهه
-            ct = video_resp.headers.get("content-type", "")
-            if "image" in ct.lower() or "text/html" in ct.lower():
-                logger.warning("Got non-video content-type: %s for URL: %s", ct, target_url[:100])
-                # اگه URL اشتباه بود، URL دیگه از sources رو امتحان کن
-                for q in sources:
-                    if q["url"] != target_url:
-                        logger.info("Trying alternative URL: %s", q["url"][:100])
-                        video_resp2 = await s.get(q["url"], impersonate="chrome", headers={
-                            "Accept": "*/*",
-                            "Accept-Language": "en-US,en;q=0.9",
-                            "Referer": page_url,
-                        }, allow_redirects=True, timeout=600)
-                        ct2 = video_resp2.headers.get("content-type", "")
-                        if video_resp2.status_code == 200 and "video" in ct2.lower():
-                            data = video_resp2.content if hasattr(video_resp2, "content") else video_resp2.body
-                            if data and len(data) >= MIN_VALID_VIDEO_SIZE:
-                                async with aiofiles.open(filepath, "wb") as f:
-                                    await f.write(data)
-                                size = len(data)
-                                logger.info("Download DONE (alt URL) | size=%s", _format_size(size))
-                                return True, "", size
-                return False, f"Got {ct} instead of video — all URLs are placeholders", 0
-
-            data = video_resp.content if hasattr(video_resp, "content") else video_resp.body
-            if not data or len(data) < MIN_VALID_VIDEO_SIZE:
-                return False, f"File too small ({len(data) if data else 0} bytes)", 0
-
-            if len(data) > MAX_DOWNLOAD_SIZE:
-                return False, f"File too large: {_format_size(len(data))}", 0
-
-            async with aiofiles.open(filepath, "wb") as f:
-                await f.write(data)
-
-            size = len(data)
-            logger.info("Download DONE | size=%s", _format_size(size))
-            return True, "", size
+            return False, last_err or "All stream URLs failed", 0
 
     except asyncio.CancelledError:
         _cleanup_file(filepath)
