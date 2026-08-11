@@ -36,10 +36,10 @@ CHUNK_SIZE = 1024 * 1024
 PROGRESS_INTERVAL = 1.0
 
 MULTI_SEGMENT_WORKERS = 32
-MULTI_SEGMENT_CHUNK_SIZE = 10 * 1024 * 1024
-MULTI_SEGMENT_MIN_SIZE = 5 * 1024 * 1024
+MULTI_SEGMENT_CHUNK_SIZE = 4 * 1024 * 1024
+MULTI_SEGMENT_MIN_SIZE = 2 * 1024 * 1024
 MAX_RETRIES = 3
-RETRY_DELAY = 2.0
+RETRY_DELAY = 1.0
 
 _ALLOWED_HOSTS = frozenset({"x-fetish.tube", "www.x-fetish.tube"})
 
@@ -492,7 +492,7 @@ async def _fetch_and_download(page_url, filepath, quality_key, progress_cb, dl_i
         await progress_cb("🔄 **دریافت اطلاعات صفحه...**")
 
     try:
-        async with AsyncSession() as s:
+        async with AsyncSession(max_clients=64) as s:
             # 1. Fetch page
             resp = await s.get(page_url, impersonate="chrome", headers={
                 "User-Agent": _USER_AGENT,
