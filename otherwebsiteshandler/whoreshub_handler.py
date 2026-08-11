@@ -1,3 +1,35 @@
+
+def _parse_ytdlp_progress_msg(text: str) -> str:
+    pct_m = re.search(r"(\d+\.?\d*)%", text)
+    if not pct_m:
+        return ""
+    pct_str = pct_m.group(1)
+    try:
+        pct_num = float(pct_str)
+        filled = int(pct_num / 5)
+        bar = "█" * filled + "░" * (20 - filled)
+    except (ValueError, TypeError):
+        bar = "░" * 20
+
+    size_m = re.search(r"of\s+~?\s*([\d\.]+\s*[KMGT]?i?B)", text, re.I)
+    size_str = size_m.group(1) if size_m else ""
+
+    speed_m = re.search(r"at\s+([\d\.]+\s*[KMGT]?i?B/s)", text, re.I)
+    speed_str = speed_m.group(1) if speed_m else ""
+
+    eta_m = re.search(r"ETA\s+([\d:]+)", text, re.I)
+    eta_str = eta_m.group(1) if eta_m else ""
+
+    line2 = []
+    if size_str: line2.append(f"💾 {size_str}")
+    if speed_str: line2.append(f"⚡ {speed_str}")
+    line2_str = f"\n{'  •  '.join(line2)}" if line2 else ""
+
+    line3_str = f"\n📊 {pct_str}%"
+    if eta_str: line3_str += f"  •  ⏱ ETA: {eta_str}"
+
+    return f"📥 **Downloading (via yt-dlp ⚡ 32x)...**\n`[{bar}]`{line2_str}{line3_str}"
+
 """
 whoreshub_handler.py
 ────────────────────
@@ -416,40 +448,25 @@ async def _download_multi_segment(direct_url, filepath, referer, cookies, progre
         accept_ranges = ""
 
         try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers, cookies=cookies) as s:
-                async with s.head(direct_url, allow_redirects=True) as r:
+            async with aiohttp.ClientSession(timeout=timeout, headers={**headers, "Range": "bytes=0-0"}, cookies=cookies) as s:
+                async with s.get(direct_url, allow_redirects=True) as r:
                     if r.status in (200, 206):
-                        content_length = int(r.headers.get("Content-Length", 0))
-                        accept_ranges = r.headers.get("Accept-Ranges", "").lower()
+                        accept_ranges = "bytes"
+                        cr = r.headers.get("Content-Range", "")
+                        m = re.search(r"/(\d+)", cr)
+                        if m:
+                            content_length = int(m.group(1))
+                        else:
+                            content_length = int(r.headers.get("Content-Length", 0))
                     elif r.status == 403:
                         return False, "HTTP_403", 0
         except Exception as e:
-            logger.warning(f"HEAD request failed: {e}")
-
-        if content_length == 0:
-            try:
-                timeout = ClientTimeout(total=10, connect=5)
-                async with aiohttp.ClientSession(timeout=timeout, headers={**headers, "Range": "bytes=0-0"}, cookies=cookies) as s:
-                    async with s.get(direct_url, allow_redirects=True) as r:
-                        if r.status in (200, 206):
-                            if r.status == 206:
-                                accept_ranges = "bytes"
-                                cr = r.headers.get("Content-Range", "")
-                                m = re.search(r"/(\d+)", cr)
-                                if m: content_length = int(m.group(1))
-                            else:
-                                content_length = int(r.headers.get("Content-Length", 0))
-                        elif r.status == 403:
-                            return False, "HTTP_403", 0
-            except Exception as e:
-                logger.warning(f"Probe request failed: {e}")
+            logger.warning(f"Probe request failed: {e}")
 
         if content_length == 0:
             return False, "Cannot determine file size", 0
         if content_length > MAX_DOWNLOAD_SIZE:
             return False, f"File too large: {_format_size(content_length)}", 0
-        if accept_ranges != "bytes" or content_length < MULTI_SEGMENT_MIN_SIZE:
-            return False, "Range not supported or file too small", 0
 
         total_mb = content_length / 1024 / 1024
         await progress_cb(f"📥 **Downloading...**\n(هندلر)\n💾 Size: {total_mb:.1f} MB\n🔥 {num_workers} parallel workers")
@@ -704,7 +721,9 @@ async def _download_with_ytdlp(url, filepath, progress_cb, quality_key=""):
                             bar = "█" * filled + "░" * (20 - filled)
                         except (ValueError, TypeError):
                             bar = "░" * 20
-                        await progress_cb(f"📥 **Downloading (via yt-dlp ⚡ 32x)...**\n`[{bar}]`\n📊 {pct}%")
+                        parsed_msg = _parse_ytdlp_progress_msg(text)
+                        if parsed_msg:
+                            await progress_cb(parsed_msg)
         await process.wait()
         if process.returncode != 0:
             stderr = (await process.stderr.read()).decode(errors="replace")
