@@ -580,6 +580,84 @@ def get_free_space(path: str = OUTPUT_FOLDER) -> int:
     return usage.free
 
 
+async def _get_video_duration(filepath: str) -> float:
+    """دریافت مدت زمان ویدیو با ffprobe."""
+    if shutil.which("ffprobe"):
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            filepath
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            val = float(stdout.decode().strip())
+            if val > 0: return val
+        except Exception:
+            pass
+    return 0.0
+
+
+async def split_video_smart(
+    filepath: str,
+    max_part_size: int = MAX_PART_SIZE,
+    status_msg: Message = None,
+) -> list:
+    """
+    تقسیم فوق‌العاده سریع و سبک ویدیوهای بیشتر از ۲ گیگابایت با FFmpeg -c copy (بدون رندر مجدد).
+    سرعت بالا، بدون مصرف اضافی CPU/RAM، و تولید پارت‌های ویدیویی قابل پخش در تلگرام.
+    """
+    file_size = os.path.getsize(filepath)
+    if file_size <= max_part_size:
+        return [filepath]
+
+    if status_msg:
+        await safe_edit(
+            status_msg,
+            f"📦 **حجم ویدیو ({file_size / 1024 / 1024 / 1024:.2f} گیگابایت) بیشتر از ۲ گیگابایت است.**\n"
+            f"⚡ **در حال تقسیم ویدیو به پارت‌های ۲ گیگابایتی...**",
+        )
+
+    # 1. اگر FFmpeg هست، تقسیم بر اساس استریم ویدیو انجام بدید (-c copy)
+    if shutil.which("ffmpeg"):
+        duration = await _get_video_duration(filepath)
+        if duration > 0:
+            num_parts = math.ceil(file_size / max_part_size)
+            segment_seconds = int(duration / num_parts)
+            base, ext = os.path.splitext(filepath)
+            if not ext: ext = ".mp4"
+            output_pattern = os.path.join(OUTPUT_FOLDER, f"{os.path.basename(base)}_part%03d{ext}")
+
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", filepath,
+                "-c", "copy",
+                "-map", "0",
+                "-segment_time", str(segment_seconds),
+                "-f", "segment",
+                "-reset_timestamps", "1",
+                output_pattern
+            ]
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                _, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    part_files = sorted(glob.glob(os.path.join(OUTPUT_FOLDER, f"{os.path.basename(base)}_part*{ext}")))
+                    if part_files:
+                        logger.info(f"[SPLIT] FFmpeg -c copy split {len(part_files)} video parts successfully")
+                        return part_files
+            except Exception as e:
+                logger.warning(f"[SPLIT] FFmpeg segment failed: {e}")
+
+    # Fallback to binary splitting
+    return await split_file_into_parts(filepath, max_part_size, status_msg)
+
+
 async def split_file_into_parts(
     filepath: str,
     max_part_size: int = MAX_PART_SIZE,
@@ -5691,7 +5769,7 @@ async def generic_url_handler(event):
                 status_msg,
                 f"✂️ Splitting large file ({human_readable_size(file_size)}) into parts...",
             )
-            parts = await split_file_into_parts(filepath, status_msg=status_msg)
+            parts = await split_video_smart(filepath, status_msg=status_msg)
             if not parts:
                 await safe_edit(status_msg, "❌ Failed to split file.")
                 return

@@ -37,7 +37,7 @@ _DEFAULT_HEADERS = {
 }
 
 # حداکثر حجم دانلود: 2 گیگابایت
-MAX_DOWNLOAD_SIZE = 2 * 1024 * 1024 * 1024
+MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024 * 1024
 
 # حداکثر عمر session (ثانیه): 30 دقیقه
 SESSION_TTL = 30 * 60
