@@ -193,6 +193,38 @@ async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
     return qualities, title
 
 
+def _parse_ytdlp_progress_msg(text: str) -> str:
+    pct_m = re.search(r"(\d+\.?\d*)%", text)
+    if not pct_m:
+        return ""
+    pct_str = pct_m.group(1)
+    try:
+        pct_num = float(pct_str)
+        filled = int(pct_num / 5)
+        bar = "█" * filled + "░" * (20 - filled)
+    except (ValueError, TypeError):
+        bar = "░" * 20
+
+    size_m = re.search(r"of\s+~?\s*([\d\.]+\s*[KMGT]?i?B)", text, re.I)
+    size_str = size_m.group(1) if size_m else ""
+
+    speed_m = re.search(r"at\s+([\d\.]+\s*[KMGT]?i?B/s)", text, re.I)
+    speed_str = speed_m.group(1) if speed_m else ""
+
+    eta_m = re.search(r"ETA\s+([\d:]+)", text, re.I)
+    eta_str = eta_m.group(1) if eta_m else ""
+
+    line2 = []
+    if size_str: line2.append(f"💾 {size_str}")
+    if speed_str: line2.append(f"⚡ {speed_str}")
+    line2_str = f"\n{'  •  '.join(line2)}" if line2 else ""
+
+    line3_str = f"\n📊 {pct_str}%"
+    if eta_str: line3_str += f"  •  ⏱ ETA: {eta_str}"
+
+    return f"📥 **Downloading (via yt-dlp ⚡ 32x)...**\n`[{bar}]`{line2_str}{line3_str}"
+
+
 async def download_with_ytdlp(
     url: str,
     format_id: str,
@@ -200,7 +232,7 @@ async def download_with_ytdlp(
     progress_cb,
 ) -> Tuple[bool, str, int]:
     """Download video using yt-dlp with the selected format."""
-    await progress_cb("📥 **در حال دانلود با yt-dlp...**")
+    await progress_cb("📥 **در حال دانلود با yt-dlp (32x Multi-Segment)...**")
     try:
         format_spec = f"{format_id}+bestaudio/best"
         cmd = [
@@ -238,7 +270,11 @@ async def download_with_ytdlp(
             now = time.time()
             if now - last_update >= 2.0 and text:
                 last_update = now
-                await progress_cb(f"📥 **Downloading (via yt-dlp ⚡ 32x)...**\n`{text[:80]}`")
+                parsed = _parse_ytdlp_progress_msg(text)
+                if parsed:
+                    await progress_cb(parsed)
+                else:
+                    await progress_cb(f"📥 **Downloading (via yt-dlp ⚡ 32x)...**\n`{text[:80]}`")
 
         # collect remaining stderr
         remaining_stderr = await process.stderr.read()
