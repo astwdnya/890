@@ -471,19 +471,31 @@ from happyscribe_subtitle import hardcode_subtitle_online
 from subtitle_extractor import get_subtitle_streams, extract_subtitles
 
 # ====================== CONFIGURATION ======================
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-API_ID = 2040
-API_HASH = "b18441a1ff607e10a989891a5462e627"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+API_ID = int(os.environ.get("API_ID", os.environ.get("TELEGRAM_API_ID", 2040)))
+API_HASH = os.environ.get("API_HASH", os.environ.get("TELEGRAM_API_HASH", "b18441a1ff607e10a989891a5462e627"))
 
-AUTHORIZED_USERS = {818185073, 6936101187, 7972834913, 8228738080}
-ADMIN_ID = 818185073
+def _parse_authorized_users() -> set:
+    raw = os.environ.get("AUTHORIZED_USERS", "")
+    users = set()
+    if raw:
+        for item in raw.split(","):
+            item = item.strip()
+            if item.lstrip("-").isdigit():
+                users.add(int(item))
+    if not users:
+        users = {818185073, 6936101187, 7972834913, 8228738080}
+    return users
+
+AUTHORIZED_USERS = _parse_authorized_users()
+ADMIN_ID = int(os.environ.get("ADMIN_ID", next(iter(AUTHORIZED_USERS), 818185073)))
 
 MAX_FILE_SIZE_MB = 50000  # allow up to ~50GB (bot will split into 2GB parts)
 MAX_PART_SIZE = 1900 * 1024 * 1024  # 1.9GB per part for Telegram upload
 OUTPUT_FOLDER = "output_files"
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-HEALTH_PORT = int(os.environ.get("PORT", 10000))
+HEALTH_PORT = int(os.environ.get("HEALTH_PORT", os.environ.get("PORT", 10000)))
 
 video_cache: Dict[str, Dict] = {}
 user_state: Dict[int, Dict] = {}
