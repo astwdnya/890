@@ -1596,9 +1596,7 @@ async def _download_single_curl_cffi(
                         try:
                             await safe_edit(
                                 status_msg,
-                                f"📥 **Downloading...**
-(هندلر)
-`[{bar}]`\n"
+                                f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
                                 f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
                                 f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}",
                                 buttons=dl_buttons_cancel,
@@ -1611,9 +1609,7 @@ async def _download_single_curl_cffi(
                         try:
                             await safe_edit(
                                 status_msg,
-                                f"📥 **Downloading...**
-(هندلر)
-💾 {dl_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s",
+                                f"📥 **Downloading...**\n(هندلر)\n💾 {dl_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s",
                                 buttons=dl_buttons_cancel,
                             )
                         except Exception:
