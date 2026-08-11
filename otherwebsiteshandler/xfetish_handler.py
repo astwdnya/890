@@ -35,6 +35,12 @@ MIN_VALID_VIDEO_SIZE = 100 * 1024
 CHUNK_SIZE = 1024 * 1024
 PROGRESS_INTERVAL = 1.0
 
+MULTI_SEGMENT_WORKERS = 32
+MULTI_SEGMENT_CHUNK_SIZE = 10 * 1024 * 1024
+MULTI_SEGMENT_MIN_SIZE = 5 * 1024 * 1024
+MAX_RETRIES = 3
+RETRY_DELAY = 2.0
+
 _ALLOWED_HOSTS = frozenset({"x-fetish.tube", "www.x-fetish.tube"})
 
 active_downloads: dict = {}
@@ -244,13 +250,198 @@ def _extract_video_sources(html: str) -> List[dict]:
 # ─── Combined: Fetch page + Extract + Download (same session) ────────────
 
 
+async def _download_multi_segment(s, page_url, target_url, filepath, progress_cb, dl_id="", num_workers=MULTI_SEGMENT_WORKERS):
+    """
+    دانلود موازی چندتکه‌ای (Multi-Segment با 32 Worker) با استفاده از همان session و Range headers.
+    سرعت دانلود را تا 32 برابر افزایش می‌دهد.
+    """
+    cdn_headers = {
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": page_url,
+    }
+
+    content_length = 0
+    accept_ranges = False
+
+    # 1. Probe request با Range: bytes=0-1023
+    try:
+        probe_headers = dict(cdn_headers)
+        probe_headers["Range"] = "bytes=0-1023"
+        probe_resp = await s.get(target_url, impersonate="chrome", headers=probe_headers, allow_redirects=True, timeout=(30, 86400))
+        if probe_resp.status_code in (200, 206):
+            ct = probe_resp.headers.get("content-type", "").lower()
+            if "image" in ct or "text/html" in ct:
+                return False, f"Got invalid content-type: {ct}", 0
+            if probe_resp.status_code == 206:
+                accept_ranges = True
+                cr = probe_resp.headers.get("Content-Range", "")
+                m = re.search(r"/(\d+)", cr)
+                if m:
+                    content_length = int(m.group(1))
+            if content_length == 0:
+                content_length = int(probe_resp.headers.get("Content-Length", 0))
+    except Exception as e:
+        logger.warning("Probe request failed: %s", e)
+
+    if content_length == 0 or not accept_ranges or content_length < MULTI_SEGMENT_MIN_SIZE:
+        return False, "Range not supported or file too small for multi-segment", 0
+
+    if content_length > MAX_DOWNLOAD_SIZE:
+        return False, f"File too large: {_format_size(content_length)}", 0
+
+    total_mb = content_length / 1024 / 1024
+    if progress_cb:
+        await progress_cb(f"📥 **Downloading (32x Parallel)...**\n💾 Size: {total_mb:.1f} MB")
+
+    # 2. تقسیم فایل به چانک‌های 10MB
+    chunks = []
+    offset = 0
+    chunk_idx = 0
+    while offset < content_length:
+        end = min(offset + MULTI_SEGMENT_CHUNK_SIZE - 1, content_length - 1)
+        chunks.append((chunk_idx, offset, end))
+        offset = end + 1
+        chunk_idx += 1
+
+    total_chunks = len(chunks)
+    logger.info("Multi-segment work-queue: %d chunks, %d workers, size=%d", total_chunks, num_workers, content_length)
+
+    # 3. ساخت فایل پیش‌فرض
+    try:
+        async with aiofiles.open(filepath, "wb") as f:
+            await f.truncate(content_length)
+    except Exception as e:
+        logger.warning("File pre-allocate error: %s", e)
+
+    chunk_queue = asyncio.Queue()
+    for c in chunks:
+        await chunk_queue.put(c)
+
+    downloaded_bytes = [0] * total_chunks
+    completed_chunks = [0]
+    failed_chunks = []
+    start_time = time.time()
+    last_update = [0.0]
+    progress_lock = asyncio.Lock()
+    file_write_lock = asyncio.Lock()
+
+    async def _update_progress(force=False):
+        now = time.time()
+        if not force and now - last_update[0] < PROGRESS_INTERVAL:
+            return
+        last_update[0] = now
+        total_dl = sum(downloaded_bytes)
+        elapsed = now - start_time
+        speed = total_dl / elapsed if elapsed > 0 else 0
+        dl_mb = total_dl / 1024 / 1024
+        total_mb_local = content_length / 1024 / 1024
+        pct = (total_dl / content_length * 100) if content_length > 0 else 0
+        filled = int(pct / 5)
+        bar = "█" * filled + "░" * (20 - filled)
+        speed_mb = min(speed / 1024 / 1024, 999)
+        eta_secs = int((content_length - total_dl) / speed) if speed > 0 else 0
+        eta_m, eta_s = divmod(eta_secs, 60)
+        if progress_cb:
+            try:
+                await progress_cb(
+                    f"📥 **Downloading...**\n`[{bar}]`\n"
+                    f"💾 {dl_mb:.1f}/{total_mb_local:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
+                    f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}\n"
+                    f"📦 {completed_chunks[0]}/{total_chunks} chunks • 🔥 {num_workers}x speed"
+                )
+            except Exception:
+                pass
+
+    shared_file = await aiofiles.open(filepath, "r+b")
+
+    async def _worker(worker_id):
+        while True:
+            if active_downloads.get(dl_id, {}).get("cancelled"):
+                return False
+            try:
+                chunk_info = chunk_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return True
+
+            c_idx, byte_start, byte_end = chunk_info
+            chunk_size = byte_end - byte_start + 1
+
+            for attempt in range(MAX_RETRIES):
+                if active_downloads.get(dl_id, {}).get("cancelled"):
+                    return False
+                try:
+                    resp = await s.get(
+                        target_url,
+                        impersonate="chrome",
+                        headers={**cdn_headers, "Range": f"bytes={byte_start}-{byte_end}"},
+                        allow_redirects=True,
+                        timeout=(30, 86400), # 30s connect timeout, 24h read timeout!
+                    )
+                    if resp.status_code not in (200, 206):
+                        raise Exception(f"HTTP {resp.status_code}")
+                    chunk_data = resp.content if hasattr(resp, "content") else resp.body
+                    if len(chunk_data) != chunk_size:
+                        raise Exception(f"Size mismatch: expected {chunk_size}, got {len(chunk_data)}")
+
+                    async with file_write_lock:
+                        await shared_file.seek(byte_start)
+                        await shared_file.write(bytes(chunk_data))
+
+                    downloaded_bytes[c_idx] = chunk_size
+                    async with progress_lock:
+                        completed_chunks[0] += 1
+                        await _update_progress()
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("Worker %d chunk %d attempt %d failed: %s", worker_id, c_idx, attempt + 1, e)
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                    else:
+                        failed_chunks.append((c_idx, str(e)[:100]))
+                        return False
+            chunk_queue.task_done()
+
+    try:
+        results = await asyncio.gather(*[_worker(i) for i in range(num_workers)], return_exceptions=True)
+        try: await shared_file.close()
+        except: pass
+
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            _cleanup_file(filepath)
+            return False, "Cancelled by user", 0
+
+        real_failures = [r for r in results if r is not True]
+        if real_failures or failed_chunks:
+            logger.warning("Multi-segment failed: %d worker failures, %d chunk failures", len(real_failures), len(failed_chunks))
+            _cleanup_file(filepath)
+            return False, f"Multi-segment failed ({len(failed_chunks)} chunks)", 0
+
+        file_size = os.path.getsize(filepath)
+        if file_size < MIN_VALID_VIDEO_SIZE:
+            _cleanup_file(filepath)
+            return False, f"File too small ({file_size} bytes)", 0
+
+        logger.info("Multi-segment DONE (32x) | size=%s", _format_size(file_size))
+        return True, "", file_size
+
+    except Exception as e:
+        logger.error("Multi-segment execution error: %s", e, exc_info=True)
+        try: await shared_file.close()
+        except: pass
+        _cleanup_file(filepath)
+        return False, str(e)[:200], 0
+
+
 async def _stream_download_response(s, page_url, target_url, filepath, progress_cb, dl_id=""):
-    """دانلود تکه‌ای (Stream) ویدیو با aiter_content تا از تایم‌اوت و مصرف زیاد RAM جلوگیری شود."""
+    """دانلود تکه‌ای (Stream) ویدیو بدون تایم‌اوت بدنه (حتی اگر چند ساعت طول بکشد)."""
     video_resp = await s.get(target_url, impersonate="chrome", headers={
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": page_url,
-    }, allow_redirects=True, timeout=30, stream=True)
+    }, allow_redirects=True, timeout=(30, 86400), stream=True)
 
     if video_resp.status_code != 200:
         return False, f"HTTP {video_resp.status_code}", 0
@@ -295,7 +486,7 @@ async def _stream_download_response(s, page_url, target_url, filepath, progress_
 
 async def _fetch_and_download(page_url, filepath, quality_key, progress_cb, dl_id=""):
     """
-    Fetch صفحه، استخراج URL ویدیو، و دانلود استریم با همان session.
+    Fetch صفحه، استخراج URL ویدیو، و دانلود با ۳۲ Worker موازی یا استریم بدون تایم‌اوت.
     """
     if progress_cb:
         await progress_cb("🔄 **دریافت اطلاعات صفحه...**")
@@ -331,20 +522,28 @@ async def _fetch_and_download(page_url, filepath, quality_key, progress_cb, dl_i
                 else:
                     ordered_urls.append(q["url"])
 
-            # 3. تست و دانلود تک‌تک URLها به روش Streaming
+            # 3. ابتدا دانلود موازی 32 تایی (Multi-Segment)، و در صورت عدم پشتیبانی استریم پیوسته
             last_err = ""
             for target_url in ordered_urls:
-                logger.info("Trying stream URL: %s", target_url[:100])
+                logger.info("Trying multi-segment (32x) URL: %s", target_url[:100])
                 if progress_cb:
-                    await progress_cb("📥 **Downloading...**")
+                    await progress_cb("🚀 **در حال راه‌اندازی دانلود ۳۲ اتصاله...**")
 
+                # اولویت 1: دانلود موازی 32 تایی
+                success, err, size = await _download_multi_segment(s, page_url, target_url, filepath, progress_cb, dl_id=dl_id)
+                if success:
+                    return True, "", size
+
+                logger.warning("Multi-segment failed/not supported for URL %s (%s), falling back to single stream...", target_url[:100], err)
+
+                # اولویت 2: استریم پیوسته تک اتصاله بدون تایم‌اوت
                 success, err, size = await _stream_download_response(s, page_url, target_url, filepath, progress_cb, dl_id=dl_id)
                 if success:
                     return True, "", size
                 logger.warning("Stream failed for URL %s: %s", target_url[:100], err)
                 last_err = err
 
-            return False, last_err or "All stream URLs failed", 0
+            return False, last_err or "All download methods failed", 0
 
     except asyncio.CancelledError:
         _cleanup_file(filepath)
