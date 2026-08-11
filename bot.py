@@ -475,6 +475,15 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 API_ID = int(os.environ.get("API_ID", os.environ.get("TELEGRAM_API_ID", 2040)))
 API_HASH = os.environ.get("API_HASH", os.environ.get("TELEGRAM_API_HASH", "b18441a1ff607e10a989891a5462e627"))
 
+def _parse_authorized_mainadmin() -> int:
+    raw = os.environ.get("AUTHORIZED_MAINADMIN", os.environ.get("ADMIN_ID", "818185073")).strip()
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+    return 818185073
+
+ADMIN_ID = _parse_authorized_mainadmin()
+AUTHORIZED_MAINADMIN = ADMIN_ID
+
 def _parse_authorized_users() -> set:
     raw = os.environ.get("AUTHORIZED_USERS", "")
     users = set()
@@ -485,10 +494,11 @@ def _parse_authorized_users() -> set:
                 users.add(int(item))
     if not users:
         users = {818185073, 6936101187, 7972834913, 8228738080}
+    # Always ensure main admin is in authorized users set
+    users.add(ADMIN_ID)
     return users
 
 AUTHORIZED_USERS = _parse_authorized_users()
-ADMIN_ID = int(os.environ.get("ADMIN_ID", next(iter(AUTHORIZED_USERS), 818185073)))
 
 MAX_FILE_SIZE_MB = 50000  # allow up to ~50GB (bot will split into 2GB parts)
 MAX_PART_SIZE = 1900 * 1024 * 1024  # 1.9GB per part for Telegram upload
@@ -522,6 +532,8 @@ video_send_timers: Dict[str, asyncio.Task] = {}
 
 # اشتراک‌گذاری ویدیو با لینک از طریق آرکایو کانال تلگرام
 ARCHIVE_CHANNEL_ID: int = int(os.getenv("ARCHIVE_CHANNEL_ID", "0"))
+MAX_FILE_SIZE_GB: int = int(os.getenv("MAX_FILE_SIZE_GB", "2"))
+CLEANUP_DELAY_SECONDS: int = int(os.getenv("CLEANUP_DELAY_SECONDS", "20"))
 # GitHub sponsor persistence
 SPONSOR_REPO: str = os.getenv("SPONSOR_REPO", "astwdnya/data")
 SPONSOR_BRANCH: str = os.getenv("SPONSOR_BRANCH", "main")
