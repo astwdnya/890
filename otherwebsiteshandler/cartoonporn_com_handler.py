@@ -159,9 +159,7 @@ def _format_progress(
         )
         eta_m, eta_s = divmod(eta_secs, 60)
         return (
-            f"📥 **Downloading...**
-(هندلر)
-`[{bar}]`\n"
+            f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
             f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
             f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}"
         )
@@ -624,9 +622,7 @@ async def _download_multi_segment(
             eta_m, eta_s = divmod(eta_secs, 60)
             try:
                 await progress_cb(
-                    f"📥 **Downloading...**
-(هندلر)
-`[{bar}]`\n"
+                    f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
                     f"💾 {dl_mb:.1f}/{total_mb_local:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
                     f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}\n"
                     f"📦 {completed_chunks[0]}/{total_chunks} chunks • 🔥 {num_workers}x"

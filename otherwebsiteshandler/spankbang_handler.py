@@ -367,9 +367,7 @@ async def _download_multi_segment(s, page_url, target_url, filepath, progress_cb
         if progress_cb:
             try:
                 await progress_cb(
-                    f"📥 **Downloading...**
-(هندلر)
-`[{bar}]`\n"
+                    f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
                     f"💾 {dl_mb:.1f}/{total_mb_local:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
                     f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}\n"
                     f"📦 {completed_chunks[0]}/{total_chunks} chunks • 🔥 {num_workers}x speed"
@@ -497,9 +495,7 @@ async def _stream_download_response(s, page_url, target_url, filepath, progress_
                     msg = (
                         f"📥 **Downloading...**\n"
                         f"💾 {downloaded/1024/1024:.1f}/{content_length/1024/1024:.1f} MB  •  ⚡ {downloaded/(now-start_time)/1024/1024:.1f} MB/s"
-                    ) if content_length > 0 else f"📥 **Downloading...**
-(هندلر)
-💾 {downloaded/1024/1024:.1f} MB"
+                    ) if content_length > 0 else f"📥 **Downloading...**\n(هندلر)\n💾 {downloaded/1024/1024:.1f} MB"
                     try:
                         await progress_cb(msg)
                     except Exception:
@@ -570,9 +566,7 @@ async def _download_with_ffmpeg(video_url, filepath, progress_cb, dl_id="", refe
                         speed_mb = min(speed / 1024 / 1024, 999)
                         if progress_cb:
                             try:
-                                await progress_cb(f"📥 **Downloading...**
-(هندلر)
-💾 {dl_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s")
+                                await progress_cb(f"📥 **Downloading...**\n(هندلر)\n💾 {dl_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s")
                             except:
                                 pass
             except asyncio.CancelledError:

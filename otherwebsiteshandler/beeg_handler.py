@@ -229,9 +229,7 @@ async def _download_with_ffmpeg(video_url, filepath, progress_cb, dl_id="", refe
                         dl_mb = current_size / 1024 / 1024
                         speed_mb = min(speed / 1024 / 1024, 999)
                         try:
-                            await progress_cb(f"📥 **Downloading...**
-(هندلر)
-💾 {dl_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s")
+                            await progress_cb(f"📥 **Downloading...**\n(هندلر)\n💾 {dl_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s")
                         except:
                             pass
             except asyncio.CancelledError:

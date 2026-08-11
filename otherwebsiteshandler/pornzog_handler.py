@@ -199,9 +199,7 @@ def _format_progress(
         filled = int(pct / 5)
         bar = "█" * filled + "░" * (20 - filled)
         return (
-            f"📥 **Downloading...**
-(هندلر)
-`[{bar}]`\n"
+            f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
             f"💾 {dl_mb:.1f}/{total_mb:.1f} MB"
             f"  •  ⚡ {speed / 1024 / 1024:.1f} MB/s\n📊 {pct:.1f}%"
         )

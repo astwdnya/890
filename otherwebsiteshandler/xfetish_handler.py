@@ -84,15 +84,11 @@ def _format_progress(downloaded: int, content_length: int, start_time: float, no
         eta_secs = int((content_length - downloaded) / speed) if speed > 0 else 0
         eta_m, eta_s = divmod(eta_secs, 60)
         return (
-            f"📥 **Downloading...**
-(هندلر)
-`[{bar}]`\n"
+            f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
             f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
             f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}"
         )
-    return f"📥 **Downloading...**
-(هندلر)
-💾 {dl_mb:.1f} MB  •  ⚡ {speed / 1024 / 1024:.1f} MB/s"
+    return f"📥 **Downloading...**\n(هندلر)\n💾 {dl_mb:.1f} MB  •  ⚡ {speed / 1024 / 1024:.1f} MB/s"
 
 
 def _is_main_video_url(url: str) -> bool:
@@ -349,9 +345,7 @@ async def _download_multi_segment(s, page_url, target_url, filepath, progress_cb
         if progress_cb:
             try:
                 await progress_cb(
-                    f"📥 **Downloading...**
-(هندلر)
-`[{bar}]`\n"
+                    f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
                     f"💾 {dl_mb:.1f}/{total_mb_local:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
                     f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}\n"
                     f"📦 {completed_chunks[0]}/{total_chunks} chunks • 🔥 {num_workers}x speed"

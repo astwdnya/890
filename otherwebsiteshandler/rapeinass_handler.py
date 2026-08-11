@@ -235,15 +235,11 @@ def _format_progress(downloaded: int, content_length: int, start_time: float, no
         eta_secs = int((content_length - downloaded) / speed) if speed > 0 else 0
         eta_m, eta_s = divmod(eta_secs, 60)
         return (
-            f"📥 **Downloading...**
-(هندلر)
-`[{bar}]`\n"
+            f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
             f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
             f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}"
         )
-    return f"📥 **Downloading...**
-(هندلر)
-💾 {dl_mb:.1f} MB  •  ⚡ {speed / 1024 / 1024:.1f} MB/s"
+    return f"📥 **Downloading...**\n(هندلر)\n💾 {dl_mb:.1f} MB  •  ⚡ {speed / 1024 / 1024:.1f} MB/s"
 
 
 def _check_curl_cffi() -> bool:
@@ -712,9 +708,7 @@ async def _download_multi_segment(
 
         total_mb = content_length / 1024 / 1024
         await progress_cb(
-            f"📥 **Downloading...**
-(هندلر)
-💾 Size: {total_mb:.1f} MB\n🔥 {num_workers} parallel workers"
+            f"📥 **Downloading...**\n(هندلر)\n💾 Size: {total_mb:.1f} MB\n🔥 {num_workers} parallel workers"
         )
 
         chunks: List[Tuple[int, int, int]] = []
@@ -769,9 +763,7 @@ async def _download_multi_segment(
             eta_m, eta_s = divmod(eta_secs, 60)
             try:
                 await progress_cb(
-                    f"📥 **Downloading...**
-(هندلر)
-`[{bar}]`\n"
+                    f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
                     f"💾 {dl_mb:.1f}/{total_mb_local:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
                     f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}\n"
                     f"📦 {completed_chunks[0]}/{total_chunks} chunks • 🔥 {num_workers}x"
@@ -1259,9 +1251,7 @@ def _parse_ytdlp_progress(text: str) -> Optional[str]:
     except (ValueError, TypeError):
         bar = "░" * 20
     return (
-        f"📥 **Downloading...**
-(هندلر)
-`[{bar}]`\n"
+        f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
         f"💾 {total}  •  ⚡ {speed}\n📊 {pct}%  •  ⏱ ETA: {eta}"
     )
 

@@ -109,15 +109,11 @@ def _format_progress(downloaded, content_length, start_time, now):
         eta_secs = int((content_length - downloaded) / speed) if speed > 0 else 0
         eta_m, eta_s = divmod(eta_secs, 60)
         return (
-            f"📥 **Downloading...**
-(هندلر)
-`[{bar}]`\n"
+            f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
             f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
             f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}"
         )
-    return f"📥 **Downloading...**
-(هندلر)
-💾 {dl_mb:.1f} MB  •  ⚡ {speed / 1024 / 1024:.1f} MB/s"
+    return f"📥 **Downloading...**\n(هندلر)\n💾 {dl_mb:.1f} MB  •  ⚡ {speed / 1024 / 1024:.1f} MB/s"
 
 
 # ─── Fetch Page ───────────────────────────────────────────────────────────
@@ -429,9 +425,7 @@ async def download_erome_video(video_url, filepath, progress_cb=None, dl_id="", 
         return await _download_single(video_url, filepath, headers, progress_cb, dl_id)
 
     total_mb = content_length / 1024 / 1024
-    await progress_cb(f"📥 **Downloading...**
-(هندلر)
-💾 Size: {total_mb:.1f} MB\n🔥 {MULTI_SEGMENT_WORKERS} workers")
+    await progress_cb(f"📥 **Downloading...**\n(هندلر)\n💾 Size: {total_mb:.1f} MB\n🔥 {MULTI_SEGMENT_WORKERS} workers")
 
     CHUNK_SIZE_BYTES = MULTI_SEGMENT_CHUNK_SIZE
     chunks = []
@@ -480,9 +474,7 @@ async def download_erome_video(video_url, filepath, progress_cb=None, dl_id="", 
         eta_m, eta_s = divmod(eta_secs, 60)
         try:
             await progress_cb(
-                f"📥 **Downloading...**
-(هندلر)
-`[{bar}]`\n"
+                f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
                 f"💾 {dl_mb:.1f}/{total_mb_local:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
                 f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}\n"
                 f"📦 {completed_chunks[0]}/{total_chunks} chunks • 🔥 {MULTI_SEGMENT_WORKERS}x"
