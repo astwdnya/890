@@ -1248,13 +1248,13 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
                 eta_secs = int((total - downloaded) / speed) if speed > 0 else 0
                 eta_m, eta_s = divmod(eta_secs, 60)
                 return (
-                    f"📥 **Downloading...**\n`[{bar}]`\n"
+                    f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
                     f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
                     f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}"
                     f"{seg_info}"
                 )
             return (
-                f"📥 **Downloading...**\n💾 {dl_mb:.1f} MB  •  ⚡ {speed / 1024 / 1024:.1f} MB/s"
+                f"📥 **Downloading...**\n(هندلر)\n💾 {dl_mb:.1f} MB  •  ⚡ {speed / 1024 / 1024:.1f} MB/s"
                 f"{seg_info}"
             )
 
@@ -1344,7 +1344,7 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
                 try:
                     await safe_edit(
                         status_msg,
-                        f"📥 **Downloading...**\n`[{bar}]`\n"
+                        f"📥 **Downloading...**\n(هندلر)\n`[{bar}]`\n"
                         f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
                         f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}\n"
                         f"📦 {completed_chunks[0]}/{total_chunks} chunks • 🔥 {NUM_WORKERS}x",
@@ -1596,7 +1596,9 @@ async def _download_single_curl_cffi(
                         try:
                             await safe_edit(
                                 status_msg,
-                                f"📥 **Downloading...**\n`[{bar}]`\n"
+                                f"📥 **Downloading...**
+(هندلر)
+`[{bar}]`\n"
                                 f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
                                 f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}",
                                 buttons=dl_buttons_cancel,
@@ -1609,7 +1611,9 @@ async def _download_single_curl_cffi(
                         try:
                             await safe_edit(
                                 status_msg,
-                                f"📥 **Downloading...**\n💾 {dl_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s",
+                                f"📥 **Downloading...**
+(هندلر)
+💾 {dl_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s",
                                 buttons=dl_buttons_cancel,
                             )
                         except Exception:

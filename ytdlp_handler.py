@@ -209,6 +209,10 @@ async def download_with_ytdlp(
             "--quiet",
             "--progress",
             "--newline",
+            "-N",
+            "32",
+            "--concurrent-fragments",
+            "32",
             "-f",
             format_spec,
             "--add-header",
@@ -234,7 +238,7 @@ async def download_with_ytdlp(
             now = time.time()
             if now - last_update >= 2.0 and text:
                 last_update = now
-                await progress_cb(f"📥 **Downloading...**\n`{text[:80]}`")
+                await progress_cb(f"📥 **Downloading (via yt-dlp ⚡ 32x)...**\n`{text[:80]}`")
 
         # collect remaining stderr
         remaining_stderr = await process.stderr.read()
