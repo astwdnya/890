@@ -56,10 +56,15 @@ from xnxx_handler import (
     download_xnxx_m3u8,
     xnxx_sessions,
 )
-from searcher.xnxx_search import search_xnxx, parse_inline_query
-from searcher.pornhub_search import search_pornhub
-from searcher.xvideos_search import search_xvideos
+from searcher.xnxx_search import search_xnxx, search_xnxx_multi_page, parse_inline_query
+from searcher.pornhub_search import search_pornhub, search_pornhub_multi_page
+from searcher.xvideos_search import search_xvideos, search_xvideos_multi_page
 from searcher.eporner_search import search_eporner
+from searcher.whoreshub_search import (
+    search_whoreshub,
+    search_whoreshub_multi_page,
+    parse_inline_query as parse_wh_inline_query,
+)
 import sys as _sys
 import os as _os
 _searcher_imdb_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "searcher", "imdb")
@@ -12305,7 +12310,7 @@ luxuretv_sessions: Dict[str, dict] = {}
 
 
 INLINE_CACHE_TIME = 60
-INLINE_RESULTS_LIMIT = 20
+INLINE_RESULTS_LIMIT = 50
 INLINE_PICK_TTL = 30 * 60  # توکن‌های دکمه شروع دانلود ۳۰ دقیقه معتبرند
 inline_pick_urls: dict = {}
 
@@ -12329,7 +12334,7 @@ async def setsearch_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
     current = get_user_default_search(event.sender_id)
-    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX", "imd": "IMDB"}
+    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX", "imd": "IMDB", "wh": "WhoresHub"}
     buttons = [
         [Button.inline(f"{'✅ ' if current == k else ''}{v}", f"setsearch_{k}") for k, v in labels.items()]
     ]
@@ -12348,10 +12353,10 @@ async def setsearch_callback(event):
     if not data.startswith("setsearch_"):
         return
     src = data.replace("setsearch_", "")
-    if src not in ("ph", "xv", "ep", "xn", "imd"):
+    if src not in ("ph", "xv", "ep", "xn", "imd", "wh"):
         return
     set_user_default_search(user_id, src)
-    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX", "imd": "IMDB"}
+    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX", "imd": "IMDB", "wh": "WhoresHub"}
     buttons = [
         [Button.inline(f"{'✅ ' if src == k else ''}{v}", f"setsearch_{k}") for k, v in labels.items()]
     ]
@@ -12926,12 +12931,13 @@ async def xnxx_inline_handler(event):
             )
             return
 
-        # تشخیص منبع: ph:xxx → PornHub, xv:xxx → XVideos, ep:xxx → Eporner, xn:xxx → XNXX, imd:xxx → IMDB
+        # تشخیص منبع: ph:xxx → PornHub, xv:xxx → XVideos, ep:xxx → Eporner, xn:xxx → XNXX, imd:xxx → IMDB, wh:xxx → WhoresHub
         is_ph = raw.lower().startswith("ph:")
         is_xv = raw.lower().startswith("xv:")
         is_ep = raw.lower().startswith("ep:")
         is_xn = raw.lower().startswith("xn:")
         is_imd = raw.lower().startswith("imd:")
+        is_wh = raw.lower().startswith("wh:")
         if is_ph:
             inner = raw[3:].strip()
             parsed = parse_inline_query(inner)
@@ -12945,6 +12951,9 @@ async def xnxx_inline_handler(event):
         elif is_xn:
             inner = raw[3:].strip()
             parsed = parse_inline_query(inner)
+        elif is_wh:
+            inner = raw[3:].strip()
+            parsed = parse_wh_inline_query(inner)
         elif is_imd:
             inner = raw[4:].strip()
         else:
@@ -12968,6 +12977,10 @@ async def xnxx_inline_handler(event):
             elif default_src == "imd":
                 is_imd = True
                 inner = raw
+            elif default_src == "wh":
+                is_wh = True
+                inner = raw
+                parsed = parse_wh_inline_query(inner)
             else:  # "xn"
                 is_xn = True
                 inner = raw
@@ -12982,29 +12995,52 @@ async def xnxx_inline_handler(event):
             page = parsed["page"]
             sort = parsed["sort"]
 
-        source = "IMDB" if is_imd else ("EP" if is_ep else ("XV" if is_xv else ("PH" if is_ph else "XNXX")))
+        source = "IMDB" if is_imd else ("EP" if is_ep else ("WH" if is_wh else ("XV" if is_xv else ("PH" if is_ph else "XNXX"))))
         logger.info(f"[INLINE] {source}: q='{query}' page={page} sort={sort}")
 
         if is_imd:
             results = await search_imdb(query, limit=INLINE_RESULTS_LIMIT)
         elif is_ph:
-            ph_page = max(1, page) if page > 0 else 1
-            results = await search_pornhub(
-                query, page=ph_page, limit=INLINE_RESULTS_LIMIT, sort=ph_sort
-            )
+            if page == 0:
+                results = await search_pornhub_multi_page(
+                    query, pages=3, limit=INLINE_RESULTS_LIMIT, sort=ph_sort
+                )
+            else:
+                results = await search_pornhub(
+                    query, page=page, limit=INLINE_RESULTS_LIMIT, sort=ph_sort
+                )
         elif is_xv:
-            results = await search_xvideos(
-                query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
-            )
+            if page == 0:
+                results = await search_xvideos_multi_page(
+                    query, pages=3, limit=INLINE_RESULTS_LIMIT, sort=sort
+                )
+            else:
+                results = await search_xvideos(
+                    query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
+                )
         elif is_ep:
             results = await search_eporner(
                 query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
             )
+        elif is_wh:
+            if page == 0:
+                results = await search_whoreshub_multi_page(
+                    query, pages=3, limit=INLINE_RESULTS_LIMIT, sort=sort
+                )
+            else:
+                results = await search_whoreshub(
+                    query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
+                )
         else:  # XNXX
-            xnxx_page = max(0, page - 1)
-            results = await search_xnxx(
-                query, page=xnxx_page, limit=INLINE_RESULTS_LIMIT, sort=sort
-            )
+            if page == 0:
+                results = await search_xnxx_multi_page(
+                    query, pages=3, limit=INLINE_RESULTS_LIMIT
+                )
+            else:
+                xnxx_page = max(0, page - 1)
+                results = await search_xnxx(
+                    query, page=xnxx_page, limit=INLINE_RESULTS_LIMIT, sort=sort
+                )
 
         if not results:
             await event.answer(
@@ -13110,6 +13146,10 @@ async def xnxx_inline_handler(event):
                 quality = video.get("quality", "")
                 hd_tag = f" | 🏆 {video.get('rating', '')}" if video.get("rating") else ""
                 source_tag = "EP"
+            elif is_wh:
+                quality = video.get("quality", "")
+                hd_tag = ""
+                source_tag = "WH"
             else:
                 quality = video.get("quality", "")
                 hd_tag = ""
