@@ -117,47 +117,32 @@ async def get_qualities(
     """
     گرفتن لیست کیفیت‌های موجود برای یه فیلم/قسمت.
 
+    NOTE: این تابع اکنون از imdbplay_downloader (سرورهای imdbplay.tech) استفاده می‌کند.
+    روش قدیمی vidsrcme که WASM و stream_urls encrypted داشت حذف شده.
+
     Returns:
         list of dicts:
-        - label: "1080p", "720p", ...
-        - bandwidth, resolution, height, url, is_auto
+        - label: "Auto", "1080p", "720p", ...
+        - bandwidth, resolution, height, url, is_auto, server
     """
-    info = await get_stream_info(imdb_id, season, episode)
-    if not info or not info.stream_urls:
-        logger.warning("get_qualities: no stream info")
+    try:
+        from imdbplay_downloader import get_qualities as _new_get_qualities
+        result = await _new_get_qualities(imdb_id, season, episode)
+        # normalize: اگه فیلد height نبود، از resolution استخراج کن
+        for q in result:
+            if "height" not in q:
+                res = q.get("resolution", "")
+                h = 0
+                if res and "x" in res:
+                    try:
+                        h = int(res.split("x")[1])
+                    except ValueError:
+                        pass
+                q["height"] = h
+        return result
+    except Exception as e:
+        logger.error("get_qualities via imdbplay failed: %s", e)
         return []
-
-    async with AsyncSession() as s:
-        for master_url in info.stream_urls:
-            try:
-                token = await _fetch_token(s, master_url)
-                if not token:
-                    continue
-                master_with_token = _apply_token(master_url, token)
-                r = await s.get(master_with_token, impersonate="chrome",
-                                headers=_SEG_HEADERS, timeout=20)
-                if r.status_code != 200:
-                    continue
-                variants = _parse_master_m3u8(r.text)
-                if not variants:
-                    continue
-                # تبدیل به Quality و حذف تکراری‌ها بر اساس label
-                qualities = [_variant_to_quality(v) for v in variants]
-                seen_labels = set()
-                unique = []
-                for q in sorted(qualities, key=lambda x: x.height, reverse=True):
-                    if q.label in seen_labels:
-                        continue
-                    seen_labels.add(q.label)
-                    unique.append(q)
-
-                # اضافه کردن Auto
-                auto = Quality(label="Auto", bandwidth=0, resolution="", height=0, url="", is_auto=True)
-                return [auto.to_dict()] + [q.to_dict() for q in unique]
-            except Exception as e:
-                logger.warning("get_qualities: stream failed: %s", e)
-                continue
-    return []
 
 
 # ─── Download with specific quality ─────────────────────────
@@ -174,139 +159,48 @@ async def download_with_quality(
     """
     دانلود ویدیو با کیفیت مشخص.
 
+    NOTE: این تابع اکنون از imdbplay_downloader (سرورهای imdbplay.tech) استفاده می‌کند.
+    روش قدیمی vidsrcme که WASM و stream_urls encrypted داشت حذف شده.
+
     quality_label="Auto" → بهترین کیفیت
     quality_label="720p" → کیفیت 720p (اگه نباشه، نزدیک‌ترین)
     """
-    info = await get_stream_info(imdb_id, season, episode)
-    if not info or not info.stream_urls:
+    try:
+        from imdbplay_downloader import download_with_quality as _new_download
+        return await _new_download(
+            imdb_id, quality_label, out_dir, season, episode, progress_cb=progress_cb
+        )
+    except Exception as e:
+        logger.error("download_with_quality via imdbplay failed: %s", e)
+        raise
+
+
+# ─── Persian subtitle fetching (new, from imdbplay servers) ────
+
+
+async def get_persian_subtitle(
+    imdb_id: str,
+    season: Optional[int] = None,
+    episode: Optional[int] = None,
+    out_dir: Optional[str] = None,
+) -> Optional[str]:
+    """
+    گرفتن زیرنویس فارسی از سرورهای imdbplay.
+
+    ترتیب جستجو:
+      1. Vidzee (core.vidzee.wtf/subs)
+      2. 2Embed (sub.vdrk.site)
+      3. Videasy (subs.videasy.to)
+
+    Returns:
+        مسیر فایل زیرنویس VTT، یا None.
+    """
+    try:
+        from imdbplay_downloader import get_persian_subtitle as _new_get_sub
+        return await _new_get_sub(imdb_id, season=season, episode=episode, out_dir=out_dir)
+    except Exception as e:
+        logger.error("get_persian_subtitle via imdbplay failed: %s", e)
         return None
-
-    os.makedirs(out_dir, exist_ok=True)
-    if info.is_series:
-        out_name = f"{info.title} S{season:02d}E{episode:02d}.mp4".replace("/", "_")
-    else:
-        out_name = f"{info.title}.mp4".replace("/", "_")
-    out_path = os.path.join(out_dir, out_name)
-
-    with tempfile.TemporaryDirectory(prefix="vidsrc_") as tmp:
-        async with AsyncSession() as s:
-            last_err = None
-            for master_url in info.stream_urls:
-                try:
-                    token = await _fetch_token(s, master_url)
-                    if not token:
-                        continue
-                    master_with_token = _apply_token(master_url, token)
-                    r = await s.get(master_with_token, impersonate="chrome",
-                                    headers=_SEG_HEADERS, timeout=20)
-                    if r.status_code != 200:
-                        continue
-                    variants = _parse_master_m3u8(r.text)
-                    if not variants:
-                        continue
-
-                    # انتخاب variant بر اساس quality_label
-                    qualities = [_variant_to_quality(v) for v in variants]
-                    sorted_qs = sorted(qualities, key=lambda x: x.height, reverse=True)
-
-                    chosen = None
-                    if quality_label == "Auto" or quality_label == "best":
-                        chosen = sorted_qs[0]
-                    elif quality_label == "worst":
-                        chosen = sorted_qs[-1]
-                    else:
-                        # پیدا کردن variant با label مساوی
-                        for q in sorted_qs:
-                            if q.label == quality_label:
-                                chosen = q
-                                break
-                        if not chosen:
-                            # نزدیک‌ترین
-                            target_h = int(re.search(r'\d+', quality_label).group(0)) if re.search(r'\d+', quality_label) else 720
-                            chosen = min(sorted_qs, key=lambda q: abs(q.height - target_h) if q.height else 9999)
-
-                    logger.info("chosen quality: %s (%s) bw=%d", chosen.label, chosen.resolution, chosen.bandwidth)
-
-                    # URL absolute
-                    p = urlparse(master_with_token)
-                    base = f"{p.scheme}://{p.netloc}"
-                    if chosen.url.startswith("/"):
-                        var_url = base + chosen.url
-                    elif chosen.url.startswith("http"):
-                        var_url = chosen.url
-                    else:
-                        var_url = urljoin(master_with_token, chosen.url)
-                    if "token=" not in var_url:
-                        var_url = _apply_token(var_url, token)
-
-                    # fetch variant m3u8
-                    r = await s.get(var_url, impersonate="chrome", headers=_SEG_HEADERS, timeout=20)
-                    if r.status_code != 200:
-                        continue
-                    segments = _parse_variant_m3u8(r.text)
-                    if not segments:
-                        continue
-
-                    var_base = var_url.rsplit("/", 1)[0] + "/"
-                    seg_urls = []
-                    total_dur = 0.0
-                    for seg_rel, dur in segments:
-                        if seg_rel.startswith("/"):
-                            su = base + seg_rel
-                        elif seg_rel.startswith("http"):
-                            su = seg_rel
-                        else:
-                            su = var_base + seg_rel
-                        if "token=" not in su:
-                            su = _apply_token(su, token)
-                        seg_urls.append(su)
-                        total_dur += dur
-
-                    logger.info("downloading %d segments (%.1f sec)", len(seg_urls), total_dur)
-
-                    # download with concurrency
-                    sem = asyncio.Semaphore(8)
-                    seg_paths = [None] * len(seg_urls)
-
-                    async def download_one(idx: int, url: str):
-                        async with sem:
-                            for attempt in range(3):
-                                try:
-                                    rr = await s.get(url, impersonate="chrome",
-                                                     headers=_SEG_HEADERS, timeout=60)
-                                    if rr.status_code == 200 and rr.content:
-                                        path = os.path.join(tmp, f"seg_{idx:05d}.ts")
-                                        with open(path, "wb") as f:
-                                            f.write(rr.content)
-                                        seg_paths[idx] = path
-                                        if progress_cb:
-                                            progress_cb(idx + 1, len(seg_urls))
-                                        return
-                                except Exception as e:
-                                    logger.warning("seg %d attempt %d: %s", idx, attempt + 1, e)
-                                await asyncio.sleep(0.5 * (attempt + 1))
-
-                    await asyncio.gather(*[download_one(i, u) for i, u in enumerate(seg_urls)])
-                    seg_paths = [p for p in seg_paths if p]
-
-                    if not seg_paths:
-                        continue
-
-                    if _concat_segments(seg_paths, out_path):
-                        logger.info("✅ saved: %s", out_path)
-                        return out_path
-
-                except Exception as e:
-                    last_err = e
-                    logger.warning("stream failed: %s", e)
-                    await asyncio.sleep(1)
-                    continue
-
-            logger.error("all streams failed: %s", last_err)
-            # به‌جای None، exception پرتاب کن تا caller بتونه خطا رو به کاربر نشون بده
-            if last_err:
-                raise RuntimeError(f"دانلود ناموفق بود ({len(info.stream_urls)} سرور امتحان شد). آخرین خطا: {last_err}")
-            return None
 
 
 # ─── Subtitle fetching ──────────────────────────────────────
@@ -530,24 +424,9 @@ def _srt_to_vtt(srt_text: str) -> str:
     return "\n".join(out)
 
 
-async def get_persian_subtitle(
-    imdb_id: str,
-    out_dir: str,
-    season: Optional[int] = None,
-    episode: Optional[int] = None,
-) -> Optional[str]:
-    """
-    میانبر: گرفتن اولین زیرنویس فارسی موجود و دانلودش.
-
-    Returns:
-        path فایل زیرنویس یا None
-    """
-    subs = await search_subtitles(imdb_id, "per", season, episode)
-    if not subs:
-        logger.info("no Persian subtitle found")
-        return None
-    # اولین رو بگیر (already sorted by downloads)
-    return await download_subtitle(subs[0], out_dir, prefer_format="vtt")
+# NOTE: تابع قدیمی get_persian_subtitle (که از OpenSubtitles استفاده می‌کرد) حذف شد.
+# تابع جدید در ابتدای همین فایل (از imdbplay_downloader) تعریف شده و از سرورهای
+# imdbplay.tech (Vidzee, 2Embed, Videasy) زیرنویس فارسی می‌گیره.
 
 
 # ─── Quick test ─────────────────────────────────────────────
