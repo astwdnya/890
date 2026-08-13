@@ -71,7 +71,7 @@ _searcher_imdb_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
 if _searcher_imdb_dir not in _sys.path:
     _sys.path.insert(0, _searcher_imdb_dir)
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
-from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality
+from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle
 from searcher.imdb.videotext_burn import burn_subtitles
 from ytdlp_handler import (
     is_ytdlp_site_url,
@@ -13003,6 +13003,43 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
             ul_id=f"imd_ul_{dl_id}",
         )
         active_downloads.pop(dl_id, None)
+
+        # Send Persian subtitle as a separate file after video
+        # Auto-fetches Persian subtitle from imdbplay servers (Vidzee, 2Embed, Videasy)
+        try:
+            await status_msg.edit("\U0001F4AC \u062F\u0631 \u062D\u0627\u0644 \u062C\u0633\u062A\u062C\u0648\u06CC \u0632\u06CC\u0631\u0646\u0648\u06CC\u0633 \u0641\u0627\u0631\u0633\u06CC...")
+            persian_sub_path = await get_persian_subtitle(
+                imdb_id,
+                season=season,
+                episode=episode,
+                out_dir=out_dir,
+            )
+            if persian_sub_path and os.path.exists(persian_sub_path):
+                sub_size_kb = os.path.getsize(persian_sub_path) / 1024
+                if season and episode:
+                    sub_caption = f"\U0001F4C4 \u0632\u06CC\u0631\u0646\u0648\u06CC\u0633 \u0641\u0627\u0631\u0633\u06CC | **{title}** - S{season:02d}E{episode:02d}\n\n\U0001F4C0 \u0627\u0632 \u0633\u0631\u0648\u0631\u0647\u0627\u06CC imdbplay"
+                else:
+                    sub_caption = f"\U0001F4C4 \u0632\u06CC\u0631\u0646\u0648\u06CC\u0633 \u0641\u0627\u0631\u0633\u06CC | **{title}**\n\n\U0001F4C0 \u0627\u0632 \u0633\u0631\u0648\u0631\u0647\u0627\u06CC imdbplay"
+                await event.respond(
+                    file=persian_sub_path,
+                    caption=sub_caption,
+                    parse_mode="md",
+                    force_document=True,
+                )
+                logger.info(f"[IMDB] Persian subtitle sent: {persian_sub_path} ({sub_size_kb:.1f} KB)")
+                try:
+                    os.unlink(persian_sub_path)
+                except Exception:
+                    pass
+            else:
+                logger.info(f"[IMDB] No Persian subtitle found for {imdb_id}")
+                try:
+                    await status_msg.edit("\u2705 \u0648\u06CC\u062F\u06CC\u0648 \u0627\u0631\u0633\u0627\u0644 \u0634\u062F\n\n\u26A0 \u0632\u06CC\u0631\u0646\u0648\u06CC\u0633 \u0641\u0627\u0631\u0633\u06CC \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F")
+                except Exception:
+                    pass
+        except Exception as sub_err:
+            logger.warning(f"[IMDB] Persian subtitle fetch/send failed: {sub_err}", exc_info=True)
+        # End Persian subtitle section
 
     except asyncio.CancelledError:
         active_downloads.pop(dl_id, None)
