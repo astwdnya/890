@@ -1029,32 +1029,43 @@ async def get_qualities(imdb_id: str, season: Optional[int] = None, episode: Opt
         return []
 
     # امتحان سرورها به ترتیب — اول سروری که کیفیت‌های متعدد داره پیدا کن
+    # با retry اگه همه fail شدن
     multi_quality_stream = None
     fallback_stream = None
 
-    for server in _SERVERS:
-        try:
-            logger.info("[IMDBPlay] get_qualities: Trying server %s...", server["name"])
-            stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
-            if not stream or not stream.get("url"):
+    for attempt in range(2):  # 2 تلاش کل
+        if attempt > 0:
+            logger.info("[IMDBPlay] get_qualities: retry attempt %d after delay...", attempt + 1)
+            await asyncio.sleep(2)
+
+        for server in _SERVERS:
+            try:
+                logger.info("[IMDBPlay] get_qualities: Trying server %s... (attempt %d)",
+                            server["name"], attempt + 1)
+                stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+                if not stream or not stream.get("url"):
+                    continue
+
+                # اگه fallback نداریم، این رو به‌عنوان fallback نگه دار
+                if not fallback_stream:
+                    fallback_stream = stream
+
+                # اگه این سرور کیفیت‌های متعدد داره، اون رو انتخاب کن
+                if stream.get("qualities") and len(stream["qualities"]) > 1:
+                    multi_quality_stream = stream
+                    logger.info("[IMDBPlay] ✓ Server %s has %d qualities",
+                                server["name"], len(stream["qualities"]))
+                    break
+                elif stream.get("qualities") and len(stream["qualities"]) == 1:
+                    logger.info("[IMDBPlay] Server %s has 1 quality: %s",
+                                server["name"], stream["qualities"][0].get("label", "?"))
+            except Exception as e:
+                logger.warning("[IMDBPlay] Server %s exception: %s", server["name"], e)
                 continue
 
-            # اگه fallback نداریم، این رو به‌عنوان fallback نگه دار
-            if not fallback_stream:
-                fallback_stream = stream
-
-            # اگه این سرور کیفیت‌های متعدد داره، اون رو انتخاب کن
-            if stream.get("qualities") and len(stream["qualities"]) > 1:
-                multi_quality_stream = stream
-                logger.info("[IMDBPlay] ✓ Server %s has %d qualities",
-                            server["name"], len(stream["qualities"]))
-                break
-            elif stream.get("qualities") and len(stream["qualities"]) == 1:
-                logger.info("[IMDBPlay] Server %s has 1 quality: %s",
-                            server["name"], stream["qualities"][0].get("label", "?"))
-        except Exception as e:
-            logger.warning("[IMDBPlay] Server %s exception: %s", server["name"], e)
-            continue
+        # اگه چیزی پیدا کردیم، خارج شو
+        if multi_quality_stream or fallback_stream:
+            break
 
     # اولویت با multi-quality stream هست
     stream = multi_quality_stream or fallback_stream
@@ -1310,15 +1321,44 @@ async def download_with_quality(
             else:
                 raise RuntimeError("MP4 download failed and no HLS fallback available")
 
-    # برای HLS، fetch m3u8
-    try:
-        async with AsyncSession() as s:
-            r = await s.get(m3u8_url, impersonate=_BROWSER_IMPERSONATE, timeout=20, headers=headers)
-            if r.status_code != 200:
-                raise RuntimeError(f"m3u8 fetch HTTP {r.status_code}")
-            text = r.text
-    except Exception as e:
-        raise RuntimeError(f"m3u8 fetch failed: {e}")
+    # برای HLS، fetch m3u8 — با retry و re-fetch stream اگه 401/429 گرفتیم
+    text = None
+    for m3u8_attempt in range(3):
+        try:
+            async with AsyncSession() as s:
+                r = await s.get(m3u8_url, impersonate=_BROWSER_IMPERSONATE, timeout=20, headers=headers)
+                if r.status_code == 200:
+                    text = r.text
+                    break
+                elif r.status_code in (401, 429):
+                    # Seed منقضی شده یا rate-limited — stream جدید بگیر
+                    logger.warning("m3u8 fetch HTTP %d (attempt %d) — re-fetching stream with new seed",
+                                   r.status_code, m3u8_attempt + 1)
+                    await asyncio.sleep(1 * (m3u8_attempt + 1))
+                    # Stream جدید با seed جدید
+                    new_stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
+                    if new_stream and new_stream.get("url"):
+                        stream = new_stream
+                        m3u8_url = stream["url"]
+                        headers = {"User-Agent": _USER_AGENT}
+                        headers.update(stream.get("headers", {}))
+                        # اگه کیفیت خاص خواستیم، دوباره URL اون کیفیت رو پیدا کن
+                        if quality_label and quality_label.lower() != "auto" and stream.get("qualities"):
+                            for q in stream["qualities"]:
+                                if q.get("label", "").lower() == quality_label.lower():
+                                    m3u8_url = q["url"]
+                                    break
+                    continue
+                else:
+                    raise RuntimeError(f"m3u8 fetch HTTP {r.status_code}")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.warning("m3u8 fetch attempt %d failed: %s", m3u8_attempt + 1, e)
+            await asyncio.sleep(1 * (m3u8_attempt + 1))
+
+    if not text:
+        raise RuntimeError("m3u8 fetch failed after 3 attempts")
 
     # اگه master.m3u8 باشه، variant انتخاب کن
     variant_url = m3u8_url
@@ -1382,13 +1422,18 @@ async def download_with_quality(
                             f.write(r.content)
                         logger.info("Init segment saved (%d bytes)", len(r.content))
                         break
-                    elif r.status_code in (429, 503):
+                    elif r.status_code in (401, 429, 503):
+                        logger.warning("init download HTTP %d (attempt %d)", r.status_code, attempt + 1)
                         await asyncio.sleep(2 * (attempt + 1))
                     else:
                         await asyncio.sleep(0.5 * (attempt + 1))
                 except Exception as e:
                     logger.warning("init download attempt %d failed: %s", attempt, e)
                     await asyncio.sleep(1 * (attempt + 1))
+
+            # اگه init segment دانلود نشد ولی نیاز هست، خطا بده
+            if not init_path and init_url:
+                logger.error("Init segment failed to download after 5 attempts — concat will likely fail")
 
         async def download_one(idx: int, seg_url: str):
             nonlocal seg_paths
