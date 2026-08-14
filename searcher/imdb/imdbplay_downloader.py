@@ -1607,6 +1607,42 @@ def _concat_segments(seg_paths: List[str], out_path: str, init_path: Optional[st
                 logger.info("concat succeeded (method 4: re-encode)")
                 return True
 
+            # ─── روش 5: ffmpeg concat با -f concat و -c copy و بدون -bsf (فایل list با مسیر مطلق) ───
+            # این روش برای بعضی از سگمنت‌هایی که روش‌های قبلی روشون fail می‌شه کار می‌کنه
+            try:
+                # اگه init_path هست، اون رو هم به لیست اضافه کن
+                all_paths = []
+                if init_path and os.path.exists(init_path):
+                    all_paths.append(init_path)
+                all_paths.extend([p for p in seg_paths if p and os.path.exists(p)])
+
+                with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+                    for p in all_paths:
+                        # مسیر مطلق با escape
+                        p_abs = os.path.abspath(p)
+                        p_escaped = p_abs.replace("'", "'\\''")
+                        f.write(f"file '{p_escaped}'\n")
+                    list_path2 = f.name
+
+                cmd5 = [
+                    "ffmpeg", "-y",
+                    "-f", "concat", "-safe", "0",
+                    "-i", list_path2,
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    out_path,
+                ]
+                result5 = subprocess.run(cmd5, capture_output=True, timeout=3600)
+                try:
+                    os.unlink(list_path2)
+                except Exception:
+                    pass
+                if result5.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    logger.info("concat succeeded (method 5: absolute paths + copy)")
+                    return True
+            except Exception as e:
+                logger.warning("method 5 failed: %s", e)
+
             logger.error("ffmpeg concat failed all methods. Last stderr: %s",
                          result4.stderr.decode("utf-8", errors="ignore")[:500])
             return False

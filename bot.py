@@ -12594,9 +12594,14 @@ def _imdb_quality_buttons(qualities: list, is_episode: bool) -> list:
 
 
 def _imdb_sub_buttons(subs: list, is_episode: bool) -> list:
-    """دکمه‌های انتخاب زیرنویس — فقط دو گزینه: با زیرنویس فارسی یا بدون زیرنویس"""
+    """دکمه‌های انتخاب زیرنویس — لیست زیرنویس‌های موجود + بدون زیرنویس"""
     buttons = []
-    buttons.append([Button.inline("📄 با زیرنویس فارسی", "imd_withsub")])
+    if subs:
+        for i, s in enumerate(subs[:5]):
+            label = f"📄 {s['file_name'][:40]} (↓{s['downloads']})"
+            buttons.append([Button.inline(label, f"imd_esub_{i}" if is_episode else f"imd_sub_{i}")])
+    # همیشه گزینه imdbplay (softsub) و بدون زیرنویس
+    buttons.append([Button.inline("🎬 با زیرنویس imdbplay (softsub)", "imd_withsub")])
     buttons.append([Button.inline("⏭ بدون زیرنویس", "imd_enosub" if is_episode else "imd_nosub")])
     buttons.append([Button.inline("🚫 بستن", "imd_close")])
     return buttons
@@ -12743,22 +12748,15 @@ async def imdb_cb_quality(event):
         await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
         return
     state["quality"] = quality_label
-    await event.edit(f"✅ کیفیت: **{quality_label}**\n\n🔍 در حال بررسی زیرنویس فارسی...")
+    await event.edit(f"✅ کیفیت: **{quality_label}**\n\n🔍 در حال جستجوی زیرنویس فارسی...")
     imdb_id = state["imdb_id"]
-    sub_status = ""
-    try:
-        sub_info = await _check_persian_subtitle_available(imdb_id)
-    except Exception:
-        sub_info = None
-    if sub_info and sub_info.get("available"):
-        sub_status = f"📄 زیرنویس فارسی: موجود ✅"
-        if sub_info.get("source"):
-            sub_status += f" ({sub_info['source']})"
-    else:
-        sub_status = "⚠ زیرنویس فارسی: موجود نیست"
+    # Search Persian subtitles from OpenSubtitles
+    subs = await search_subtitles(imdb_id, "per")
+    state["subs"] = subs
+    sub_count_text = f"📄 {len(subs)} زیرنویس پیدا شد:" if subs else "❌ زیرنویسی پیدا نشد"
     await event.edit(
-        f"✅ کیفیت: **{quality_label}**\n\n{sub_status}\n\n📄 آیا زیرنویس فارسی می‌خواهی؟",
-        buttons=_imdb_sub_buttons(None, is_episode=False),
+        f"✅ کیفیت: **{quality_label}**\n\n📝 زیرنویس فارسی:\n{sub_count_text}",
+        buttons=_imdb_sub_buttons(subs, is_episode=False),
         parse_mode="md",
     )
 
@@ -12800,46 +12798,67 @@ async def imdb_cb_equality(event):
     state["quality"] = quality_label
     season = state.get("selected_season")
     episode = state.get("selected_episode")
-    await event.edit(f"✅ کیفیت: **{quality_label}**\n\n🔍 در حال بررسی زیرنویس فارسی...")
+    await event.edit(f"✅ کیفیت: **{quality_label}**\n\n🔍 در حال جستجوی زیرنویس فارسی...")
     imdb_id = state["imdb_id"]
-    sub_status = ""
-    try:
-        sub_info = await _check_persian_subtitle_available(imdb_id, season=season, episode=episode)
-    except Exception:
-        sub_info = None
-    if sub_info and sub_info.get("available"):
-        sub_status = f"📄 زیرنویس فارسی: موجود ✅"
-        if sub_info.get("source"):
-            sub_status += f" ({sub_info['source']})"
-    else:
-        sub_status = "⚠ زیرنویس فارسی: موجود نیست"
+    # Search Persian subtitles from OpenSubtitles
+    subs = await search_subtitles(imdb_id, "per", season, episode)
+    state["subs"] = subs
+    sub_count_text = f"📄 {len(subs)} زیرنویس پیدا شد:" if subs else "❌ زیرنویسی پیدا نشد"
     await event.edit(
-        f"✅ کیفیت: **{quality_label}**\n\n{sub_status}\n\n📄 آیا زیرنویس فارسی می‌خواهی؟",
-        buttons=_imdb_sub_buttons(None, is_episode=True),
+        f"✅ کیفیت: **{quality_label}**\n\n📝 زیرنویس فارسی:\n{sub_count_text}",
+        buttons=_imdb_sub_buttons(subs, is_episode=True),
         parse_mode="md",
     )
 
 
 async def imdb_cb_sub(event):
-    """Handler for imd_withsub — start download with Persian subtitle"""
+    """Handler for subtitle selection — either specific sub from OpenSubtitles or imdbplay softsub"""
+    data = event.data.decode()
     user_id = event.sender_id
     state = imdb_states.get(user_id)
     if not state:
         await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
         return
-    await event.answer("✅ شروع دانلود...", alert=False)
-    asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
+    if data == "imd_withsub":
+        # imdbplay softsub — download Persian sub from imdbplay and embed
+        state["selected_sub"] = None
+        state["use_imdbplay_sub"] = True
+        await event.answer("✅ شروع دانلود با softsub...", alert=False)
+        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
+    else:
+        # Specific subtitle from OpenSubtitles
+        sub_idx = int(data.replace("imd_sub_", ""))
+        if sub_idx >= len(state.get("subs", [])):
+            await event.answer("زیرنویس نامعتبر", alert=True)
+            return
+        state["selected_sub"] = state["subs"][sub_idx]
+        state["use_imdbplay_sub"] = False
+        await event.answer(f"✅ زیرنویس: {state['selected_sub'].get('file_name', '')[:30]}", alert=False)
+        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
 
 
 async def imdb_cb_esub(event):
-    """Handler for imd_withsub (episode) — start download with Persian subtitle"""
+    """Handler for subtitle selection (episode) — either specific sub or imdbplay softsub"""
+    data = event.data.decode()
     user_id = event.sender_id
     state = imdb_states.get(user_id)
     if not state:
         await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
         return
-    await event.answer("✅ شروع دانلود...", alert=False)
-    asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
+    if data == "imd_withsub":
+        state["selected_sub"] = None
+        state["use_imdbplay_sub"] = True
+        await event.answer("✅ شروع دانلود با softsub...", alert=False)
+        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
+    else:
+        sub_idx = int(data.replace("imd_esub_", ""))
+        if sub_idx >= len(state.get("subs", [])):
+            await event.answer("زیرنویس نامعتبر", alert=True)
+            return
+        state["selected_sub"] = state["subs"][sub_idx]
+        state["use_imdbplay_sub"] = False
+        await event.answer(f"✅ زیرنویس: {state['selected_sub'].get('file_name', '')[:30]}", alert=False)
+        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
 
 
 async def imdb_cb_nosub(event):
@@ -12932,14 +12951,16 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
         await status_msg.edit(f"📥 دانلود {label} با کیفیت {quality}{server_info_text}", buttons=cancel_btn)
 
         sub_name = None
-        if with_subtitle and state.get("selected_sub"):
-            await status_msg.edit("📝 دانلود زیرنویس...")
+        use_imdbplay_sub = state.get("use_imdbplay_sub", False)
+        if with_subtitle and state.get("selected_sub") and not use_imdbplay_sub:
+            # User selected a specific subtitle from OpenSubtitles
+            await status_msg.edit("📝 دانلود زیرنویس از OpenSubtitles...")
             sub_path = await download_subtitle(state["selected_sub"], out_dir)
             if sub_path:
                 sub_name = state["selected_sub"].get("file_name", "")
                 await status_msg.edit(f"✅ زیرنویس: `{sub_name}`", parse_mode="md")
             else:
-                await status_msg.edit("⚠ زیرنویس دانلود نشد، بدون burn ادامه میدیم.")
+                await status_msg.edit("⚠ زیرنویس دانلود نشد، ادامه بدون زیرنویس.")
                 with_subtitle = False
 
         last_progress = [0]
@@ -13001,18 +13022,23 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
         if with_subtitle:
             # User chose "with subtitle" — embed subtitle as softsub in the video
             try:
-                sub_out_dir = os.path.join(IMDB_OUTPUT_FOLDER, f"sub_{user_id}_{int(time.time())}")
-                os.makedirs(sub_out_dir, exist_ok=True)
-                try:
-                    await status_msg.edit("💬 در حال جستجوی زیرنویس فارسی...")
-                except Exception:
-                    pass
-                persian_sub_path = await get_persian_subtitle(
-                    imdb_id,
-                    season=season,
-                    episode=episode,
-                    out_dir=sub_out_dir,
-                )
+                # If user selected a specific subtitle from OpenSubtitles, use that
+                # Otherwise, fetch from imdbplay
+                if sub_path and os.path.exists(sub_path):
+                    persian_sub_path = sub_path
+                else:
+                    sub_out_dir = os.path.join(IMDB_OUTPUT_FOLDER, f"sub_{user_id}_{int(time.time())}")
+                    os.makedirs(sub_out_dir, exist_ok=True)
+                    try:
+                        await status_msg.edit("💬 در حال جستجوی زیرنویس فارسی...")
+                    except Exception:
+                        pass
+                    persian_sub_path = await get_persian_subtitle(
+                        imdb_id,
+                        season=season,
+                        episode=episode,
+                        out_dir=sub_out_dir,
+                    )
                 if persian_sub_path and os.path.exists(persian_sub_path):
                     try:
                         await status_msg.edit("📝 در حال جاسازی زیرنویس درون ویدیو (softsub)...")
@@ -13022,7 +13048,8 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
                     embedded = embed_subtitle_soft(video_path, persian_sub_path, softsub_out)
                     if embedded and os.path.exists(embedded):
                         final_path = embedded
-                        sub_name = "Persian (softsub)"
+                        if not sub_name:
+                            sub_name = "Persian (softsub)"
                         try:
                             await status_msg.edit("✅ زیرنویس داخل ویدیو قرار گرفت!")
                         except Exception:
