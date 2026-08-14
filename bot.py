@@ -72,6 +72,10 @@ if _searcher_imdb_dir not in _sys.path:
     _sys.path.insert(0, _searcher_imdb_dir)
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle, get_server_info, embed_subtitle_soft
+# Iran server (doostihaa + farsiland)
+IRAN_SERVER = os.getenv('IRAN_SERVER', 'doostihaa')  # doostihaa or farsiland
+iran_states = {}
+user_iran_server = {}  # user_id -> 'doostihaa' or 'farsiland'
 from searcher.imdb.videotext_burn import burn_subtitles
 from ytdlp_handler import (
     is_ytdlp_site_url,
@@ -13233,6 +13237,150 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
             pass
 
 
+async def server_cmd(event):
+    """انتخاب سرور بین IMDb و Doostihaa و Farsiland"""
+    user_id = event.sender_id
+    buttons = [
+        [Button.inline("🌍 IMDb (imdbplay)", "srv_imdb")],
+        [Button.inline("🇮🇷 دوستی‌ها (doostihaa)", "srv_doostihaa")],
+        [Button.inline("🇮🇷 فارسی‌لند (farsiland)", "srv_farsiland")],
+    ]
+    current = user_iran_server.get(user_id, "none")
+    await event.reply(
+        f"🖥 انتخاب سرور جستجو\n\nسرور فعلی: **{current}**\n\nیکی را انتخاب کنید:",
+        buttons=buttons,
+        parse_mode="md",
+    )
+
+
+async def server_callback(event):
+    """Handle server selection callback"""
+    data = event.data.decode()
+    user_id = event.sender_id
+    server = data.replace("srv_", "")
+    user_iran_server[user_id] = server
+    names = {"imdb": "IMDb (imdbplay)", "doostihaa": "دوستی‌ها (doostihaa)", "farsiland": "فارسی‌لند (farsiland)"}
+    await event.answer(f"سرور انتخاب شد: {names.get(server, server)}", alert=False)
+    await event.edit(f"✅ سرور انتخاب شد: **{names.get(server, server)}**\n\nبرای جستجو از @bot استفاده کنید با پیشوند iran: (برای دوستی‌ها) یا imd: (برای IMDb)", parse_mode="md")
+
+
+
+# ─── Iran server (doostihaa) callbacks ───
+
+async def iran_cb_title(event):
+    """Handle iran title selection — show qualities"""
+    data = event.data.decode()
+    post_id = data.replace("irn_sel_", "")
+    user_id = event.sender_id
+    await event.edit("\U0001F50D \u062F\u0631 \u062D\u0627\u0644 \u062F\u0631\u06CC\u0627\u0641\u062A \u0644\u06CC\u0633\u062A \u06A9\u06CC\u0641\u06CC\u062A\u200C\u0647\u0627...", buttons=None)
+    from searcher.iranserver.doostihaa_search import get_qualities_doostihaa
+    qualities = await get_qualities_doostihaa(post_id)
+    if not qualities:
+        await event.edit("\u274C \u06A9\u06CC\u0641\u06CC\u062A\u06CC \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F.", buttons=None)
+        return
+    iran_states[user_id] = {"post_id": post_id, "qualities": qualities}
+    # Build quality buttons
+    buttons = []
+    row = []
+    seen_labels = set()
+    for q in qualities:
+        label = q["label"]
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        row.append(Button.inline(label, f"irn_q_{label}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([Button.inline("\U0001F6AB \u0628\u0633\u062A\u0646", "irn_close")])
+    await event.edit("\U0001F3AF \u06A9\u06CC\u0641\u06CC\u062A \u0631\u0648 \u0627\u0646\u062A\u062E\u0627\u0628 \u06A9\u0646:", buttons=buttons)
+
+
+async def iran_cb_quality(event):
+    """Handle quality selection — start download"""
+    data = event.data.decode()
+    quality_label = data.replace("irn_q_", "")
+    user_id = event.sender_id
+    state = iran_states.get(user_id)
+    if not state:
+        await event.answer("\u23F0 \u0646\u0634\u0633\u062A \u0634\u0645\u0627 \u0645\u0646\u0642\u0636\u06CC \u0634\u062F\u0647. \u062F\u0648\u0628\u0627\u0631\u0647 \u0633\u0631\u0686 \u06A9\u0646\u06CC\u062F.", alert=True)
+        return
+    # Find the URL for this quality
+    url = None
+    for q in state["qualities"]:
+        if q["label"] == quality_label:
+            url = q["url"]
+            break
+    if not url:
+        await event.answer("\u06A9\u06CC\u0641\u06CC\u062A \u0646\u0627\u0645\u0639\u062A\u0628\u0631", alert=True)
+        return
+    await event.answer("\u2705 \u0634\u0631\u0648\u0639 \u062F\u0627\u0646\u0644\u0648\u062F...", alert=False)
+    asyncio.create_task(_iran_download_task(event, user_id, url, quality_label))
+
+
+async def iran_cb_nosub(event):
+    pass
+
+
+async def iran_cb_close(event):
+    user_id = event.sender_id
+    iran_states.pop(user_id, None)
+    try:
+        await event.delete()
+    except Exception:
+        await event.edit("\U0001F6AB \u0628\u0633\u062A\u0647 \u0634\u062F", buttons=None)
+
+
+async def _iran_download_task(event, user_id, url, quality_label):
+    """Download task for iran server (doostihaa)"""
+    out_dir = os.path.join(IMDB_OUTPUT_FOLDER, f"iran_{user_id}_{int(time.time())}")
+    os.makedirs(out_dir, exist_ok=True)
+    dl_id = f"iran_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("\u274C Cancel", f"dlcancel_{dl_id}")]]
+    try:
+        try:
+            status_msg = await event.client.send_message(event.chat_id, "\U0001F4E5 \u062F\u0627\u0646\u0644\u0648\u062F \u0628\u0627 \u06A9\u06CC\u0641\u06CC\u062A " + quality_label + "...")
+        except Exception:
+            status_msg = await event.edit("\U0001F4E5 \u062F\u0627\u0646\u0644\u0648\u062F...", buttons=cancel_btn)
+        from searcher.iranserver.doostihaa_search import download_doostihaa
+        video_path = await download_doostihaa(url, out_dir)
+        if not video_path or not os.path.exists(video_path):
+            await status_msg.edit("\u274C \u062F\u0627\u0646\u0644\u0648\u062F \u0646\u0627\u0645\u0648\u0641 \u0628\u0648\u062F.", buttons=None)
+            return
+        size_mb = os.path.getsize(video_path) / 1024 / 1024
+        await status_msg.edit(f"\u2705 \u0648\u06CC\u062F\u06CC\u0648 \u062F\u0627\u0646\u0644\u0648\u062F \u0634\u062F ({size_mb:.1f} MB)", buttons=None)
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=video_path,
+            caption=f"\U0001F3AC {quality_label} \U0001F4C0 \u062F\u0648\u0633\u062A\u06CC\u200C\u0647\u0627\n\U0001F4BE {size_mb:.1f} MB",
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=f"iran_ul_{dl_id}",
+        )
+        active_downloads.pop(dl_id, None)
+    except asyncio.CancelledError:
+        active_downloads.pop(dl_id, None)
+        try: await status_msg.edit("\u274C \u062F\u0627\u0646\u0644\u0648\u062F \u0644\u063A\u0648 \u0634\u062F.", buttons=None)
+        except: pass
+    except Exception as e:
+        active_downloads.pop(dl_id, None)
+        logger.error(f"[IRAN] download failed: {e}", exc_info=True)
+        try: await status_msg.edit(f"\u274C \u062E\u0637\u0627: {e}", buttons=None)
+        except: pass
+    finally:
+        iran_states.pop(user_id, None)
+        if video_path and os.path.exists(video_path):
+            try: os.unlink(video_path)
+            except: pass
+        try: os.rmdir(out_dir)
+        except: pass
+
+
 async def xnxx_inline_handler(event):
     try:
         if event.sender_id not in AUTHORIZED_USERS:
@@ -13252,6 +13400,7 @@ async def xnxx_inline_handler(event):
         is_ep = raw.lower().startswith("ep:")
         is_xn = raw.lower().startswith("xn:")
         is_imd = raw.lower().startswith("imd:")
+        is_iran = raw.lower().startswith("iran:")
         is_wh = raw.lower().startswith("wh:")
         if is_ph:
             inner = raw[3:].strip()
@@ -13271,6 +13420,8 @@ async def xnxx_inline_handler(event):
             parsed = parse_wh_inline_query(inner)
         elif is_imd:
             inner = raw[4:].strip()
+        elif is_iran:
+            inner = raw[5:].strip()
         else:
             # بدون پیشوند — استفاده از سرچر دیفالت کاربر
             default_src = get_user_default_search(event.sender_id)
@@ -13483,6 +13634,44 @@ async def xnxx_inline_handler(event):
             )
             logger.info(f"[INLINE] IMDB: {len(imdb_results)} results for '{query}'")
             return
+
+        if is_iran:
+            query = inner
+            page = 1
+            sort = ""
+            logger.info(f"[INLINE] IRAN: q='{query}'")
+            # Use doostihaa search
+            from searcher.iranserver.doostihaa_search import search_doostihaa
+            results = await search_doostihaa(query, limit=INLINE_RESULTS_LIMIT)
+            if not results:
+                await event.answer([], cache_time=30)
+                return
+            iran_results = []
+            builder = event.builder
+            for item in results:
+                title = item.get("title", "Untitled")[:128]
+                post_id = item.get("id", "")
+                url = item.get("url", "")
+                cover = item.get("img", "")
+                is_series = item.get("is_series", False)
+                type_icon = "\U0001F4FA" if is_series else "\U0001F3AC"
+                display_title = f"{type_icon} {title}"
+                desc = "\U0001F4C0 \u062F\u0648\u0633\u062A\u06CC\u200C\u0647\u0627"
+                message_text = f"\U0001F3AC **{title}**\n\n\U0001F510 {url}"
+                buttons = [[Button.inline("\U0001F4E5 \u062F\u0627\u0646\u0644\u0648\u062F", f"irn_sel_{post_id}")]]
+                try:
+                    if cover:
+                        from telethon.tl.types import InputWebDocument
+                        thumb_doc = InputWebDocument(url=cover, size=0, mime_type="image/jpeg", attributes=[])
+                        iran_results.append(builder.article(title=display_title, description=desc, thumb=thumb_doc, text=message_text, buttons=buttons, parse_mode="md", link_preview=False))
+                    else:
+                        iran_results.append(builder.article(title=display_title, description=desc, text=message_text, buttons=buttons, parse_mode="md", link_preview=False))
+                except Exception:
+                    iran_results.append(builder.article(title=display_title, description=desc, text=message_text, buttons=buttons, parse_mode="md", link_preview=False))
+            await event.answer(iran_results, cache_time=30)
+            logger.info(f"[INLINE] IRAN: {len(iran_results)} results for '{query}'")
+            return
+
 
 
         inline_results = []
@@ -18211,7 +18400,17 @@ async def main():
         inline_start_callback, events.CallbackQuery(pattern=r"^inl_")
     )
 
+    # Server selection handler
+    client.add_event_handler(server_cmd, events.NewMessage(pattern=r"^/server", incoming=True))
+    client.add_event_handler(server_callback, events.CallbackQuery(pattern=r"srv_"))
+
     # IMDB (vidsrc) search & download callbacks
+    # Iran server (doostihaa) callbacks
+    client.add_event_handler(iran_cb_title, events.CallbackQuery(pattern=r"irn_sel_"))
+    client.add_event_handler(iran_cb_quality, events.CallbackQuery(pattern=r"irn_q_"))
+    client.add_event_handler(iran_cb_nosub, events.CallbackQuery(pattern=r"irn_nosub$"))
+    client.add_event_handler(iran_cb_close, events.CallbackQuery(pattern=r"irn_close$"))
+
     client.add_event_handler(imdb_cb_title, events.CallbackQuery(pattern=r"imd_sel_"))
     client.add_event_handler(imdb_cb_season, events.CallbackQuery(pattern=r"imd_season_"))
     client.add_event_handler(imdb_cb_episode, events.CallbackQuery(pattern=r"imd_ep_"))
