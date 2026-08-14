@@ -829,6 +829,61 @@ async def _get_first_working_stream(tmdb_id: str, imdb_id: str, season: Optional
     return None
 
 
+# متدهای استخراج برای نمایش به کاربر
+_EXTRACTION_METHODS = {
+    "s2": "WASM Decrypt (Vidzee API)",
+    "s1": "XOR Cipher + Seed (speedracelight API)",
+    "s3": "XOR Cipher + Seed (speedracelight API)",
+    "s9": "Custom Base64 (vidnest API)",
+    "s7": "WASM Decrypt (vidsrcme API)",
+}
+
+
+async def get_server_info(imdb_id: str, season: Optional[int] = None, episode: Optional[int] = None) -> Optional[dict]:
+    """
+    گرفتن اطلاعات سرور فعال بدون شروع دانلود.
+
+    Returns:
+        dict با فیلدهای:
+        - server: نام سرور (مثلاً "Vidzee")
+        - method: متد استخراج (مثلاً "WASM Decrypt")
+        - server_id: شناسه سرور (مثلاً "s2")
+        - stream_type: نوع stream ("hls" یا "mp4")
+    """
+    if not imdb_id:
+        return None
+    if not imdb_id.startswith("tt"):
+        imdb_id = f"tt{imdb_id}"
+
+    tmdb_id = await _get_tmdb_id(imdb_id)
+    if not tmdb_id:
+        return None
+
+    stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
+    if not stream:
+        return None
+
+    server_name = stream.get("server", "Unknown")
+    # پیدا کردن server_id از روی server_name
+    server_id = ""
+    for srv in _SERVERS:
+        if srv["name"] == server_name:
+            server_id = srv["id"]
+            break
+
+    method = _EXTRACTION_METHODS.get(server_id, "Unknown")
+    stream_type = stream.get("type", "hls")
+
+    return {
+        "server": server_name,
+        "method": method,
+        "server_id": server_id,
+        "stream_type": stream_type,
+        "tmdb_id": tmdb_id,
+    }
+
+
+
 # ═══════════════════════════════════════════════════════════
 #   m3u8 parsing & quality extraction
 # ═══════════════════════════════════════════════════════════
@@ -864,14 +919,26 @@ def _parse_master_m3u8(text: str) -> List[Tuple[str, int, str]]:
     return variants
 
 
-def _parse_variant_m3u8(text: str) -> List[Tuple[str, float]]:
-    """پارس variant.m3u8 (playlist سگمنت‌ها). Returns: list of (url, duration)."""
+def _parse_variant_m3u8(text: str) -> Tuple[List[Tuple[str, float]], Optional[str]]:
+    """
+    پارس variant.m3u8 (playlist سگمنت‌ها).
+    Returns:
+        (segments, init_url) where segments is list of (url, duration) and
+        init_url is the EXT-X-MAP URI (for fMP4 streams) or None (for MPEG-TS).
+    """
     segments = []
+    init_url = None
     lines = text.splitlines()
     duration = 0.0
     for line in lines:
         line = line.strip()
-        if line.startswith("#EXTINF:"):
+        if line.startswith("#EXT-X-MAP:"):
+            # parse EXT-X-MAP for fMP4 init segment
+            # format: #EXT-X-MAP:URI="https://..."
+            m = re.search(r'URI="([^"]+)"', line)
+            if m:
+                init_url = m.group(1)
+        elif line.startswith("#EXTINF:"):
             try:
                 duration = float(line[len("#EXTINF:"):].split(",")[0])
             except (ValueError, IndexError):
@@ -879,7 +946,7 @@ def _parse_variant_m3u8(text: str) -> List[Tuple[str, float]]:
         elif line and not line.startswith("#"):
             segments.append((line, duration))
             duration = 0.0
-    return segments
+    return segments, init_url
 
 
 def _resolution_to_label(resolution: str, bandwidth: int) -> str:
@@ -944,7 +1011,9 @@ class Quality:
 async def get_qualities(imdb_id: str, season: Optional[int] = None, episode: Optional[int] = None) -> List[dict]:
     """
     گرفتن لیست کیفیت‌های موجود برای یک فیلم یا قسمت سریال.
-    ابتدا سعی می‌کنه master.m3u8 پیدا کنه (کیفیت‌های متعدد)، اگه نه، کیفیت Auto برمی‌گردانه.
+
+    اولویت با سرورهایی هست که کیفیت‌های متعدد دارن (مثل Videasy/Vidking).
+    اگه هیچ سرور کیفیت متعدد نداشت، کیفیت Auto از اولین سرور موفق برمی‌گرده.
 
     Returns:
         لیست dict با فیلدهای:
@@ -960,7 +1029,36 @@ async def get_qualities(imdb_id: str, season: Optional[int] = None, episode: Opt
         logger.error("Cannot resolve tmdb_id for %s", imdb_id)
         return []
 
-    stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
+    # امتحان سرورها به ترتیب — اول سروری که کیفیت‌های متعدد داره پیدا کن
+    multi_quality_stream = None
+    fallback_stream = None
+
+    for server in _SERVERS:
+        try:
+            logger.info("[IMDBPlay] get_qualities: Trying server %s...", server["name"])
+            stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+            if not stream or not stream.get("url"):
+                continue
+
+            # اگه fallback نداریم، این رو به‌عنوان fallback نگه دار
+            if not fallback_stream:
+                fallback_stream = stream
+
+            # اگه این سرور کیفیت‌های متعدد داره، اون رو انتخاب کن
+            if stream.get("qualities") and len(stream["qualities"]) > 1:
+                multi_quality_stream = stream
+                logger.info("[IMDBPlay] ✓ Server %s has %d qualities",
+                            server["name"], len(stream["qualities"]))
+                break
+            elif stream.get("qualities") and len(stream["qualities"]) == 1:
+                logger.info("[IMDBPlay] Server %s has 1 quality: %s",
+                            server["name"], stream["qualities"][0].get("label", "?"))
+        except Exception as e:
+            logger.warning("[IMDBPlay] Server %s exception: %s", server["name"], e)
+            continue
+
+    # اولویت با multi-quality stream هست
+    stream = multi_quality_stream or fallback_stream
     if not stream:
         logger.error("No working stream found for %s (tmdb=%s)", imdb_id, tmdb_id)
         return []
@@ -980,6 +1078,17 @@ async def get_qualities(imdb_id: str, season: Optional[int] = None, episode: Opt
                 server=stream.get("server", ""),
                 is_auto=q_label.lower() == "auto",
             ).to_dict())
+        # اگه چند کیفیت داریم، یه Auto هم اضافه کن (بهترین کیفیت)
+        if len(qualities) > 1 and not any(q["label"].lower() == "auto" for q in qualities):
+            auto_q = Quality(
+                label="Auto",
+                bandwidth=0,
+                resolution="",
+                url=qualities[0]["url"],  # اولین کیفیت (معمولاً بهترین)
+                server=stream.get("server", ""),
+                is_auto=True,
+            )
+            qualities.insert(0, auto_q.to_dict())
         return qualities
 
     # در غیر این صورت، m3u8 رو fetch کن و بررسی کن master یا variant
@@ -1077,7 +1186,60 @@ async def download_with_quality(
     if not tmdb_id:
         raise RuntimeError(f"Cannot resolve tmdb_id for {imdb_id}")
 
-    stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
+    # اگه کیفیت خاصی درخواست شده، سروری رو پیدا کن که اون کیفیت رو داشته باشه
+    # اگه "Auto" درخواست شده، اولین سرور موفق کافیه
+    target_quality = quality_label.lower() if quality_label else "auto"
+
+    stream = None
+    if target_quality == "auto":
+        # برای Auto، اولین سرور موفق کافیه
+        stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
+    else:
+        # برای کیفیت خاص، سرورها رو به ترتیب امتحان کن تا سروری پیدا بشه که اون کیفیت رو داشته باشه
+        for server in _SERVERS:
+            try:
+                logger.info("[IMDBPlay] Trying server %s for quality %s...", server["name"], quality_label)
+                candidate = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+                if not candidate or not candidate.get("url"):
+                    continue
+
+                # بررسی اینکه آیا این سرور کیفیت مورد نظر رو داره
+                # اگه سرور لیست کیفیت‌ها رو داره (مثل Videasy/Vidking)، چک کن
+                if candidate.get("qualities"):
+                    has_q = any(
+                        q.get("label", "").lower() == target_quality
+                        for q in candidate["qualities"]
+                    )
+                    if has_q:
+                        # این سرور کیفیت مورد نظر رو داره — URL اون کیفیت رو برگردون
+                        for q in candidate["qualities"]:
+                            if q.get("label", "").lower() == target_quality:
+                                candidate["url"] = q["url"]
+                                break
+                        stream = candidate
+                        logger.info("[IMDBPlay] ✓ Server %s has quality %s", server["name"], quality_label)
+                        break
+                    else:
+                        logger.info("[IMDBPlay] ✗ Server %s doesn't have quality %s (has: %s)",
+                                    server["name"], quality_label,
+                                    [q.get("label") for q in candidate["qualities"]])
+                        continue
+                else:
+                    # سرور فقط Auto داره (مثل Vidzee) — اگه کیفیت Auto خواستیم، خوبه
+                    # اگه نه، این سرور رو رد کن
+                    logger.info("[IMDBPlay] ✗ Server %s only has Auto quality", server["name"])
+                    continue
+            except Exception as e:
+                logger.warning("[IMDBPlay] ✗ Server %s exception: %s", server["name"], e)
+                continue
+
+        # اگه هیچ سرور کیفیت مورد نظر رو نداشت، fallback به اولین سرور موفق
+        if not stream:
+            logger.warning("[IMDBPlay] No server has quality %s, falling back to Auto", quality_label)
+            stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
+            # وقتی fallback می‌کنیم، quality_label رو هم به Auto تغییر بده
+            quality_label = "Auto"
+
     if not stream:
         raise RuntimeError(f"No working stream found for {imdb_id}")
 
@@ -1156,18 +1318,45 @@ async def download_with_quality(
         except Exception as e:
             raise RuntimeError(f"variant m3u8 fetch failed: {e}")
 
-    segments = _parse_variant_m3u8(text)
+    segments, init_url = _parse_variant_m3u8(text)
     if not segments:
         raise RuntimeError("No segments in variant m3u8")
 
     total = len(segments)
-    logger.info("Downloading %d segments from %s", total, stream.get("server", ""))
+    server_name = stream.get("server", "unknown")
+    logger.info("Downloading %d segments from %s (init=%s)",
+                total, server_name, "yes" if init_url else "no")
 
     # download segments in parallel — با session مشترک و retries بیشتر
     seg_paths = [None] * total
+    init_path = None
     sem = asyncio.Semaphore(6)  # 6 concurrent downloads
 
     async with AsyncSession() as shared_session:
+        # اگه init segment وجود داره (fMP4)، اول اون رو دانلود کن
+        if init_url:
+            init_abs_url = _make_absolute(variant_url, init_url)
+            logger.info("Downloading init segment: %s", init_abs_url[:80])
+            for attempt in range(5):
+                try:
+                    r = await shared_session.get(
+                        init_abs_url, impersonate=_BROWSER_IMPERSONATE,
+                        timeout=60, headers=headers,
+                    )
+                    if r.status_code == 200 and r.content:
+                        init_path = os.path.join(out_dir, "init.mp4")
+                        with open(init_path, "wb") as f:
+                            f.write(r.content)
+                        logger.info("Init segment saved (%d bytes)", len(r.content))
+                        break
+                    elif r.status_code in (429, 503):
+                        await asyncio.sleep(2 * (attempt + 1))
+                    else:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                except Exception as e:
+                    logger.warning("init download attempt %d failed: %s", attempt, e)
+                    await asyncio.sleep(1 * (attempt + 1))
+
         async def download_one(idx: int, seg_url: str):
             nonlocal seg_paths
             abs_url = _make_absolute(variant_url, seg_url)
@@ -1181,7 +1370,13 @@ async def download_with_quality(
                         )
                         if r.status_code == 200 and r.content:
                             data = r.content
-                            seg_path = os.path.join(out_dir, f"seg_{idx:05d}.ts")
+                            # تشخیص فرمت از روی URL یا محتوا
+                            if init_path:
+                                # fMP4 — پسوند .m4s
+                                seg_path = os.path.join(out_dir, f"seg_{idx:05d}.m4s")
+                            else:
+                                # MPEG-TS — پسوند .ts
+                                seg_path = os.path.join(out_dir, f"seg_{idx:05d}.ts")
                             with open(seg_path, "wb") as f:
                                 f.write(data)
                             seg_paths[idx] = seg_path
@@ -1213,12 +1408,18 @@ async def download_with_quality(
         raise RuntimeError("All segments failed to download")
 
     out_path = os.path.join(out_dir, f"{int(time.time())}.mp4")
-    if not _concat_segments(valid_paths, out_path):
+    if not _concat_segments(valid_paths, out_path, init_path):
         raise RuntimeError("ffmpeg concat failed")
 
+    # پاک کردن سگمنت‌ها و init
     for p in valid_paths:
         try:
             os.unlink(p)
+        except Exception:
+            pass
+    if init_path:
+        try:
+            os.unlink(init_path)
         except Exception:
             pass
 
@@ -1227,18 +1428,68 @@ async def download_with_quality(
     return out_path
 
 
-def _concat_segments(seg_paths: List[str], out_path: str) -> bool:
-    """concat سگمنت‌ها با ffmpeg (با ۳ fallback strategy)."""
+def _concat_segments(seg_paths: List[str], out_path: str, init_path: Optional[str] = None) -> bool:
+    """
+    concat سگمنت‌ها با ffmpeg.
+
+    برای MPEG-TS (بدون init): از concat demuxer استفاده می‌شه.
+    برای fMP4 (با init): ابتدا binary concat (init + segments)، سپس remux.
+
+    Returns:
+        True اگه موفق، False در غیر این صورت.
+    """
     try:
+        has_init = init_path and os.path.exists(init_path)
+
+        # ─── روش 1 (فقط برای fMP4 با init): binary concat + remux ───
+        if has_init:
+            combined_path = out_path + ".combined.mp4"
+            try:
+                with open(combined_path, "wb") as fout:
+                    # اول init
+                    with open(init_path, "rb") as fin:
+                        fout.write(fin.read())
+                    # بعد همه segments به ترتیب
+                    for p in seg_paths:
+                        if p and os.path.exists(p):
+                            with open(p, "rb") as fin:
+                                fout.write(fin.read())
+
+                # remux با ffmpeg (تبدیل fragmented MP4 به MP4 استاندارد)
+                cmd1 = [
+                    "ffmpeg", "-y", "-i", combined_path,
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    out_path,
+                ]
+                result1 = subprocess.run(cmd1, capture_output=True, timeout=1800)
+                if result1.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    logger.info("concat succeeded (method 1: binary concat + remux for fMP4)")
+                    try:
+                        os.unlink(combined_path)
+                    except Exception:
+                        pass
+                    return True
+                # اگه fail شد، combined رو نگه می‌داریم برای fallback
+                logger.warning("method 1 (binary concat) failed: %s",
+                               result1.stderr.decode("utf-8", errors="ignore")[:300])
+                try:
+                    os.unlink(combined_path)
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning("method 1 (binary concat) exception: %s", e)
+
+        # ─── روش 2: concat demuxer با stream copy و aac_adtstoasc (برای MPEG-TS) ───
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
             for p in seg_paths:
-                p_escaped = p.replace("'", "'\\''")
-                f.write(f"file '{p_escaped}'\n")
+                if p and os.path.exists(p):
+                    p_escaped = p.replace("'", "'\\''")
+                    f.write(f"file '{p_escaped}'\n")
             list_path = f.name
 
         try:
-            # روش 1: concat demuxer با stream copy و bitstream filter
-            cmd = [
+            cmd2 = [
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
                 "-i", list_path,
                 "-c", "copy",
@@ -1246,24 +1497,26 @@ def _concat_segments(seg_paths: List[str], out_path: str) -> bool:
                 "-movflags", "+faststart",
                 out_path,
             ]
-            result = subprocess.run(cmd, capture_output=True, timeout=1800)
-            if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            result2 = subprocess.run(cmd2, capture_output=True, timeout=1800)
+            if result2.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                logger.info("concat succeeded (method 2: concat demuxer + aac_adtstoasc)")
                 return True
 
-            # روش 2: بدون bitstream filter
-            cmd2 = [
+            # ─── روش 3: concat demuxer بدون bitstream filter ───
+            cmd3 = [
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
                 "-i", list_path,
                 "-c", "copy",
                 "-movflags", "+faststart",
                 out_path,
             ]
-            result2 = subprocess.run(cmd2, capture_output=True, timeout=1800)
-            if result2.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            result3 = subprocess.run(cmd3, capture_output=True, timeout=1800)
+            if result3.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                logger.info("concat succeeded (method 3: concat demuxer copy only)")
                 return True
 
-            # روش 3: re-encode
-            cmd3 = [
+            # ─── روش 4: re-encode (fallback نهایی) ───
+            cmd4 = [
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
                 "-i", list_path,
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
@@ -1271,12 +1524,13 @@ def _concat_segments(seg_paths: List[str], out_path: str) -> bool:
                 "-movflags", "+faststart",
                 out_path,
             ]
-            result3 = subprocess.run(cmd3, capture_output=True, timeout=3600)
-            if result3.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            result4 = subprocess.run(cmd4, capture_output=True, timeout=3600)
+            if result4.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                logger.info("concat succeeded (method 4: re-encode)")
                 return True
 
             logger.error("ffmpeg concat failed all methods. Last stderr: %s",
-                         result3.stderr.decode("utf-8", errors="ignore")[:500])
+                         result4.stderr.decode("utf-8", errors="ignore")[:500])
             return False
         finally:
             try:

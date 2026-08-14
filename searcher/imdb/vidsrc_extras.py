@@ -1,17 +1,21 @@
 """
 vidsrc_extras.py
 ────────────────
-توابع اضافی برای vidsrcme:
-  - get_qualities(): لیست کیفیت‌های موجود از master.m3u8
-  - get_subtitle(): دانلود زیرنویس فارسی از OpenSubtitles (با fallback)
-  - download_with_quality(): دانلود ویدیو با کیفیت انتخابی
+توابع کمکی برای دانلود از IMDB (نسخه جدید مبتنی بر imdbplay.tech).
 
-استفاده:
-  from vidsrc_extras import get_qualities, get_subtitle, download_with_quality
+این فایل صرفاً یک wrapper هست که توابع رو به imdbplay_downloader دیلیگیت می‌کنه.
+متد قدیمی vidsrcme (WASM + cloudorchestranova + encrypted stream_urls) کامل حذف شده.
 
-  qualities = await get_qualities("tt33071426")
-  sub_path = await get_subtitle("tt33071426", out_dir="/tmp")
-  path = await download_with_quality("tt33071426", "720p", "/tmp")
+توابع عمومی:
+  - get_qualities(imdb_id, season, episode) -> List[dict]
+  - download_with_quality(imdb_id, quality_label, out_dir, ...) -> Optional[str]
+  - get_persian_subtitle(imdb_id, season, episode, out_dir) -> Optional[str]
+  - search_subtitles(imdb_id, lang, season, episode) -> List[dict]  (OpenSubtitles, برای زبان‌های غیر فارسی)
+  - download_subtitle(sub, out_dir, prefer_format) -> Optional[str]  (OpenSubtitles)
+
+زیرنویس فارسی به‌طور خودکار از سرورهای imdbplay (Vidzee, 2Embed, Videasy) گرفته می‌شه
+و نیازی به OpenSubtitles نیست. توابع search_subtitles/download_subtitle برای زبان‌های
+دیگه (انگلیسی، عربی، و غیره) باقی موندن.
 """
 import asyncio
 import base64
@@ -28,85 +32,20 @@ from urllib.parse import urlparse, urljoin
 
 from curl_cffi.requests import AsyncSession
 import httpx
-import wasmtime
 
 logger = logging.getLogger("VidsrcExtras")
 
-# import از ماژول اصلی
-import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vidsrc_downloader import (
-    _USER_AGENT, _API_HEADERS, _SEG_HEADERS,
-    _decrypt_stream_urls, _parse_token, _apply_token,
-    _parse_master_m3u8, _parse_variant_m3u8,
-    get_stream_info, StreamInfo,
-    _fetch_token, _download_segments, _concat_segments,
+# User agent برای OpenSubtitles و subtitle cache
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 
 
-# ─── Quality helpers ────────────────────────────────────────
-
-
-@dataclass
-class Quality:
-    """یه کیفیت از master.m3u8"""
-    label: str            # "1080p", "720p", "480p", "Auto"
-    bandwidth: int        # bits per second
-    resolution: str       # "1920x1080"
-    height: int           # 1080
-    url: str              # variant URL (relative یا absolute)
-    is_auto: bool = False
-
-    def to_dict(self) -> dict:
-        return {
-            "label": self.label,
-            "bandwidth": self.bandwidth,
-            "resolution": self.resolution,
-            "height": self.height,
-            "url": self.url,
-            "is_auto": self.is_auto,
-        }
-
-
-def _resolution_to_label(resolution: str, bandwidth: int) -> str:
-    """تبدیل "1920x1080" → "1080p" """
-    if not resolution:
-        return f"{bandwidth // 1000}kbps"
-    parts = resolution.split("x")
-    if len(parts) == 2:
-        try:
-            h = int(parts[1])
-            if h >= 1080:
-                return "1080p"
-            if h >= 720:
-                return "720p"
-            if h >= 480:
-                return "480p"
-            if h >= 360:
-                return "360p"
-            return f"{h}p"
-        except ValueError:
-            pass
-    return "Auto"
-
-
-def _variant_to_quality(variant: Tuple[str, int, str]) -> Quality:
-    url, bw, res = variant
-    label = _resolution_to_label(res, bw)
-    h = 0
-    if res and "x" in res:
-        try:
-            h = int(res.split("x")[1])
-        except ValueError:
-            pass
-    return Quality(
-        label=label,
-        bandwidth=bw,
-        resolution=res,
-        height=h,
-        url=url,
-        is_auto=False,
-    )
+# ═══════════════════════════════════════════════════════════
+#   Wrapper functions → imdbplay_downloader
+# ═══════════════════════════════════════════════════════════
 
 
 async def get_qualities(
@@ -115,10 +54,14 @@ async def get_qualities(
     episode: Optional[int] = None,
 ) -> List[dict]:
     """
-    گرفتن لیست کیفیت‌های موجود برای یه فیلم/قسمت.
+    گرفتن لیست کیفیت‌های موجود برای یه فیلم/قسمت از سرورهای imdbplay.tech.
 
-    NOTE: این تابع اکنون از imdbplay_downloader (سرورهای imdbplay.tech) استفاده می‌کند.
-    روش قدیمی vidsrcme که WASM و stream_urls encrypted داشت حذف شده.
+    سرورها به ترتیب اولویت امتحان می‌شن:
+      1. Vidzee (WASM decrypt)
+      2. Videasy (XOR cipher)
+      3. Vidking (XOR cipher)
+      4. 2Embed (vnest API)
+      5. GarageBand (vidsrcme + WASM)
 
     Returns:
         list of dicts:
@@ -145,22 +88,16 @@ async def get_qualities(
         return []
 
 
-# ─── Download with specific quality ─────────────────────────
-
-
 async def download_with_quality(
     imdb_id: str,
-    quality_label: str,        # "Auto", "1080p", "720p", ...
+    quality_label: str,
     out_dir: str,
     season: Optional[int] = None,
     episode: Optional[int] = None,
     progress_cb=None,
 ) -> Optional[str]:
     """
-    دانلود ویدیو با کیفیت مشخص.
-
-    NOTE: این تابع اکنون از imdbplay_downloader (سرورهای imdbplay.tech) استفاده می‌کند.
-    روش قدیمی vidsrcme که WASM و stream_urls encrypted داشت حذف شده.
+    دانلود ویدیو با کیفیت مشخص از سرورهای imdbplay.tech.
 
     quality_label="Auto" → بهترین کیفیت
     quality_label="720p" → کیفیت 720p (اگه نباشه، نزدیک‌ترین)
@@ -173,9 +110,6 @@ async def download_with_quality(
     except Exception as e:
         logger.error("download_with_quality via imdbplay failed: %s", e)
         raise
-
-
-# ─── Persian subtitle fetching (new, from imdbplay servers) ────
 
 
 async def get_persian_subtitle(
@@ -203,7 +137,32 @@ async def get_persian_subtitle(
         return None
 
 
-# ─── Subtitle fetching ──────────────────────────────────────
+async def get_server_info(
+    imdb_id: str,
+    season: Optional[int] = None,
+    episode: Optional[int] = None,
+) -> Optional[dict]:
+    """
+    گرفتن اطلاعات سرور فعال (نام، متد، نوع stream) بدون شروع دانلود.
+
+    Returns:
+        dict با فیلدهای:
+        - server: نام سرور (مثلاً "Vidzee")
+        - method: متد استخراج (مثلاً "WASM Decrypt")
+        - server_id: شناسه سرور (مثلاً "s2")
+        - stream_type: نوع stream ("hls" یا "mp4")
+    """
+    try:
+        from imdbplay_downloader import get_server_info as _new_get_info
+        return await _new_get_info(imdb_id, season=season, episode=episode)
+    except Exception as e:
+        logger.error("get_server_info via imdbplay failed: %s", e)
+        return None
+
+
+# ═══════════════════════════════════════════════════════════
+#   OpenSubtitles API (for non-Persian languages)
+# ═══════════════════════════════════════════════════════════
 
 
 _OS_HEADERS = {
@@ -211,22 +170,14 @@ _OS_HEADERS = {
     "Accept": "application/json",
 }
 
-_CACHE_URL = "https://cloudorchestranova.com/embed/iframe_player/cache.php"
-
-_CACHE_HEADERS = {
-    "User-Agent": _USER_AGENT,
-    "Accept": "*/*",
-    "Referer": "https://cloudorchestranova.com/",
-}
-
 
 @dataclass
 class Subtitle:
     """یه زیرنویس از OpenSubtitles"""
     file_name: str
-    language: str           # "Persian", "English", ...
-    language_code: str      # "per", "eng", ...
-    download_link: str      # gzip URL
+    language: str
+    language_code: str
+    download_link: str
     rating: float = 0.0
     downloads: int = 0
     file_id: str = ""
@@ -245,7 +196,7 @@ class Subtitle:
 
 async def search_subtitles(
     imdb_id: str,
-    lang: str = "per",
+    lang: str = "eng",
     season: Optional[int] = None,
     episode: Optional[int] = None,
 ) -> List[dict]:
@@ -254,14 +205,13 @@ async def search_subtitles(
 
     Args:
         imdb_id: tt33071426
-        lang: کد زبان (per=Persian, eng=English, ara=Arabic, ...)
+        lang: کد زبان (eng=English, ara=Arabic, ...) — برای فارسی از get_persian_subtitle استفاده کنید
         season, episode: برای سریال
 
     Returns:
         list of dicts با فیلدهای: file_name, language, language_code,
         download_link, rating, downloads, file_id
     """
-    # حذف "tt" prefix برای imdb_id
     imdb_num = imdb_id.replace("tt", "") if imdb_id.startswith("tt") else imdb_id
 
     if season and episode:
@@ -294,7 +244,6 @@ async def search_subtitles(
                     downloads=int(item.get("SubDownloadsCnt", 0) or 0),
                     file_id=file_id,
                 ))
-            # مرتب‌سازی بر اساس downloads نزولی
             subs.sort(key=lambda x: x.downloads, reverse=True)
             return [s.to_dict() for s in subs]
     except Exception as e:
@@ -308,8 +257,7 @@ async def download_subtitle(
     prefer_format: str = "vtt",
 ) -> Optional[str]:
     """
-    دانلود و تبدیل زیرنویس به VTT یا SRT.
-    از cache.php vidsrcme استفاده میکنه (proxy).
+    دانلود زیرنویس از OpenSubtitles (gzip) و تبدیل به VTT یا SRT.
 
     Args:
         sub: dict از search_subtitles
@@ -319,90 +267,41 @@ async def download_subtitle(
     Returns:
         path فایل زیرنویس ذخیره شده
     """
-    file_id = sub.get("file_id", "")
-    if not file_id:
-        logger.warning("no file_id in subtitle")
+    download_link = sub.get("download_link", "")
+    if not download_link:
+        logger.warning("no download_link in subtitle")
         return None
 
     os.makedirs(out_dir, exist_ok=True)
     file_name = sub.get("file_name", f"subtitle.{prefer_format}")
-    # تبدیل پسوند به فرمت درخواستی
     base_name = os.path.splitext(file_name)[0]
     out_path = os.path.join(out_dir, f"{base_name}.{prefer_format}")
 
     try:
         async with AsyncSession() as s:
-            # 1. اگه cached باشه
-            cache_get_url = f"{_CACHE_URL}?action=get&file_id={file_id}"
-            r = await s.get(cache_get_url, impersonate="chrome",
-                            headers=_CACHE_HEADERS, timeout=20)
-            if r.status_code == 200:
-                try:
-                    d = r.json()
-                    if d.get("success") and d.get("vtt_url"):
-                        vtt_url = d["vtt_url"]
-                        # download VTT
-                        r = await s.get(vtt_url, impersonate="chrome",
-                                        headers=_CACHE_HEADERS, timeout=20)
-                        if r.status_code == 200:
-                            with open(out_path, "wb") as f:
-                                f.write(r.content)
-                            logger.info("subtitle cached: %s", out_path)
-                            return out_path
-                except Exception:
-                    pass
-
-            # 2. download + cache
-            download_link = sub.get("download_link", "")
-            if not download_link:
-                return None
             r = await s.get(download_link, impersonate="chrome",
-                            headers=_CACHE_HEADERS, timeout=30)
+                            headers={"User-Agent": _USER_AGENT}, timeout=30)
             if r.status_code != 200:
                 logger.warning("subtitle download HTTP %d", r.status_code)
                 return None
 
-            # POST به cache.php برای تبدیل
-            cache_post_url = f"{_CACHE_URL}?action=cache_subtitle&file_id={file_id}&encoding=UTF-8"
-            r = await s.post(cache_post_url, impersonate="chrome",
-                             headers={**_CACHE_HEADERS, "Content-Type": "application/octet-stream"},
-                             data=r.content, timeout=30)
-            if r.status_code == 200:
-                try:
-                    d = r.json()
-                    if d.get("success") and d.get("vtt_url"):
-                        vtt_url = d["vtt_url"]
-                        r = await s.get(vtt_url, impersonate="chrome",
-                                        headers=_CACHE_HEADERS, timeout=20)
-                        if r.status_code == 200:
-                            with open(out_path, "wb") as f:
-                                f.write(r.content)
-                            logger.info("subtitle converted: %s", out_path)
-                            return out_path
-                except Exception as e:
-                    logger.warning("cache_subtitle parse: %s", e)
+            # OpenSubtitles gzip شده
+            try:
+                decompressed = gzip.decompress(r.content)
+                srt_text = decompressed.decode("utf-8", errors="replace")
+            except Exception as e:
+                logger.warning("gzip decompress failed: %s", e)
+                return None
 
-            # 3. fallback: خودمون gzip رو decode کنیم
-            r = await s.get(download_link, impersonate="chrome",
-                            headers=_CACHE_HEADERS, timeout=30)
-            if r.status_code == 200:
-                try:
-                    decompressed = gzip.decompress(r.content)
-                    srt_text = decompressed.decode("utf-8", errors="replace")
-                    # اگه srt خواستیم
-                    if prefer_format == "srt":
-                        with open(out_path, "w", encoding="utf-8") as f:
-                            f.write(srt_text)
-                    else:
-                        # تبدیل srt به vtt
-                        vtt_text = _srt_to_vtt(srt_text)
-                        with open(out_path, "w", encoding="utf-8") as f:
-                            f.write(vtt_text)
-                    logger.info("subtitle fallback: %s", out_path)
-                    return out_path
-                except Exception as e:
-                    logger.warning("fallback failed: %s", e)
-
+            if prefer_format == "srt":
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(srt_text)
+            else:
+                vtt_text = _srt_to_vtt(srt_text)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(vtt_text)
+            logger.info("subtitle saved: %s", out_path)
+            return out_path
     except Exception as e:
         logger.error("download_subtitle failed: %s", e)
 
@@ -414,22 +313,17 @@ def _srt_to_vtt(srt_text: str) -> str:
     lines = srt_text.replace("\r\n", "\n").split("\n")
     out = ["WEBVTT", ""]
     for line in lines:
-        # تبدیل timestamp‌ها از کاما به نقطه
         if "-->" in line:
             line = line.replace(",", ".")
-        # حذف شماره‌های بلوک (در VTT لازم نیست)
         if line.strip().isdigit():
             continue
         out.append(line)
     return "\n".join(out)
 
 
-# NOTE: تابع قدیمی get_persian_subtitle (که از OpenSubtitles استفاده می‌کرد) حذف شد.
-# تابع جدید در ابتدای همین فایل (از imdbplay_downloader) تعریف شده و از سرورهای
-# imdbplay.tech (Vidzee, 2Embed, Videasy) زیرنویس فارسی می‌گیره.
-
-
-# ─── Quick test ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+#   Quick test
+# ═══════════════════════════════════════════════════════════
 
 
 async def _test():
@@ -438,18 +332,11 @@ async def _test():
     print("=== Test get_qualities for tt33071426 ===")
     qs = await get_qualities("tt33071426")
     for q in qs:
-        print(f"  {q['label']}: res={q['resolution']} bw={q['bandwidth']}")
+        print(f"  {q['label']}: server={q.get('server', '')} res={q['resolution']}")
 
-    print("\n=== Test get_qualities for tt0903747 S01E01 ===")
-    qs = await get_qualities("tt0903747", season=1, episode=1)
-    for q in qs:
-        print(f"  {q['label']}: res={q['resolution']} bw={q['bandwidth']}")
-
-    print("\n=== Test subtitle search ===")
-    subs = await search_subtitles("tt33071426", "per")
-    print(f"Found {len(subs)} Persian subs")
-    for s in subs[:5]:
-        print(f"  {s['file_name']} | downloads={s['downloads']} | rating={s['rating']}")
+    print("\n=== Test get_persian_subtitle for tt33071426 ===")
+    sub = await get_persian_subtitle("tt33071426", out_dir="/tmp/sub_test")
+    print(f"  Subtitle: {sub}")
 
 
 if __name__ == "__main__":
