@@ -71,7 +71,7 @@ _searcher_imdb_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
 if _searcher_imdb_dir not in _sys.path:
     _sys.path.insert(0, _searcher_imdb_dir)
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
-from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle
+from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle, get_server_info
 from searcher.imdb.videotext_burn import burn_subtitles
 from ytdlp_handler import (
     is_ytdlp_site_url,
@@ -12864,7 +12864,19 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
         status_msg = await event.respond("📊 آماده‌سازی...")
 
         label = f"S{season:02d}E{episode:02d}" if season and episode else ""
-        await status_msg.edit(f"📥 دانلود {label} با کیفیت {quality}...", buttons=cancel_btn)
+        # Get server info before download to show in status
+        server_info_text = ""
+        server_info = None
+        try:
+            server_info = await get_server_info(imdb_id, season, episode)
+            if server_info:
+                srv_name = server_info.get("server", "Unknown")
+                srv_method = server_info.get("method", "Unknown")
+                srv_type = server_info.get("stream_type", "unknown").upper()
+                server_info_text = f"\n🖥 سرور: {srv_name} | 🔧 متد: {srv_method} | 📡 نوع: {srv_type}"
+        except Exception:
+            pass
+        await status_msg.edit(f"📥 دانلود {label} با کیفیت {quality}{server_info_text}", buttons=cancel_btn)
 
         sub_name = None
         if with_subtitle and state.get("selected_sub"):
@@ -12891,7 +12903,9 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
                     d, t = last_progress[0]
                     pct = d * 100 // t if t else 0
                     try:
-                        await status_msg.edit(f"📥 دانلود سگمنت: {d}/{t} ({pct}%)", buttons=cancel_btn)
+                        srv_short = server_info.get("server", "") if server_info else ""
+                        srv_text = f" [{srv_short}]" if srv_short else ""
+                        await status_msg.edit(f"📥 دانلود سگمنت: {d}/{t} ({pct}%){srv_text}", buttons=cancel_btn)
                     except Exception:
                         pass
 
