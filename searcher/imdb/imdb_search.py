@@ -256,7 +256,9 @@ async def get_title_info(imdb_id: str) -> Optional[dict]:
 
 async def get_tv_episodes(imdb_id: str) -> Optional[dict]:
     """
-    گرفتن لیست فصل/قسمت سریال از طریق vidsrcme (چون IMDB GraphQL بسته‌ست).
+    گرفتن لیست فصل/قسمت سریال.
+
+    ابتدا از vidsrcme API استفاده می‌کنه، اگه کار نکرد از TMDB API به‌عنوان fallback.
 
     Returns:
         dict با فیلدهای:
@@ -266,41 +268,95 @@ async def get_tv_episodes(imdb_id: str) -> Optional[dict]:
     if not imdb_id or not imdb_id.startswith("tt"):
         return None
 
-    api_url = f"https://data.vidsrcme.ru/api.php?type=tv&imdb={imdb_id}"
-    async with httpx.AsyncClient(timeout=20, headers=_HEADERS) as cli:
-        try:
-            r = await cli.get(api_url)
+    # ─── روش 1: vidsrcme API (با curl_cffi) ───
+    try:
+        from curl_cffi.requests import AsyncSession
+        api_url = f"https://data.vidsrcme.ru/api.php?type=tv&imdb={imdb_id}"
+        async with AsyncSession() as s:
+            r = await s.get(api_url, impersonate="chrome", timeout=20, headers=_HEADERS)
+            if r.status_code == 200:
+                d = r.json()
+                data = d.get("data", {})
+                eps_raw = data.get("eps", {})
+
+                seasons = {}
+                for s_str, ep_list in eps_raw.items():
+                    try:
+                        s_num = int(s_str)
+                        seasons[s_num] = [int(e) for e in ep_list if e.isdigit()]
+                    except (ValueError, TypeError):
+                        continue
+
+                if seasons:
+                    # مرتب‌سازی نزولی (جدیدترین فصل اول)
+                    seasons = dict(sorted(seasons.items(), key=lambda x: -x[0]))
+                    result = TvEpisodes(
+                        imdb_id=imdb_id,
+                        title=data.get("title", ""),
+                        seasons=seasons,
+                    )
+                    logger.info("get_tv_episodes %s (vidsrcme) -> %d seasons, %d eps",
+                                imdb_id, result.total_seasons, result.total_episodes)
+                    return result.to_dict()
+            else:
+                logger.warning("get_tv_episodes vidsrcme HTTP %d", r.status_code)
+    except Exception as e:
+        logger.warning("get_tv_episodes vidsrcme failed: %s", e)
+
+    # ─── روش 2: TMDB API (fallback) ───
+    try:
+        from curl_cffi.requests import AsyncSession
+        _TMDB_KEY = "adc48d20c0956934fb224de5c40bb85d"
+
+        # اول imdb_id → tmdb_id
+        find_url = f"https://api.themoviedb.org/3/find/{imdb_id}?api_key={_TMDB_KEY}&external_source=imdb_id"
+        async with AsyncSession() as s:
+            r = await s.get(find_url, impersonate="chrome", timeout=15, headers=_HEADERS)
             if r.status_code != 200:
-                logger.warning("get_tv_episodes HTTP %d", r.status_code)
+                logger.warning("get_tv_episodes TMDB find HTTP %d", r.status_code)
                 return None
-            d = r.json()
-            data = d.get("data", {})
-            eps_raw = data.get("eps", {})
+            find_data = r.json()
+            tv_results = find_data.get("tv_results", [])
+            if not tv_results:
+                logger.warning("get_tv_episodes TMDB: no TV results for %s", imdb_id)
+                return None
 
-            # parse seasons: {"1": ["1","2",...], "2": [...]}
+            tmdb_id = str(tv_results[0].get("id", ""))
+            show_title = tv_results[0].get("name", "")
+
+            # گرفتن اطلاعات فصل‌ها
+            show_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={_TMDB_KEY}"
+            r2 = await s.get(show_url, impersonate="chrome", timeout=15, headers=_HEADERS)
+            if r2.status_code != 200:
+                logger.warning("get_tv_episodes TMDB show HTTP %d", r2.status_code)
+                return None
+
+            show_data = r2.json()
+            seasons_data = show_data.get("seasons", [])
+
             seasons = {}
-            for s_str, ep_list in eps_raw.items():
-                try:
-                    s_num = int(s_str)
-                    seasons[s_num] = [int(e) for e in ep_list if e.isdigit()]
-                except (ValueError, TypeError):
-                    continue
+            for season in seasons_data:
+                s_num = season.get("season_number", 0)
+                ep_count = season.get("episode_count", 0)
+                if s_num > 0 and ep_count > 0:  # رد کردن Season 0 (Specials)
+                    seasons[s_num] = list(range(1, ep_count + 1))
 
-            # مرتب‌سازی نزولی (جدیدترین فصل اول)
-            seasons = dict(sorted(seasons.items(), key=lambda x: -x[0]))
+            if seasons:
+                seasons = dict(sorted(seasons.items(), key=lambda x: -x[0]))
+                result = TvEpisodes(
+                    imdb_id=imdb_id,
+                    title=show_title,
+                    seasons=seasons,
+                )
+                logger.info("get_tv_episodes %s (TMDB) -> %d seasons, %d eps",
+                            imdb_id, result.total_seasons, result.total_episodes)
+                return result.to_dict()
 
-            result = TvEpisodes(
-                imdb_id=imdb_id,
-                title=data.get("title", ""),
-                seasons=seasons,
-            )
-            logger.info("get_tv_episodes %s -> %d seasons, %d eps",
-                        imdb_id, result.total_seasons, result.total_episodes)
-            return result.to_dict()
-
-        except Exception as e:
-            logger.warning("get_tv_episodes failed: %s", e)
+            logger.warning("get_tv_episodes TMDB: no seasons found for %s", imdb_id)
             return None
+    except Exception as e:
+        logger.warning("get_tv_episodes TMDB failed: %s", e)
+        return None
 
 
 # ─── Quick test ─────────────────────────────────────────────
