@@ -1403,7 +1403,7 @@ async def download_with_quality(
     # download segments in parallel — با session مشترک و retries بیشتر
     seg_paths = [None] * total
     init_path = None
-    sem = asyncio.Semaphore(6)  # 6 concurrent downloads
+    sem = asyncio.Semaphore(10)  # 10 concurrent downloads (افزایش سرعت)
 
     async with AsyncSession() as shared_session:
         # اگه init segment وجود داره (fMP4)، اول اون رو دانلود کن
@@ -1424,7 +1424,7 @@ async def download_with_quality(
                         break
                     elif r.status_code in (401, 429, 503):
                         logger.warning("init download HTTP %d (attempt %d)", r.status_code, attempt + 1)
-                        await asyncio.sleep(2 * (attempt + 1))
+                        await asyncio.sleep(0.5 * (attempt + 1))
                     else:
                         await asyncio.sleep(0.5 * (attempt + 1))
                 except Exception as e:
@@ -1444,7 +1444,7 @@ async def download_with_quality(
                     try:
                         r = await shared_session.get(
                             abs_url, impersonate=_BROWSER_IMPERSONATE,
-                            timeout=90, headers=headers,
+                            timeout=60, headers=headers,
                         )
                         if r.status_code == 200 and r.content:
                             data = r.content
@@ -1466,7 +1466,7 @@ async def download_with_quality(
                                     pass
                             return
                         elif r.status_code in (429, 503):
-                            await asyncio.sleep(2 * (attempt + 1))
+                            await asyncio.sleep(0.5 * (attempt + 1))
                         else:
                             await asyncio.sleep(0.5 * (attempt + 1))
                     except Exception as e:

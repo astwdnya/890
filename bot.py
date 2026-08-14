@@ -13424,33 +13424,33 @@ async def xnxx_inline_handler(event):
             inner = raw[5:].strip()
         else:
             # بدون پیشوند — استفاده از سرچر دیفالت کاربر
-            default_src = get_user_default_search(event.sender_id)
-            inner = raw  # اصل query بدون پیشوند
-            # شبیه‌سازی پیشوند برای مسیریابی
-            if default_src == "ph":
-                is_ph = True
+            # بررسی آیا کاربر سرور ایرانی انتخاب کرده
+            iran_srv = user_iran_server.get(event.sender_id)
+            if iran_srv and iran_srv in ("doostihaa", "farsiland"):
+                is_iran = True
                 inner = raw
-                parsed = parse_inline_query(inner)
-                ph_sort = PH_SORT_MAP.get(parsed["sort"], "")
-            elif default_src == "xv":
-                is_xv = True
-                inner = raw
-                parsed = parse_inline_query(inner)
-            elif default_src == "ep":
-                is_ep = True
-                inner = raw
-                parsed = parse_inline_query(inner)
-            elif default_src == "imd":
-                is_imd = True
-                inner = raw
-            elif default_src == "wh":
-                is_wh = True
-                inner = raw
-                parsed = parse_wh_inline_query(inner)
-            else:  # "xn"
-                is_xn = True
-                inner = raw
-                parsed = parse_inline_query(inner)
+            else:
+                default_src = get_user_default_search(event.sender_id)
+                inner = raw  # اصل query بدون پیشوند
+                # شبیه‌سازی پیشوند برای مسیریابی
+                if default_src == "ph":
+                    is_ph = True
+                    parsed = parse_inline_query(inner)
+                    ph_sort = PH_SORT_MAP.get(parsed["sort"], "")
+                elif default_src == "xv":
+                    is_xv = True
+                    parsed = parse_inline_query(inner)
+                elif default_src == "ep":
+                    is_ep = True
+                    parsed = parse_inline_query(inner)
+                elif default_src == "imd":
+                    is_imd = True
+                elif default_src == "wh":
+                    is_wh = True
+                    parsed = parse_wh_inline_query(inner)
+                else:  # "xn"
+                    is_xn = True
+                    parsed = parse_inline_query(inner)
 
         if is_imd:
             query = inner
@@ -13656,7 +13656,7 @@ async def xnxx_inline_handler(event):
                 is_series = item.get("is_series", False)
                 type_icon = "\U0001F4FA" if is_series else "\U0001F3AC"
                 display_title = f"{type_icon} {title}"
-                desc = "\U0001F4C0 \u062F\u0648\u0633\u062A\u06CC\u200C\u0647\u0627"
+                desc = "\U0001F4C0 \u062F\u0648\u0633\u062A\u06CC\u200C\u0647\u0627 | \U0001F310 \u062F\u0648\u0633\u062A\u06CC\u200C\u0647\u0627"
                 message_text = f"\U0001F3AC **{title}**\n\n\U0001F510 {url}"
                 buttons = [[Button.inline("\U0001F4E5 \u062F\u0627\u0646\u0644\u0648\u062F", f"irn_sel_{post_id}")]]
                 try:
