@@ -12600,9 +12600,19 @@ def _imdb_sub_buttons(subs: list, is_episode: bool) -> list:
         for i, s in enumerate(subs[:5]):
             label = f"📄 {s['file_name'][:40]} (↓{s['downloads']})"
             buttons.append([Button.inline(label, f"imd_esub_{i}" if is_episode else f"imd_sub_{i}")])
-    # همیشه گزینه imdbplay (softsub) و بدون زیرنویس
-    buttons.append([Button.inline("🎬 با زیرنویس imdbplay (softsub)", "imd_withsub")])
+    # اگه زیرنویس از OpenSubtitles پیدا نشد، گزینه imdbplay رو نشون بده
+    if not subs:
+        buttons.append([Button.inline("🎬 با زیرنویس imdbplay (softsub)", "imd_withsub")])
     buttons.append([Button.inline("⏭ بدون زیرنویس", "imd_enosub" if is_episode else "imd_nosub")])
+    buttons.append([Button.inline("🚫 بستن", "imd_close")])
+    return buttons
+
+
+def _imdb_delivery_buttons(is_episode: bool) -> list:
+    """دکمه‌های انتخاب نحوه ارسال زیرنویس — بعد از انتخاب زیرنویس"""
+    buttons = []
+    buttons.append([Button.inline("🎬 softsub (تو ویدیو)", "imd_softsub")])
+    buttons.append([Button.inline("📄 فایل جداگانه", "imd_sepsub")])
     buttons.append([Button.inline("🚫 بستن", "imd_close")])
     return buttons
 
@@ -12812,7 +12822,7 @@ async def imdb_cb_equality(event):
 
 
 async def imdb_cb_sub(event):
-    """Handler for subtitle selection — either specific sub from OpenSubtitles or imdbplay softsub"""
+    """Handler for subtitle selection — show delivery options after selecting a subtitle"""
     data = event.data.decode()
     user_id = event.sender_id
     state = imdb_states.get(user_id)
@@ -12825,20 +12835,32 @@ async def imdb_cb_sub(event):
         state["use_imdbplay_sub"] = True
         await event.answer("✅ شروع دانلود با softsub...", alert=False)
         asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
+    elif data == "imd_softsub":
+        # User chose softsub delivery for previously selected subtitle
+        await event.answer("✅ شروع دانلود با softsub...", alert=False)
+        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True, softsub=True))
+    elif data == "imd_sepsub":
+        # User chose separate file delivery for previously selected subtitle
+        await event.answer("✅ شروع دانلود...", alert=False)
+        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True, softsub=False))
     else:
-        # Specific subtitle from OpenSubtitles
+        # Specific subtitle from OpenSubtitles — show delivery options
         sub_idx = int(data.replace("imd_sub_", ""))
         if sub_idx >= len(state.get("subs", [])):
             await event.answer("زیرنویس نامعتبر", alert=True)
             return
         state["selected_sub"] = state["subs"][sub_idx]
         state["use_imdbplay_sub"] = False
-        await event.answer(f"✅ زیرنویس: {state['selected_sub'].get('file_name', '')[:30]}", alert=False)
-        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
+        sub_name = state["subs"][sub_idx].get("file_name", "")[:40]
+        await event.edit(
+            f"✅ زیرنویس انتخاب شد: **{sub_name}**\n\n📄 نحوه ارسال رو انتخاب کن:",
+            buttons=_imdb_delivery_buttons(is_episode=False),
+            parse_mode="md",
+        )
 
 
 async def imdb_cb_esub(event):
-    """Handler for subtitle selection (episode) — either specific sub or imdbplay softsub"""
+    """Handler for subtitle selection (episode) — show delivery options after selecting"""
     data = event.data.decode()
     user_id = event.sender_id
     state = imdb_states.get(user_id)
@@ -12850,6 +12872,12 @@ async def imdb_cb_esub(event):
         state["use_imdbplay_sub"] = True
         await event.answer("✅ شروع دانلود با softsub...", alert=False)
         asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
+    elif data == "imd_softsub":
+        await event.answer("✅ شروع دانلود با softsub...", alert=False)
+        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True, softsub=True))
+    elif data == "imd_sepsub":
+        await event.answer("✅ شروع دانلود...", alert=False)
+        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True, softsub=False))
     else:
         sub_idx = int(data.replace("imd_esub_", ""))
         if sub_idx >= len(state.get("subs", [])):
@@ -12857,8 +12885,12 @@ async def imdb_cb_esub(event):
             return
         state["selected_sub"] = state["subs"][sub_idx]
         state["use_imdbplay_sub"] = False
-        await event.answer(f"✅ زیرنویس: {state['selected_sub'].get('file_name', '')[:30]}", alert=False)
-        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
+        sub_name = state["subs"][sub_idx].get("file_name", "")[:40]
+        await event.edit(
+            f"✅ زیرنویس انتخاب شد: **{sub_name}**\n\n📄 نحوه ارسال رو انتخاب کن:",
+            buttons=_imdb_delivery_buttons(is_episode=True),
+            parse_mode="md",
+        )
 
 
 async def imdb_cb_nosub(event):
@@ -12895,7 +12927,7 @@ async def _imdb_download_cover(url: str, out_dir: str) -> Optional[str]:
     return None
 
 
-async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
+async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub: bool = None):
     state = imdb_states.get(user_id)
     if not state:
         await event.answer("وضعیت شما منقضی شده.", alert=True)
@@ -13019,14 +13051,22 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
         final_path = video_path
         persian_sub_path = None
 
-        if with_subtitle:
-            # User chose "with subtitle" — embed subtitle as softsub in the video
+        # Determine if we should do softsub or separate subtitle file
+        # softsub=True → embed subtitle in video and send as document
+        # softsub=False → send video as streaming + subtitle as separate file
+        # softsub=None → default: if with_subtitle and imdbplay → softsub, else separate
+        if softsub is None:
+            softsub = with_subtitle and state.get("use_imdbplay_sub", False)
+
+        do_softsub = with_subtitle and softsub
+        do_separate_sub = with_subtitle and not softsub
+
+        if do_softsub:
+            # Embed subtitle as softsub in the video
             try:
-                # If user selected a specific subtitle from OpenSubtitles, use that
-                # Otherwise, fetch from imdbplay
                 if sub_path and os.path.exists(sub_path):
                     persian_sub_path = sub_path
-                else:
+                elif state.get("use_imdbplay_sub"):
                     sub_out_dir = os.path.join(IMDB_OUTPUT_FOLDER, f"sub_{user_id}_{int(time.time())}")
                     os.makedirs(sub_out_dir, exist_ok=True)
                     try:
@@ -13039,6 +13079,9 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
                         episode=episode,
                         out_dir=sub_out_dir,
                     )
+                else:
+                    persian_sub_path = sub_path
+
                 if persian_sub_path and os.path.exists(persian_sub_path):
                     try:
                         await status_msg.edit("📝 در حال جاسازی زیرنویس درون ویدیو (softsub)...")
@@ -13059,6 +13102,7 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
                             await status_msg.edit("⚠ جاسازی نشد، ویدیو بدون زیرنویس ارسال می‌شه")
                         except Exception:
                             pass
+                        do_separate_sub = True  # fallback to separate
                 else:
                     logger.info(f"[IMDB] No Persian subtitle found for {imdb_id}")
                     try:
@@ -13067,6 +13111,7 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
                         pass
             except Exception as sub_err:
                 logger.warning(f"[IMDB] Persian subtitle fetch/embed failed: {sub_err}", exc_info=True)
+                do_separate_sub = True  # fallback
 
         file_size = os.path.getsize(final_path)
         size_mb = file_size / 1024 / 1024
@@ -13088,53 +13133,69 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
             caption=caption,
             status_msg=status_msg,
             buttons=None,
-            supports_streaming=not with_subtitle,
+            supports_streaming=not do_softsub,
             thumb_filepath=cover_path,
             ul_id=f"imd_ul_{dl_id}",
-            force_document=with_subtitle,
+            force_document=do_softsub,
         )
         active_downloads.pop(dl_id, None)
 
-        # If user chose "without subtitle", also send the Persian subtitle as a separate file
-        if not with_subtitle:
-            persian_sub_path = None
-            try:
-                sub_out_dir = os.path.join(IMDB_OUTPUT_FOLDER, f"sub_{user_id}_{int(time.time())}")
-                os.makedirs(sub_out_dir, exist_ok=True)
-                try:
-                    await status_msg.edit("💬 در حال جستجوی زیرنویس فارسی...")
-                except Exception:
-                    pass
-                persian_sub_path = await get_persian_subtitle(
-                    imdb_id,
-                    season=season,
-                    episode=episode,
-                    out_dir=sub_out_dir,
-                )
-                if persian_sub_path and os.path.exists(persian_sub_path):
-                    sub_size_kb = os.path.getsize(persian_sub_path) / 1024
-                    if season and episode:
-                        sub_caption = f"📄 زیرنویس فارسی | **{title}** - S{season:02d}E{episode:02d}\n\n📀 از سرورهای imdbplay"
-                    else:
-                        sub_caption = f"📄 زیرنویس فارسی | **{title}**\n\n📀 از سرورهای imdbplay"
-                    await event.client.send_file(
-                        entity=event.chat_id,
-                        file=persian_sub_path,
-                        caption=sub_caption,
-                        parse_mode="md",
-                        force_document=True,
-                    )
-                    logger.info(f"[IMDB] Persian subtitle sent: {persian_sub_path} ({sub_size_kb:.1f} KB)")
+        # If separate subtitle (not softsub), send subtitle file after video
+        if do_separate_sub:
+            if persian_sub_path and os.path.exists(persian_sub_path):
+                # Already downloaded — just send it
+                sub_size_kb = os.path.getsize(persian_sub_path) / 1024
+                if season and episode:
+                    sub_caption = f"📄 زیرنویس فارسی | **{title}** - S{season:02d}E{episode:02d}"
                 else:
-                    logger.info(f"[IMDB] No Persian subtitle found for {imdb_id}")
-            except Exception as sub_err:
-                logger.warning(f"[IMDB] Persian subtitle fetch/send failed: {sub_err}", exc_info=True)
-            finally:
-                if persian_sub_path and os.path.exists(persian_sub_path):
+                    sub_caption = f"📄 زیرنویس فارسی | **{title}**"
+                await event.client.send_file(
+                    entity=event.chat_id,
+                    file=persian_sub_path,
+                    caption=sub_caption,
+                    parse_mode="md",
+                    force_document=True,
+                )
+                logger.info(f"[IMDB] Subtitle sent separately: {persian_sub_path} ({sub_size_kb:.1f} KB)")
+            elif not with_subtitle:
+                # No subtitle selected — try imdbplay
+                try:
+                    sub_out_dir = os.path.join(IMDB_OUTPUT_FOLDER, f"sub_{user_id}_{int(time.time())}")
+                    os.makedirs(sub_out_dir, exist_ok=True)
                     try:
-                        os.unlink(persian_sub_path)
+                        await status_msg.edit("💬 در حال جستجوی زیرنویس فارسی...")
                     except Exception:
                         pass
+                    persian_sub_path = await get_persian_subtitle(
+                        imdb_id,
+                        season=season,
+                        episode=episode,
+                        out_dir=sub_out_dir,
+                    )
+                    if persian_sub_path and os.path.exists(persian_sub_path):
+                        sub_size_kb = os.path.getsize(persian_sub_path) / 1024
+                        if season and episode:
+                            sub_caption = f"📄 زیرنویس فارسی | **{title}** - S{season:02d}E{episode:02d}\n\n📀 از سرورهای imdbplay"
+                        else:
+                            sub_caption = f"📄 زیرنویس فارسی | **{title}**\n\n📀 از سرورهای imdbplay"
+                        await event.client.send_file(
+                            entity=event.chat_id,
+                            file=persian_sub_path,
+                            caption=sub_caption,
+                            parse_mode="md",
+                            force_document=True,
+                        )
+                        logger.info(f"[IMDB] Persian subtitle sent: {persian_sub_path} ({sub_size_kb:.1f} KB)")
+                    else:
+                        logger.info(f"[IMDB] No Persian subtitle found for {imdb_id}")
+                except Exception as sub_err:
+                    logger.warning(f"[IMDB] Persian subtitle fetch/send failed: {sub_err}", exc_info=True)
+                finally:
+                    if persian_sub_path and os.path.exists(persian_sub_path):
+                        try:
+                            os.unlink(persian_sub_path)
+                        except Exception:
+                            pass
         # End Persian subtitle section
 
     except asyncio.CancelledError:
@@ -18160,6 +18221,8 @@ async def main():
     client.add_event_handler(imdb_cb_sub, events.CallbackQuery(pattern=r"imd_sub_"))
     client.add_event_handler(imdb_cb_esub, events.CallbackQuery(pattern=r"imd_esub_"))
     client.add_event_handler(imdb_cb_sub, events.CallbackQuery(pattern=r"imd_withsub$"))
+    client.add_event_handler(imdb_cb_sub, events.CallbackQuery(pattern=r"imd_softsub$"))
+    client.add_event_handler(imdb_cb_sub, events.CallbackQuery(pattern=r"imd_sepsub$"))
     client.add_event_handler(imdb_cb_nosub, events.CallbackQuery(pattern=r"imd_nosub$"))
     client.add_event_handler(imdb_cb_enosub, events.CallbackQuery(pattern=r"imd_enosub$"))
 
