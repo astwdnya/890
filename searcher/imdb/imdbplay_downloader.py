@@ -563,9 +563,8 @@ async def _2embed_get_stream(tmdb_id: str, imdb_id: str, season: Optional[int], 
                 api_url = f"https://new.vidnest.fun/{provider}/{media_type}/{tmdb_id}"
 
             async with AsyncSession() as s:
-                # Note: urllib works but curl_cffi may trigger CF 403 on some domains
-                # Use plain httpx via curl_cffi but with explicit headers
-                r = await s.get(api_url, timeout=15,
+                # Use impersonate="chrome" to bypass Cloudflare and rate limits
+                r = await s.get(api_url, impersonate=_BROWSER_IMPERSONATE, timeout=15,
                                 headers={"User-Agent": _USER_AGENT,
                                          "Referer": "https://cineby.hair/",
                                          "Origin": "https://cineby.hair",
@@ -1252,30 +1251,64 @@ async def download_with_quality(
     if stream_type == "mp4":
         logger.info("Downloading MP4 directly from %s", stream.get("server", ""))
         out_path = os.path.join(out_dir, f"{int(time.time())}.mp4")
+        mp4_failed = False
         try:
             async with AsyncSession() as s:
                 # برای MP4، دانلود با chunked
                 r = await s.get(m3u8_url, impersonate=_BROWSER_IMPERSONATE, timeout=600,
                                 headers=headers, stream=True)
                 if r.status_code != 200:
-                    raise RuntimeError(f"MP4 fetch HTTP {r.status_code}")
-                total = int(r.headers.get("content-length", 0))
-                done = 0
-                with open(out_path, "wb") as f:
-                    async for chunk in r.aiter_content(chunk_size=1024 * 256):
-                        f.write(chunk)
-                        done += len(chunk)
-                        if progress_cb:
-                            try:
-                                progress_cb(done, total)
-                            except Exception:
-                                pass
-            logger.info("Download complete: %s (%.1f MB)",
-                        out_path, os.path.getsize(out_path) / 1024 / 1024)
-            return out_path
+                    # اگه 429 (rate limited) یا 5xx، به HLS fallback کن
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        logger.warning("MP4 fetch HTTP %d — falling back to HLS server", r.status_code)
+                        mp4_failed = True
+                    else:
+                        raise RuntimeError(f"MP4 fetch HTTP {r.status_code}")
+                else:
+                    total = int(r.headers.get("content-length", 0))
+                    done = 0
+                    with open(out_path, "wb") as f:
+                        async for chunk in r.aiter_content(chunk_size=1024 * 256):
+                            f.write(chunk)
+                            done += len(chunk)
+                            if progress_cb:
+                                try:
+                                    progress_cb(done, total)
+                                except Exception:
+                                    pass
+                    logger.info("Download complete: %s (%.1f MB)",
+                                out_path, os.path.getsize(out_path) / 1024 / 1024)
+                    return out_path
         except Exception as e:
             logger.error("MP4 download failed: %s", e)
-            raise RuntimeError(f"MP4 download failed: {e}")
+            mp4_failed = True
+
+        # اگه MP4 fail شد (429 یا خطا)، fallback به سرور HLS
+        if mp4_failed:
+            logger.info("Falling back to HLS server (skipping MP4-only servers)...")
+            # سرورها رو دوباره امتحان کن، ولی فقط HLS ها رو
+            for server in _SERVERS:
+                if server["name"] == stream.get("server"):
+                    continue  # همین سرور رو رد کن
+                try:
+                    logger.info("[IMDBPlay] Fallback: trying server %s (HLS)...", server["name"])
+                    fallback_stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+                    if not fallback_stream or not fallback_stream.get("url"):
+                        continue
+                    # فقط HLS رو بپذیر (نه MP4)
+                    if fallback_stream.get("type", "hls") != "hls":
+                        continue
+                    logger.info("[IMDBPlay] ✓ Fallback to %s (HLS)", server["name"])
+                    stream = fallback_stream
+                    m3u8_url = stream["url"]
+                    headers = {"User-Agent": _USER_AGENT}
+                    headers.update(stream.get("headers", {}))
+                    break
+                except Exception as e:
+                    logger.warning("[IMDBPlay] Fallback server %s failed: %s", server["name"], e)
+                    continue
+            else:
+                raise RuntimeError("MP4 download failed and no HLS fallback available")
 
     # برای HLS، fetch m3u8
     try:
