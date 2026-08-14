@@ -66,14 +66,15 @@ async def search_doostihaa(query: str, limit: int = 20) -> List[dict]:
         return []
 
     query = query.strip()
-    search_url = f"{_BASE_URL}/wp-json/wp/v2/posts?search={quote_plus(query)}&per_page={min(limit, 100)}"
+    # فقط 5 پست برای سرعت بیشتر — تلگرام query رو بعد از ~10s منقضی می‌کنه
+    search_url = f"{_BASE_URL}/wp-json/wp/v2/posts?search={quote_plus(query)}&per_page=5"
 
     try:
         async with AsyncSession() as s:
             r = await s.get(
                 search_url,
                 impersonate="chrome",
-                timeout=30,
+                timeout=8,  # timeout کوتاه برای جلوگیری از منقضی شدن query تلگرام
                 headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
             )
             if r.status_code != 200:
@@ -101,20 +102,12 @@ async def search_doostihaa(query: str, limit: int = 20) -> List[dict]:
                 if not dl_links:
                     continue
 
-                # Get featured image from _links
-                featured_media = post.get("_links", {}).get("wp:featuredmedia", [])
+                # Get featured image from _embedded (بدون درخواست جداگانه)
                 img = ""
-                if featured_media:
-                    # We need to fetch the media URL separately
-                    media_url = featured_media[0].get("href", "")
-                    if media_url:
-                        try:
-                            r2 = await s.get(media_url, impersonate="chrome", timeout=10,
-                                             headers={"User-Agent": _USER_AGENT, "Accept": "application/json"})
-                            if r2.status_code == 200:
-                                img = r2.json().get("source_url", "")
-                        except Exception:
-                            pass
+                embedded = post.get("_embedded", {})
+                featured_media = embedded.get("wp:featuredmedia", [])
+                if featured_media and isinstance(featured_media, list) and len(featured_media) > 0:
+                    img = featured_media[0].get("source_url", "")
 
                 # Also try to find image in content
                 if not img:

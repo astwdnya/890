@@ -13646,7 +13646,7 @@ async def xnxx_inline_handler(event):
             logger.info(f"[INLINE] IRAN: q='{query}'")
             # Use doostihaa search
             from searcher.iranserver.doostihaa_search import search_doostihaa
-            results = await search_doostihaa(query, limit=INLINE_RESULTS_LIMIT)
+            results = await search_doostihaa(query, limit=10)  # محدود کردن نتایج برای سرعت بیشتر
             if not results:
                 await event.answer([], cache_time=30)
                 return
@@ -13672,7 +13672,10 @@ async def xnxx_inline_handler(event):
                         iran_results.append(builder.article(title=display_title, description=desc, text=message_text, buttons=buttons, parse_mode="md", link_preview=False))
                 except Exception:
                     iran_results.append(builder.article(title=display_title, description=desc, text=message_text, buttons=buttons, parse_mode="md", link_preview=False))
-            await event.answer(iran_results, cache_time=30)
+            try:
+                await event.answer(iran_results, cache_time=30)
+            except Exception as ans_err:
+                logger.warning(f"[INLINE] IRAN answer error: {ans_err}")
             logger.info(f"[INLINE] IRAN: {len(iran_results)} results for '{query}'")
             return
 
