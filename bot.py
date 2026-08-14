@@ -2558,6 +2558,21 @@ async def send_file_with_progress(
                 thumb=thumb_input,
                 force_file=False,
             )
+        elif is_video and force_document:
+            # Send as plain document (no streaming, no video player)
+            # This preserves softsub subtitles inside the file
+            attributes, mime_type = utils.get_attributes(filepath)
+            thumb_input = None
+            if thumb_path and os.path.exists(thumb_path):
+                with open(thumb_path, "rb") as tf:
+                    thumb_input = await fast_upload_file(client, tf)
+            media = InputMediaUploadedDocument(
+                file=uploaded,
+                mime_type=mime_type,
+                attributes=attributes,
+                thumb=thumb_input,
+                force_file=True,
+            )
         elif is_audio:
             audio_dur = int(duration) if duration and duration > 0 else 0
             attributes, mime_type = utils.get_attributes(
