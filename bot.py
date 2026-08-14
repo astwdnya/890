@@ -5033,6 +5033,11 @@ async def generic_url_handler(event):
     target_url = urls[0]
     target_url = _normalize_subdomain(target_url)
 
+    # Skip IMDb URLs — these come from inline search results and should not be downloaded
+    if "imdb.com" in target_url or "imdbplay.tech" in target_url:
+        processing_messages.discard(msg_id)
+        return
+
     if (
         YOUTUBE_RE.match(target_url)
         or "youtube.com" in target_url
@@ -13020,39 +13025,51 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
 
         # Send Persian subtitle as a separate file after video
         # Auto-fetches Persian subtitle from imdbplay servers (Vidzee, 2Embed, Videasy)
+        persian_sub_path = None
         try:
-            await status_msg.edit("\U0001F4AC \u062F\u0631 \u062D\u0627\u0644 \u062C\u0633\u062A\u062C\u0648\u06CC \u0632\u06CC\u0631\u0646\u0648\u06CC\u0633 \u0641\u0627\u0631\u0633\u06CC...")
+            # Create a separate dir for subtitle to avoid cleanup issues
+            sub_out_dir = os.path.join(IMDB_OUTPUT_FOLDER, f"sub_{user_id}_{int(time.time())}")
+            os.makedirs(sub_out_dir, exist_ok=True)
+            try:
+                await status_msg.edit("💬 در حال جستجوی زیرنویس فارسی...")
+            except Exception:
+                pass
             persian_sub_path = await get_persian_subtitle(
                 imdb_id,
                 season=season,
                 episode=episode,
-                out_dir=out_dir,
+                out_dir=sub_out_dir,
             )
             if persian_sub_path and os.path.exists(persian_sub_path):
                 sub_size_kb = os.path.getsize(persian_sub_path) / 1024
                 if season and episode:
-                    sub_caption = f"\U0001F4C4 \u0632\u06CC\u0631\u0646\u0648\u06CC\u0633 \u0641\u0627\u0631\u0633\u06CC | **{title}** - S{season:02d}E{episode:02d}\n\n\U0001F4C0 \u0627\u0632 \u0633\u0631\u0648\u0631\u0647\u0627\u06CC imdbplay"
+                    sub_caption = f"📄 زیرنویس فارسی | **{title}** - S{season:02d}E{episode:02d}\n\n📀 از سرورهای imdbplay"
                 else:
-                    sub_caption = f"\U0001F4C4 \u0632\u06CC\u0631\u0646\u0648\u06CC\u0633 \u0641\u0627\u0631\u0633\u06CC | **{title}**\n\n\U0001F4C0 \u0627\u0632 \u0633\u0631\u0648\u0631\u0647\u0627\u06CC imdbplay"
-                await event.respond(
+                    sub_caption = f"📄 زیرنویس فارسی | **{title}**\n\n📀 از سرورهای imdbplay"
+                # Use event.client.send_file for reliable sending
+                await event.client.send_file(
+                    entity=event.chat_id,
                     file=persian_sub_path,
                     caption=sub_caption,
                     parse_mode="md",
                     force_document=True,
                 )
                 logger.info(f"[IMDB] Persian subtitle sent: {persian_sub_path} ({sub_size_kb:.1f} KB)")
-                try:
-                    os.unlink(persian_sub_path)
-                except Exception:
-                    pass
             else:
                 logger.info(f"[IMDB] No Persian subtitle found for {imdb_id}")
                 try:
-                    await status_msg.edit("\u2705 \u0648\u06CC\u062F\u06CC\u0648 \u0627\u0631\u0633\u0627\u0644 \u0634\u062F\n\n\u26A0 \u0632\u06CC\u0631\u0646\u0648\u06CC\u0633 \u0641\u0627\u0631\u0633\u06CC \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F")
+                    await status_msg.edit("✅ ویدیو ارسال شد\n\n⚠ زیرنویس فارسی پیدا نشد")
                 except Exception:
                     pass
         except Exception as sub_err:
             logger.warning(f"[IMDB] Persian subtitle fetch/send failed: {sub_err}", exc_info=True)
+        finally:
+            # Cleanup subtitle file
+            if persian_sub_path and os.path.exists(persian_sub_path):
+                try:
+                    os.unlink(persian_sub_path)
+                except Exception:
+                    pass
         # End Persian subtitle section
 
     except asyncio.CancelledError:
@@ -13244,9 +13261,33 @@ async def xnxx_inline_handler(event):
                 cover = item.get("cover") or ""
                 is_series = item.get("is_series", False)
 
-                description = " · ".join(
-                    [p for p in (str(year) if year else "", kind, stars) if p]
-                ) or "—"
+                # Build description with year, kind, stars
+                desc_parts = []
+                if year:
+                    desc_parts.append(f"📅 {year}")
+                if kind:
+                    kind_label = kind
+                    if kind == "feature":
+                        kind_label = "🎬 فیلم"
+                    elif kind == "TV series":
+                        kind_label = "📺 سریال"
+                    elif kind == "TV movie":
+                        kind_label = "🎬 TV Movie"
+                    elif kind == "TV mini-series":
+                        kind_label = "📺 مینی‌سریال"
+                    elif kind == "short":
+                        kind_label = "🎬 کوتاه"
+                    desc_parts.append(kind_label)
+                if stars:
+                    stars_short = stars[:60] + "..." if len(stars) > 60 else stars
+                    desc_parts.append(f"👥 {stars_short}")
+                description = " | ".join(desc_parts) or "—"
+
+                # Build display title with year and type indicator
+                type_icon = "📺" if is_series else "🎬"
+                display_title = f"{type_icon} {title}"
+                if year:
+                    display_title += f" ({year})"
 
                 message_text = (
                     f"🎬 **{title}**\n\n"
@@ -13266,10 +13307,13 @@ async def xnxx_inline_handler(event):
                 ]
 
                 try:
+                    # Use builder.article with thumb for better display
                     if cover:
                         imdb_results.append(
-                            builder.photo(
-                                file=cover,
+                            builder.article(
+                                title=display_title,
+                                description=description,
+                                thumb=cover,
                                 text=message_text,
                                 buttons=buttons,
                                 parse_mode="md",
@@ -13279,7 +13323,7 @@ async def xnxx_inline_handler(event):
                     else:
                         imdb_results.append(
                             builder.article(
-                                title=title,
+                                title=display_title,
                                 description=description,
                                 text=message_text,
                                 buttons=buttons,
@@ -13288,16 +13332,19 @@ async def xnxx_inline_handler(event):
                             )
                         )
                 except Exception:
-                    imdb_results.append(
-                        builder.article(
-                            title=title,
-                            description=description,
-                            text=message_text,
-                            buttons=buttons,
-                            parse_mode="md",
-                            link_preview=False,
+                    try:
+                        imdb_results.append(
+                            builder.article(
+                                title=display_title,
+                                description=description,
+                                text=message_text,
+                                buttons=buttons,
+                                parse_mode="md",
+                                link_preview=False,
+                            )
                         )
-                    )
+                    except Exception:
+                        continue
 
             await event.answer(
                 imdb_results,
@@ -13305,6 +13352,7 @@ async def xnxx_inline_handler(event):
             )
             logger.info(f"[INLINE] IMDB: {len(imdb_results)} results for '{query}'")
             return
+
 
         inline_results = []
         builder = event.builder
