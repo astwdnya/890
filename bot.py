@@ -13109,24 +13109,14 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
 async def xnxx_inline_handler(event):
     try:
         if event.sender_id not in AUTHORIZED_USERS:
-            await event.answer(
-                [],
-                switch_pm_text="⛔ Unauthorized",
-                switch_pm_parameter="search",
-                cache_time=60,
-            )
+            await event.answer([], cache_time=60)
             return
 
         raw = event.text.strip() if event.text else ""
         logger.info(f"[INLINE] Raw: '{raw}' from {event.sender_id}")
 
         if len(raw) < 3:
-            await event.answer(
-                [],
-                switch_pm_text="🔍 حداقل ۳ حرف تایپ کنید",
-                switch_pm_parameter="search",
-                cache_time=5,
-            )
+            await event.answer([], cache_time=5)
             return
 
         # تشخیص منبع: ph:xxx → PornHub, xv:xxx → XVideos, ep:xxx → Eporner, xn:xxx → XNXX, imd:xxx → IMDB, wh:xxx → WhoresHub
@@ -13241,12 +13231,7 @@ async def xnxx_inline_handler(event):
                 )
 
         if not results:
-            await event.answer(
-                [],
-                switch_pm_text="❌ نتیجه‌ای یافت نشد",
-                switch_pm_parameter="search",
-                cache_time=30,
-            )
+            await event.answer([], cache_time=30)
             return
 
         if is_imd:
@@ -13307,19 +13292,38 @@ async def xnxx_inline_handler(event):
                 ]
 
                 try:
-                    # Use builder.article with thumb for better display
+                    # Build article with thumbnail (InputWebDocument required by Telethon)
                     if cover:
-                        imdb_results.append(
-                            builder.article(
-                                title=display_title,
-                                description=description,
-                                thumb=cover,
-                                text=message_text,
-                                buttons=buttons,
-                                parse_mode="md",
-                                link_preview=False,
+                        try:
+                            thumb_doc = InputWebDocument(
+                                url=cover,
+                                size=0,
+                                mime_type="image/jpeg",
+                                attributes=[]
                             )
-                        )
+                            imdb_results.append(
+                                builder.article(
+                                    title=display_title,
+                                    description=description,
+                                    thumb=thumb_doc,
+                                    text=message_text,
+                                    buttons=buttons,
+                                    parse_mode="md",
+                                    link_preview=False,
+                                )
+                            )
+                        except Exception:
+                            # Fallback: article without thumb
+                            imdb_results.append(
+                                builder.article(
+                                    title=display_title,
+                                    description=description,
+                                    text=message_text,
+                                    buttons=buttons,
+                                    parse_mode="md",
+                                    link_preview=False,
+                                )
+                            )
                     else:
                         imdb_results.append(
                             builder.article(
@@ -13435,12 +13439,7 @@ async def xnxx_inline_handler(event):
     except Exception as e:
         logger.error(f"[INLINE] Error: {e}", exc_info=True)
         try:
-            await event.answer(
-                [],
-                switch_pm_text="❌ خطا در جستجو",
-                switch_pm_parameter="search",
-                cache_time=5,
-            )
+            await event.answer([], cache_time=5)
         except Exception:
             pass
 
