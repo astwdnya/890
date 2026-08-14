@@ -1780,13 +1780,14 @@ async def _download_subtitle_file(url: str, out_dir: Optional[str], imdb_id: str
 
 
 # ═══════════════════════════════════════════════════════════
-#   Local ffmpeg subtitle burn (hardcode subtitle into video)
+#   Local ffmpeg subtitle embedding (softsub - no re-encode)
 # ═══════════════════════════════════════════════════════════
 
 
-def burn_subtitle_local(video_path: str, subtitle_path: str, out_path: str) -> Optional[str]:
+def embed_subtitle_soft(video_path: str, subtitle_path: str, out_path: str) -> Optional[str]:
     """
-    هاردکد کردن زیرنویس در ویدیو با ffmpeg محلی (بدون نیاز به سرویس خارجی).
+    قرار دادن زیرنویس به‌صورت softsub داخل فایل ویدیو (بدون re-encode).
+    این کار خیلی سریع هست (فقط remux) و زیرنویس قابل روشن/خاموش شدن در VLC هست.
 
     Args:
         video_path: مسیر فایل ویدیو
@@ -1797,55 +1798,73 @@ def burn_subtitle_local(video_path: str, subtitle_path: str, out_path: str) -> O
         مسیر فایل خروجی اگه موفق، None در غیر این صورت.
     """
     try:
-        # ffmpeg command برای burn زیرنویس
-        # از libx264 برای ویدیو و copy برای صدا استفاده می‌کنیم
-        # subtitles filter زیرنویس رو روی ویدیو می‌سوزونه
+        # تشخیص فرمت خروجی بر اساس پسوند
+        if out_path.endswith(".mkv"):
+            sub_codec = "srt"
+        else:
+            # MP4 از mov_text برای زیرنویس استفاده می‌کنه
+            sub_codec = "mov_text"
+            # اگه زیرنویس VTT هست، برای MP4 به mov_text تبدیل می‌شه
+
+        # ffmpeg command برای softsub
+        # -c copy = video و audio رو copy کن (بدون re-encode)
+        # -c:s mov_text = زیرنویس رو به mov_text تبدیل کن (برای MP4)
+        # -metadata:s:s:0 language=far = تنظیم زبان زیرنویس به فارسی
         cmd = [
             "ffmpeg", "-y",
             "-i", video_path,
-            "-vf", f"subtitles={subtitle_path}",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
-            "-c:a", "copy",
+            "-i", subtitle_path,
+            "-c", "copy",
+            "-c:s", sub_codec,
+            "-metadata:s:s:0", "language=far",
+            "-metadata:s:s:0", "title=Persian",
             "-movflags", "+faststart",
             out_path,
         ]
-        logger.info("Burning subtitle locally with ffmpeg: %s + %s -> %s",
+
+        logger.info("Embedding subtitle as softsub: %s + %s -> %s",
                     os.path.basename(video_path), os.path.basename(subtitle_path), os.path.basename(out_path))
 
-        result = subprocess.run(cmd, capture_output=True, timeout=7200)  # 2 hour timeout
+        result = subprocess.run(cmd, capture_output=True, timeout=600)  # 10 min timeout
 
         if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            logger.info("Subtitle burn complete: %s (%.1f MB)",
+            logger.info("Softsub embedding complete: %s (%.1f MB)",
                         out_path, os.path.getsize(out_path) / 1024 / 1024)
             return out_path
 
-        # fallback: بدون پشتیبانی از styling
-        logger.warning("First burn attempt failed, trying without styling: %s",
+        # fallback: MKV (MP4 گاهی با mov_text مشکل داره)
+        logger.warning("MP4 softsub failed, trying MKV: %s",
                       result.stderr.decode("utf-8", errors="ignore")[:300])
+
+        mkv_out = out_path.rsplit(".", 1)[0] + ".mkv"
         cmd2 = [
             "ffmpeg", "-y",
             "-i", video_path,
-            "-vf", f"subtitles={subtitle_path}:force_style='FontName=Arial,FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1'",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "25",
-            "-c:a", "copy",
-            "-movflags", "+faststart",
-            out_path,
+            "-i", subtitle_path,
+            "-c", "copy",
+            "-c:s", "srt",
+            "-metadata:s:s:0", "language=far",
+            "-metadata:s:s:0", "title=Persian",
+            mkv_out,
         ]
-        result2 = subprocess.run(cmd2, capture_output=True, timeout=7200)
-        if result2.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            logger.info("Subtitle burn complete (method 2): %s", out_path)
-            return out_path
 
-        logger.error("Subtitle burn failed: %s",
+        result2 = subprocess.run(cmd2, capture_output=True, timeout=600)
+        if result2.returncode == 0 and os.path.exists(mkv_out) and os.path.getsize(mkv_out) > 0:
+            logger.info("Softsub embedding complete (MKV): %s", mkv_out)
+            return mkv_out
+
+        logger.error("Softsub embedding failed: %s",
                      result2.stderr.decode("utf-8", errors="ignore")[:500])
         return None
     except Exception as e:
-        logger.error("Subtitle burn error: %s", e)
+        logger.error("Softsub embedding error: %s", e)
         return None
+
+
+# Compatibility alias (keep old name working)
+def burn_subtitle_local(video_path: str, subtitle_path: str, out_path: str) -> Optional[str]:
+    """Alias for embed_subtitle_soft (softsub, not hardcode)"""
+    return embed_subtitle_soft(video_path, subtitle_path, out_path)
 
 
 # ═══════════════════════════════════════════════════════════

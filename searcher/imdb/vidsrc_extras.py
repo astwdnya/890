@@ -161,8 +161,19 @@ async def get_server_info(
 
 
 def burn_subtitle_local(video_path: str, subtitle_path: str, out_path: str) -> Optional[str]:
+    """Alias for embed_subtitle_soft (softsub, not hardcode)"""
+    try:
+        from imdbplay_downloader import embed_subtitle_soft as _embed
+        return _embed(video_path, subtitle_path, out_path)
+    except Exception as e:
+        logger.error("embed_subtitle_soft failed: %s", e)
+        return None
+
+
+def embed_subtitle_soft(video_path: str, subtitle_path: str, out_path: str) -> Optional[str]:
     """
-    هاردکد کردن زیرنویس در ویدیو با ffmpeg محلی (بدون نیاز به سرویس خارجی).
+    قرار دادن زیرنویس به‌صورت softsub داخل فایل ویدیو (بدون re-encode).
+    این کار خیلی سریع هست (فقط remux) و زیرنویس قابل روشن/خاموش شدن در VLC هست.
 
     Args:
         video_path: مسیر فایل ویدیو
@@ -173,10 +184,10 @@ def burn_subtitle_local(video_path: str, subtitle_path: str, out_path: str) -> O
         مسیر فایل خروجی اگه موفق، None در غیر این صورت.
     """
     try:
-        from imdbplay_downloader import burn_subtitle_local as _burn
-        return _burn(video_path, subtitle_path, out_path)
+        from imdbplay_downloader import embed_subtitle_soft as _embed
+        return _embed(video_path, subtitle_path, out_path)
     except Exception as e:
-        logger.error("burn_subtitle_local failed: %s", e)
+        logger.error("embed_subtitle_soft failed: %s", e)
         return None
 
 
