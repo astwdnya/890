@@ -13456,12 +13456,16 @@ async def xnxx_inline_handler(event):
             query = inner
             page = 1
             sort = ""
+        elif is_iran:
+            query = inner
+            page = 1
+            sort = ""
         else:
             query = parsed["query"]
             page = parsed["page"]
             sort = parsed["sort"]
 
-        source = "IMDB" if is_imd else ("EP" if is_ep else ("WH" if is_wh else ("XV" if is_xv else ("PH" if is_ph else "XNXX"))))
+        source = "IMDB" if is_imd else ("IRAN" if is_iran else ("EP" if is_ep else ("WH" if is_wh else ("XV" if is_xv else ("PH" if is_ph else "XNXX")))))
         logger.info(f"[INLINE] {source}: q='{query}' page={page} sort={sort}")
 
         if is_imd:
