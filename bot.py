@@ -71,7 +71,7 @@ _searcher_imdb_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
 if _searcher_imdb_dir not in _sys.path:
     _sys.path.insert(0, _searcher_imdb_dir)
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
-from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle, get_server_info
+from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle, get_server_info, burn_subtitle_local
 from searcher.imdb.videotext_burn import burn_subtitles
 from ytdlp_handler import (
     is_ytdlp_site_url,
@@ -12549,13 +12549,13 @@ def _imdb_seasons_buttons(eps) -> list:
     row = []
     for s in sorted(eps["seasons"].keys(), key=lambda x: -x):
         ep_count = len(eps["seasons"][s])
-        row.append(Button.inline(f"فصل {s} ({ep_count} ق)", f"imd_season_{s}"))
+        row.append(Button.inline(f"📂 فصل {s} · {ep_count} قسمت", f"imd_season_{s}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
-    buttons.append([Button.inline("✖ بستن", "imd_close")])
+    buttons.append([Button.inline("🚫 بستن", "imd_close")])
     return buttons
 
 
@@ -12573,7 +12573,7 @@ def _imdb_quality_buttons(qualities: list, is_episode: bool) -> list:
     if row:
         buttons.append(row)
     buttons.append([Button.inline("⏭ بدون زیرنویس", "imd_enosub" if is_episode else "imd_nosub")])
-    buttons.append([Button.inline("✖ بستن", "imd_close")])
+    buttons.append([Button.inline("🚫 بستن", "imd_close")])
     return buttons
 
 
@@ -12584,7 +12584,7 @@ def _imdb_sub_buttons(subs: list, is_episode: bool) -> list:
             label = f"📄 {s['file_name'][:40]} (↓{s['downloads']})"
             buttons.append([Button.inline(label, f"imd_esub_{i}" if is_episode else f"imd_sub_{i}")])
     buttons.append([Button.inline("⏭ بدون زیرنویس", "imd_enosub" if is_episode else "imd_nosub")])
-    buttons.append([Button.inline("✖ بستن", "imd_close")])
+    buttons.append([Button.inline("🚫 بستن", "imd_close")])
     return buttons
 
 
@@ -12648,7 +12648,7 @@ async def imdb_cb_season(event):
     user_id = event.sender_id
     state = imdb_states.get(user_id)
     if not state:
-        await event.answer("وضعیت شما منقضی شده. دوباره سرچ کنید.", alert=True)
+        await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
         return
     data = event.data.decode()
     season = int(data.replace("imd_season_", ""))
@@ -12661,15 +12661,15 @@ async def imdb_cb_season(event):
     buttons = []
     row = []
     for ep in episodes:
-        row.append(Button.inline(str(ep), f"imd_ep_{season}_{ep}"))
+        row.append(Button.inline(f"🎬 {ep}", f"imd_ep_{season}_{ep}"))
         if len(row) == 5:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
-    buttons.append([Button.inline("↩ برگشت به فصل‌ها", "imd_back")])
-    buttons.append([Button.inline("✖ بستن", "imd_close")])
-    await event.edit(f"📺 فصل {season} - یکی از قسمت‌ها رو انتخاب کن:", buttons=buttons)
+    buttons.append([Button.inline("⬅️ برگشت", "imd_back")])
+    buttons.append([Button.inline("🚫 بستن", "imd_close")])
+    await event.edit(f"📺 فصل {season} — یکی از قسمت‌ها رو انتخاب کن:", buttons=buttons)
 
 
 async def imdb_cb_back(event):
@@ -12866,7 +12866,13 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
             raise asyncio.CancelledError()
 
     try:
-        status_msg = await event.respond("📊 آماده‌سازی...")
+        try:
+            status_msg = await event.client.send_message(event.chat_id, "📊 آماده‌سازی...")
+        except Exception:
+            try:
+                status_msg = await event.edit("📊 آماده‌سازی...")
+            except Exception:
+                status_msg = None
 
         label = f"S{season:02d}E{episode:02d}" if season and episode else ""
         # Get server info before download to show in status
@@ -12949,53 +12955,28 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool):
 
         final_path = video_path
         if with_subtitle and sub_path:
-            await status_msg.edit(
-                "🔥 در حال burn زیرنویس...\n⏳ این مرحله چند دقیقه طول میکشه."
-            )
-
-            burn_progress = [0, ""]
-
-            def on_burn(s):
-                check_cancel()
-                burn_progress[0] = s.progress
-                burn_progress[1] = s.status
-
-            async def update_burn():
-                while True:
-                    await asyncio.sleep(3)
-                    check_cancel()
-                    p, st = burn_progress
+            try:
+                await status_msg.edit("🔥 در حال هاردکد زیرنویس...")
+            except Exception:
+                pass
+            burn_out = os.path.join(out_dir, f"burned_{int(time.time())}.mp4")
+            try:
+                burned = burn_subtitle_local(video_path, sub_path, burn_out)
+                if burned and os.path.exists(burned):
+                    final_path = burned
                     try:
-                        await status_msg.edit(f"🔥 burn: {st} {p}%", buttons=cancel_btn)
+                        await status_msg.edit("✅ زیرنویس هاردکد شد!")
                     except Exception:
                         pass
-
-            updater = asyncio.create_task(update_burn())
-
-            try:
-                final_path = await burn_subtitles(
-                    video_path=video_path,
-                    subtitle_path=sub_path,
-                    out_dir=out_dir,
-                    on_burn_progress=on_burn,
-                )
+                else:
+                    try:
+                        await status_msg.edit("⚠ هاردکد نشد، ویدیو بدون زیرنویس ارسال میشه")
+                    except Exception:
+                        pass
+                    final_path = video_path
             except Exception as burn_err:
                 logger.error(f"[IMDB] burn error: {burn_err}", exc_info=True)
-                await status_msg.edit(
-                    f"❌ burn خطا: {str(burn_err)[:500]}\n\n⏭ ارسال ویدیوی بدون subtitle...",
-                    buttons=None,
-                )
                 final_path = video_path
-            finally:
-                if updater:
-                    updater.cancel()
-                    updater = None
-
-            if not final_path or not os.path.exists(final_path):
-                await status_msg.edit("❌ burn ناموفق بود. ویدیوی بدون subtitle ارسال میشه.")
-                final_path = video_path
-            else:
-                await status_msg.edit("✅ burn کامل شد!")
 
         file_size = os.path.getsize(final_path)
         size_mb = file_size / 1024 / 1024

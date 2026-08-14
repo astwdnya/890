@@ -160,6 +160,26 @@ async def get_server_info(
         return None
 
 
+def burn_subtitle_local(video_path: str, subtitle_path: str, out_path: str) -> Optional[str]:
+    """
+    هاردکد کردن زیرنویس در ویدیو با ffmpeg محلی (بدون نیاز به سرویس خارجی).
+
+    Args:
+        video_path: مسیر فایل ویدیو
+        subtitle_path: مسیر فایل زیرنویس (VTT یا SRT)
+        out_path: مسیر فایل خروجی
+
+    Returns:
+        مسیر فایل خروجی اگه موفق، None در غیر این صورت.
+    """
+    try:
+        from imdbplay_downloader import burn_subtitle_local as _burn
+        return _burn(video_path, subtitle_path, out_path)
+    except Exception as e:
+        logger.error("burn_subtitle_local failed: %s", e)
+        return None
+
+
 # ═══════════════════════════════════════════════════════════
 #   OpenSubtitles API (for non-Persian languages)
 # ═══════════════════════════════════════════════════════════
