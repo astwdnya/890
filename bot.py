@@ -2425,7 +2425,8 @@ async def send_file_with_progress(
 
     try:
         # ویدیو: moov atom رو ببر اول فایل (Fast Start) برای استریمینگ
-        if is_video:
+        # اما اگه force_document=True هست، skip کن چون faststart زیرنویس softsub رو حذف می‌کنه
+        if is_video and not force_document:
             fast_path = filepath + "_faststart.mp4"
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg",
