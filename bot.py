@@ -72,6 +72,9 @@ if _searcher_imdb_dir not in _sys.path:
     _sys.path.insert(0, _searcher_imdb_dir)
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle, get_server_info, embed_subtitle_soft
+# diycraft handler
+from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, download_video as diycraft_download
+
 # Iran server (doostihaa + farsiland)
 IRAN_SERVER = os.getenv('IRAN_SERVER', 'doostihaa')  # doostihaa or farsiland
 iran_states = {}
@@ -5057,6 +5060,82 @@ async def generic_url_handler(event):
     # Skip IMDb URLs — these come from inline search results and should not be downloaded
     if "imdb.com" in target_url or "imdbplay.tech" in target_url:
         processing_messages.discard(msg_id)
+        return
+
+    # diycraftsguide.com handler
+    if is_diycraft_url(target_url):
+        logger.info(f"[URL] diycraftsguide detected | url={target_url[:120]}")
+        status_msg = await event.reply("🎬 در حال دریافت اطلاعات ویدیو...")
+        try:
+            info = await extract_video_info(target_url)
+            if not info:
+                await status_msg.edit("❌ ویدیو پیدا نشد.")
+                return
+            title = info["title"]
+            video_url = info["video_url"]
+            thumb = info.get("thumbnail", "")
+
+            await status_msg.edit(f"🎬 **{title}**\n\n⏳ در حال دانلود...")
+
+            # Download
+            out_dir = os.path.join(OUTPUT_FOLDER, f"diycraft_{event.chat_id}_{int(time.time())}")
+            os.makedirs(out_dir, exist_ok=True)
+
+            dl_id = f"dc_{event.chat_id}_{event.id}_{int(time.time())}"
+            active_downloads[dl_id] = {"paused": False, "cancelled": False}
+            cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+            video_path = await diycraft_download(
+                video_url, out_dir,
+                referer=target_url,
+            )
+
+            if not video_path or not os.path.exists(video_path):
+                await status_msg.edit("❌ دانلود ناموفق بود.")
+                return
+
+            size_mb = os.path.getsize(video_path) / 1024 / 1024
+            await status_msg.edit(f"✅ دانلود شد ({size_mb:.1f} MB)\n📤 در حال آپلود...")
+
+            # Download thumbnail
+            thumb_path = None
+            if thumb:
+                try:
+                    async with aiohttp.ClientSession(timeout=ClientTimeout(total=20)) as session:
+                        async with session.get(thumb) as resp:
+                            if resp.status == 200:
+                                thumb_path = os.path.join(out_dir, "thumb.jpg")
+                                with open(thumb_path, "wb") as f:
+                                    f.write(await resp.read())
+                except Exception:
+                    pass
+
+            caption = f"🎬 **{title}**\n💾 {size_mb:.1f} MB\n📀 diycraftsguide"
+
+            await send_file_with_progress(
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=video_path,
+                caption=caption,
+                status_msg=status_msg,
+                buttons=None,
+                supports_streaming=True,
+                thumb_filepath=thumb_path,
+                ul_id=f"dc_ul_{dl_id}",
+            )
+            active_downloads.pop(dl_id, None)
+
+        except Exception as dc_err:
+            logger.error(f"[URL] diycraft error: {dc_err}", exc_info=True)
+            await status_msg.edit(f"❌ خطا: {dc_err}")
+        finally:
+            processing_messages.discard(msg_id)
+            # Cleanup
+            try:
+                import shutil
+                shutil.rmtree(out_dir, ignore_errors=True)
+            except Exception:
+                pass
         return
 
     if (
