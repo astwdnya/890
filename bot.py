@@ -13670,7 +13670,6 @@ async def xnxx_inline_handler(event):
                 buttons = [[Button.inline("\U0001F4E5 \u062F\u0627\u0646\u0644\u0648\u062F", f"irn_sel_{post_id}")]]
                 try:
                     if cover:
-                        from telethon.tl.types import InputWebDocument
                         thumb_doc = InputWebDocument(url=cover, size=0, mime_type="image/jpeg", attributes=[])
                         iran_results.append(builder.article(title=display_title, description=desc, thumb=thumb_doc, text=message_text, buttons=buttons, parse_mode="md", link_preview=False))
                     else:
