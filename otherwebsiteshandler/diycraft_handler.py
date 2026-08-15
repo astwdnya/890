@@ -148,7 +148,7 @@ async def download_video(video_url: str, out_dir: str, referer: str = "", progre
     if referer:
         headers["Referer"] = referer
 
-    # روش 1: curl_cffi
+    # روش 1: curl_cffi با streaming (بدون load کامل در memory)
     try:
         from curl_cffi.requests import AsyncSession
 
@@ -158,31 +158,37 @@ async def download_video(video_url: str, out_dir: str, referer: str = "", progre
                 impersonate="chrome",
                 timeout=600,
                 headers=headers,
+                stream=True,
             )
-            if r.status_code == 200 and r.content:
+            if r.status_code == 200:
+                total = int(r.headers.get("content-length", 0))
+                done = 0
                 with open(out_path, "wb") as f:
-                    f.write(r.content)
+                    async for chunk in r.aiter_content(chunk_size=1024 * 256):
+                        f.write(chunk)
+                        done += len(chunk)
+                        if progress_cb:
+                            try:
+                                progress_cb(done, total)
+                            except Exception:
+                                pass
 
-                if progress_cb:
-                    try:
-                        progress_cb(os.path.getsize(out_path), os.path.getsize(out_path))
-                    except Exception:
-                        pass
-
-                logger.info("diycraft download complete (curl): %s (%.1f MB)",
-                            out_path, os.path.getsize(out_path) / 1024 / 1024)
-                return out_path
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    logger.info("diycraft download complete (curl stream): %s (%.1f MB)",
+                                out_path, os.path.getsize(out_path) / 1024 / 1024)
+                    return out_path
             else:
                 logger.warning("diycraft download HTTP %d", r.status_code)
     except Exception as e:
         logger.warning("diycraft download curl_cffi failed: %s", e)
 
-    # روش 2: wget
+    # روش 2: wget (با progress)
     logger.info("Trying wget fallback...")
     try:
         wget_cmd = [
-            "wget", "-q", "--no-check-certificate",
+            "wget", "--no-check-certificate",
             "-U", _USER_AGENT,
+            "--progress=dot:mega",
         ]
         if referer:
             wget_cmd += ["--referer", referer]
@@ -199,21 +205,24 @@ async def download_video(video_url: str, out_dir: str, referer: str = "", progre
     except Exception as e:
         logger.warning("wget failed: %s", e)
 
-    # روش 3: urllib
+    # روش 3: urllib (همیشه streaming)
     logger.info("Trying urllib fallback...")
     try:
         import urllib.request
         req = urllib.request.Request(video_url, headers=headers)
         with urllib.request.urlopen(req, timeout=600) as response:
+            total = int(response.headers.get("Content-Length", 0))
+            done = 0
             with open(out_path, "wb") as f:
                 while True:
                     chunk = response.read(1024 * 256)
                     if not chunk:
                         break
                     f.write(chunk)
+                    done += len(chunk)
                     if progress_cb:
                         try:
-                            progress_cb(os.path.getsize(out_path), 0)
+                            progress_cb(done, total)
                         except Exception:
                             pass
         if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
