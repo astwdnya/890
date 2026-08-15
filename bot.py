@@ -13424,15 +13424,14 @@ async def xnxx_inline_handler(event):
             inner = raw[5:].strip()
         else:
             # بدون پیشوند — استفاده از سرچر دیفالت کاربر
-            # بررسی آیا کاربر سرور ایرانی انتخاب کرده
+            # اولویت با /setsearch هست — اگه کاربر صریحاً سرور PH/XV/... رو
+            # انتخاب کرده، از همون استفاده می‌شه
+            default_src = get_user_default_search(event.sender_id)
             iran_srv = user_iran_server.get(event.sender_id)
-            if iran_srv and iran_srv in ("doostihaa", "farsiland"):
-                is_iran = True
+
+            if default_src and default_src != "xn":
+                # کاربر با /setsearch سرور خاصی رو انتخاب کرده — اولویت با اونه
                 inner = raw
-            else:
-                default_src = get_user_default_search(event.sender_id)
-                inner = raw  # اصل query بدون پیشوند
-                # شبیه‌سازی پیشوند برای مسیریابی
                 if default_src == "ph":
                     is_ph = True
                     parsed = parse_inline_query(inner)
@@ -13448,9 +13447,15 @@ async def xnxx_inline_handler(event):
                 elif default_src == "wh":
                     is_wh = True
                     parsed = parse_wh_inline_query(inner)
-                else:  # "xn"
-                    is_xn = True
-                    parsed = parse_inline_query(inner)
+            elif iran_srv and iran_srv in ("doostihaa", "farsiland"):
+                # کاربر /server رو روی سرور ایرانی گذاشته
+                is_iran = True
+                inner = raw
+            else:
+                # دیفالت: XNXX
+                is_xn = True
+                inner = raw
+                parsed = parse_inline_query(inner)
 
         if is_imd:
             query = inner

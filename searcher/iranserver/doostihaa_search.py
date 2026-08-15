@@ -213,8 +213,14 @@ async def download_doostihaa(url: str, out_dir: str, progress_cb=None) -> Option
         مسیر فایل دانلود شده یا None
     """
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{int(asyncio.get_event_loop().time())}.mkv")
+    # تشخیص فرمت از URL
+    if ".mp4" in url.lower():
+        ext = "mp4"
+    else:
+        ext = "mkv"
+    out_path = os.path.join(out_dir, f"{int(asyncio.get_event_loop().time())}.{ext}")
 
+    # روش 1: curl_cffi
     try:
         async with AsyncSession() as s:
             r = await s.get(
@@ -226,25 +232,77 @@ async def download_doostihaa(url: str, out_dir: str, progress_cb=None) -> Option
                     "Referer": f"{_BASE_URL}/",
                 },
             )
-            if r.status_code != 200:
+            if r.status_code == 200 and r.content:
+                with open(out_path, "wb") as f:
+                    f.write(r.content)
+
+                if progress_cb:
+                    try:
+                        progress_cb(os.path.getsize(out_path), os.path.getsize(out_path))
+                    except Exception:
+                        pass
+
+                logger.info("doostihaa download complete (curl): %s (%.1f MB)",
+                            out_path, os.path.getsize(out_path) / 1024 / 1024)
+                return out_path
+            else:
                 logger.warning("doostihaa download HTTP %d", r.status_code)
-                return None
+    except Exception as e:
+        logger.warning("doostihaa download curl_cffi failed: %s", e)
 
+    # روش 2: wget (fallback)
+    logger.info("Trying wget fallback for: %s", url[:80])
+    try:
+        import subprocess
+        result = subprocess.run(
+            [
+                "wget", "-q", "--no-check-certificate",
+                "-U", _USER_AGENT,
+                "--referer", _BASE_URL + "/",
+                "-O", out_path,
+                url,
+            ],
+            capture_output=True,
+            timeout=1800,  # 30 min
+        )
+        if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            logger.info("doostihaa download complete (wget): %s (%.1f MB)",
+                        out_path, os.path.getsize(out_path) / 1024 / 1024)
+            return out_path
+        else:
+            stderr = result.stderr.decode("utf-8", errors="ignore")[:300]
+            logger.warning("wget failed: %s", stderr)
+    except Exception as e:
+        logger.warning("wget download failed: %s", e)
+
+    # روش 3: urllib (آخرین fallback)
+    logger.info("Trying urllib fallback for: %s", url[:80])
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={
+            "User-Agent": _USER_AGENT,
+            "Referer": _BASE_URL + "/",
+        })
+        with urllib.request.urlopen(req, timeout=600) as response:
             with open(out_path, "wb") as f:
-                f.write(r.content)
-
-            if progress_cb:
-                try:
-                    progress_cb(os.path.getsize(out_path), os.path.getsize(out_path))
-                except Exception:
-                    pass
-
-            logger.info("doostihaa download complete: %s (%.1f MB)",
+                while True:
+                    chunk = response.read(1024 * 256)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    if progress_cb:
+                        try:
+                            progress_cb(os.path.getsize(out_path), 0)
+                        except Exception:
+                            pass
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            logger.info("doostihaa download complete (urllib): %s (%.1f MB)",
                         out_path, os.path.getsize(out_path) / 1024 / 1024)
             return out_path
     except Exception as e:
-        logger.warning("doostihaa download failed: %s", e)
-        return None
+        logger.warning("urllib download failed: %s", e)
+
+    return None
 
 
 # ─── Quick test ─────────────────────────────────────────────
