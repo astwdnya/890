@@ -1367,21 +1367,70 @@ async def download_with_quality(
         if not variants:
             raise RuntimeError("No variants in master.m3u8")
 
-        variants.sort(key=lambda v: -v[1])
+        # اگر کیفیت خاصی خواستیم، variantها رو بر اساس height مرتب کن (نزولی)
+        # تا بتونیم نزدیک‌ترین (پایین‌تر یا مساوی) رو پیدا کنیم
+        def _variant_height(v):
+            """استخراج height از variant (res=1920x1080 → 1080)."""
+            res = v[2]
+            if not res or "x" not in res:
+                # از bandwidth حدس بزن
+                bw = v[1]
+                if bw >= 8_000_000: return 1080
+                if bw >= 4_000_000: return 720
+                if bw >= 2_000_000: return 480
+                return 0
+            try:
+                return int(res.split("x")[-1])
+            except (ValueError, IndexError):
+                return 0
+
+        # Quality map: label → height
+        _QUALITY_HEIGHTS = {
+            "2160p": 2160, "4k": 2160, "uhd": 2160,
+            "1080p fullhd": 1080, "1080p x265": 1080, "1080p": 1080,
+            "720p x265": 720, "720p": 720,
+            "480p": 480,
+            "360p": 360,
+            "240p": 240,
+        }
+
+        target_height = _QUALITY_HEIGHTS.get(quality_label.lower() if quality_label else "", 0)
+
+        # Sort variants by height descending (best first)
+        variants_with_h = [(v, _variant_height(v)) for v in variants]
+        variants_with_h.sort(key=lambda x: -x[1])
 
         chosen = None
-        if quality_label and quality_label.lower() != "auto":
-            for url, bw, res in variants:
+        if quality_label and quality_label.lower() != "auto" and target_height > 0:
+            # روش 1: تطابق دقیق label
+            for v, h in variants_with_h:
+                url, bw, res = v
                 label = _resolution_to_label(res, bw)
                 if label.lower() == quality_label.lower():
-                    chosen = (url, bw, res)
+                    chosen = v
+                    logger.info("✓ Quality match (exact): %s → height=%d", label, h)
                     break
+
+            # روش 2: تطابق بر اساس height (اگه label پیدا نشد)
             if not chosen:
-                chosen = variants[0]
+                # نزدیک‌ترین height که ≤ target باشه
+                candidates_at_or_below = [(v, h) for v, h in variants_with_h if h <= target_height]
+                if candidates_at_or_below:
+                    chosen = candidates_at_or_below[0][0]
+                    logger.info("✓ Quality match (height ≤ %d): chose height=%d",
+                                target_height, candidates_at_or_below[0][1])
+                else:
+                    # اگر هیچ کدوم ≤ target نبود، پایین‌ترین رو بگیر (حداقل حجم)
+                    chosen = variants_with_h[-1][0]
+                    logger.info("✓ Quality fallback (no variant ≤ %d): chose lowest = height=%d",
+                                target_height, variants_with_h[-1][1])
         else:
-            chosen = variants[0]
+            # Auto: بهترین کیفیت
+            chosen = variants_with_h[0][0]
 
         variant_url = _make_absolute(m3u8_url, chosen[0])
+        logger.info("Selected variant: %s (bandwidth=%d, resolution=%s)",
+                    variant_url[:80], chosen[1], chosen[2])
         try:
             async with AsyncSession() as s:
                 r = await s.get(variant_url, impersonate=_BROWSER_IMPERSONATE, timeout=20, headers=headers)
