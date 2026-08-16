@@ -73,10 +73,11 @@ if _searcher_imdb_dir not in _sys.path:
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle, get_server_info, embed_subtitle_soft
 # diycraft handler
-from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, download_video as diycraft_download
+from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 
 # Iran server (doostihaa + farsiland)
 IRAN_SERVER = os.getenv('IRAN_SERVER', 'doostihaa')  # doostihaa or farsiland
+dc_states = {}  # diycraft states
 iran_states = {}
 user_iran_server = {}  # user_id -> 'doostihaa' or 'farsiland'
 from searcher.imdb.videotext_burn import burn_subtitles
@@ -5065,25 +5066,58 @@ async def generic_url_handler(event):
     # diycraftsguide.com handler
     if is_diycraft_url(target_url):
         logger.info(f"[URL] diycraftsguide detected | url={target_url[:120]}")
-        status_msg = await event.reply("🎬 در حال دریافت اطلاعات ویدیو...")
+        status_msg = await event.reply("🎬 در حال دریافت اطلاعات...")
         try:
             info = await extract_video_info(target_url)
             if not info:
                 await status_msg.edit("❌ ویدیو پیدا نشد.")
                 return
             title = info["title"]
-            video_url = info["video_url"]
             thumb = info.get("thumbnail", "")
+
+            # Check if it's a series
+            if info.get("is_series") and info.get("episodes"):
+                # Series — show episode buttons
+                episodes = info["episodes"]
+                buttons = []
+                row = []
+                for ep in episodes:
+                    ep_num = ep["episode"]
+                    row.append(Button.inline(f"قسمت {ep_num}", f"dcep_{ep_num}"))
+                    if len(row) == 3:
+                        buttons.append(row)
+                        row = []
+                if row:
+                    buttons.append(row)
+                buttons.append([Button.inline("🚫 بستن", "dcclose")])
+
+                # Save state
+                dc_states[event.sender_id] = {
+                    "title": title,
+                    "episodes": {ep["episode"]: ep for ep in episodes},
+                    "page_url": info.get("page_url", target_url),
+                    "thumb": thumb,
+                }
+                await status_msg.edit(
+                    f"📺 **{title}**\n\n📺 یکی از قسمت‌ها رو انتخاب کن:",
+                    buttons=buttons,
+                    parse_mode="md",
+                )
+                return
+
+            # Movie — direct download
+            video_url = info.get("video_url", "")
+            if not video_url:
+                await status_msg.edit("❌ لینک ویدیو پیدا نشد.")
+                return
 
             await status_msg.edit(f"🎬 **{title}**\n\n⏳ در حال دانلود...")
 
-            # Download
             out_dir = os.path.join(OUTPUT_FOLDER, f"diycraft_{event.chat_id}_{int(time.time())}")
             os.makedirs(out_dir, exist_ok=True)
 
             dl_id = f"dc_{event.chat_id}_{event.id}_{int(time.time())}"
             active_downloads[dl_id] = {"paused": False, "cancelled": False}
-            cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
             video_path = await diycraft_download(
                 video_url, out_dir,
@@ -5097,7 +5131,6 @@ async def generic_url_handler(event):
             size_mb = os.path.getsize(video_path) / 1024 / 1024
             await status_msg.edit(f"✅ دانلود شد ({size_mb:.1f} MB)\n📤 در حال آپلود...")
 
-            # Download thumbnail
             thumb_path = None
             if thumb:
                 try:
@@ -5130,12 +5163,6 @@ async def generic_url_handler(event):
             await status_msg.edit(f"❌ خطا: {dc_err}")
         finally:
             processing_messages.discard(msg_id)
-            # Cleanup
-            try:
-                import shutil
-                shutil.rmtree(out_dir, ignore_errors=True)
-            except Exception:
-                pass
         return
 
     if (
@@ -13460,6 +13487,103 @@ async def _iran_download_task(event, user_id, url, quality_label):
         except: pass
 
 
+
+
+# ─── diycraft series episode callbacks ───
+
+dc_states = {}  # diycraft states (defined here if not already)
+
+
+async def diycraft_cb_episode(event):
+    """Handle episode selection for diycraft series"""
+    data = event.data.decode()
+    user_id = event.sender_id
+    state = dc_states.get(user_id)
+    if not state:
+        await event.answer("نشست منقضی شده. دوباره لینک رو بفرست.", alert=True)
+        return
+
+    ep_num_str = data.replace("dcep_", "")
+    ep_num = int(ep_num_str)
+    episodes = state.get("episodes", {})
+    if ep_num not in episodes:
+        await event.answer("قسمت نامعتبر", alert=True)
+        return
+
+    ep_info = episodes[ep_num]
+    ep_key = ep_info["key"]
+    page_url = state.get("page_url", "")
+    title = state.get("title", "Unknown")
+    thumb = state.get("thumb", "")
+
+    await event.edit(f"🎬 **{title}** - قسمت {ep_num}\n\n⏳ در حال دریافت لینک ویدیو...", parse_mode="md")
+
+    # Extract video URL for this episode
+    video_url = await extract_episode_video(page_url, ep_key)
+    if not video_url:
+        await event.edit("❌ لینک ویدیو پیدا نشد.", buttons=None)
+        return
+
+    await event.edit(f"🎬 **{title}** - قسمت {ep_num}\n\n⏳ در حال دانلود...", parse_mode="md")
+
+    out_dir = os.path.join(OUTPUT_FOLDER, f"diycraft_{user_id}_{int(time.time())}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    dl_id = f"dcep_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+
+    video_path = await diycraft_download(
+        video_url, out_dir,
+        referer=page_url,
+    )
+
+    if not video_path or not os.path.exists(video_path):
+        await event.edit("❌ دانلود ناموفق بود.", buttons=None)
+        return
+
+    size_mb = os.path.getsize(video_path) / 1024 / 1024
+    await event.edit(f"✅ دانلود شد ({size_mb:.1f} MB)\n📤 در حال آپلود...", buttons=None)
+
+    # Download thumbnail
+    thumb_path = None
+    if thumb:
+        try:
+            async with aiohttp.ClientSession(timeout=ClientTimeout(total=20)) as session:
+                async with session.get(thumb) as resp:
+                    if resp.status == 200:
+                        thumb_path = os.path.join(out_dir, "thumb.jpg")
+                        with open(thumb_path, "wb") as f:
+                            f.write(await resp.read())
+        except Exception:
+            pass
+
+    caption = f"🎬 **{title}** - قسمت {ep_num}\n💾 {size_mb:.1f} MB\n📀 diycraftsguide"
+
+    await send_file_with_progress(
+        client=event.client,
+        chat_id=event.chat_id,
+        filepath=video_path,
+        caption=caption,
+        status_msg=event,
+        buttons=None,
+        supports_streaming=True,
+        thumb_filepath=thumb_path,
+        ul_id=f"dcep_ul_{dl_id}",
+    )
+    active_downloads.pop(dl_id, None)
+    dc_states.pop(user_id, None)
+
+
+async def diycraft_cb_close(event):
+    """Close diycraft series selection"""
+    user_id = event.sender_id
+    dc_states.pop(user_id, None)
+    try:
+        await event.delete()
+    except Exception:
+        await event.edit("🚫 بسته شد", buttons=None)
+
+
 async def xnxx_inline_handler(event):
     try:
         if event.sender_id not in AUTHORIZED_USERS:
@@ -18495,7 +18619,11 @@ async def main():
     client.add_event_handler(server_callback, events.CallbackQuery(pattern=r"srv_"))
 
     # IMDB (vidsrc) search & download callbacks
-    # Iran server (doostihaa) callbacks
+    # diycraft series callbacks
+    client.add_event_handler(diycraft_cb_episode, events.CallbackQuery(pattern=r"dcep_"))
+    client.add_event_handler(diycraft_cb_close, events.CallbackQuery(pattern=r"dcclose$"))
+
+        # Iran server (doostihaa) callbacks
     client.add_event_handler(iran_cb_title, events.CallbackQuery(pattern=r"irn_sel_"))
     client.add_event_handler(iran_cb_quality, events.CallbackQuery(pattern=r"irn_q_"))
     client.add_event_handler(iran_cb_nosub, events.CallbackQuery(pattern=r"irn_nosub$"))
