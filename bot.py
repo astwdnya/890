@@ -13677,58 +13677,61 @@ async def sarrast_imgs_callback(event):
         return
 
     # Step 2: ارسال به‌صورت آلبوم‌های ۱۰ تایی موازی
-    await event.edit(f"📤 در حال ارسال {len(paths)} تصویر (آلبوم‌های ۱۰ تایی)...", buttons=None)
+    # از client.send_file خود Telethon استفاده می‌کنیم — به‌صورت photo (نه document)
+    await event.edit(f"📤 در حال ارسال {len(paths)} تصویر به‌صورت photo...", buttons=None)
     import shutil
-    from telethon.tl.functions.messages import SendMultiMediaRequest
-    from telethon.tl.types import InputMediaUploadedPhoto
 
     BATCH_SIZE = 10
     sent_count = 0
+    total_paths = len(paths)
+    first_caption = (
+        f"📖 **{series_title}**\n📺 **{chapter_title}**\n"
+        f"🖼 تصاویر ۱-{min(BATCH_SIZE, total_paths)}/{total_paths}"
+    )
 
     async def send_batch(batch_start_idx: int, batch_paths: list):
-        """ارسال یه آلبوم ۱۰ تایی."""
+        """ارسال یه آلبوم ۱۰ تایی به‌صورت photo."""
         nonlocal sent_count
-        input_media = []
-        for i, p in enumerate(batch_paths):
-            try:
-                uploaded = await fast_upload_file(event.client, p)
-                caption = (
-                    f"📖 **{series_title}**\n📺 **{chapter_title}**\n"
-                    f"🖼 تصویر {batch_start_idx + i + 1}/{len(paths)}"
-                ) if i == 0 else ""
-                input_media.append(
-                    InputMediaUploadedPhoto(
-                        file=uploaded,
-                        caption=caption,
-                    )
-                )
-            except Exception as e:
-                logger.warning(f"[Sarrast] Upload image {batch_start_idx + i}: {e}")
-                continue
-        if not input_media:
-            return 0
+        # Caption فقط روی اولین تصویر
+        caption = (
+            f"📖 **{series_title}**\n📺 **{chapter_title}**\n"
+            f"🖼 تصاویر {batch_start_idx + 1}-{batch_start_idx + len(batch_paths)}/{total_paths}"
+        ) if batch_paths else ""
         try:
-            await event.client(SendMultiMediaRequest(
-                peer=event.chat_id,
-                multiquote=False,
-                reply_to_msg_id=event.id if batch_start_idx == 0 else None,
-                media=input_media,
-            ))
-            return len(input_media)
+            # client.send_file با لیست فایل‌ها → آلبوم خودکار می‌سازه
+            # force_document=False → به‌صورت photo (نه document) ارسال می‌شه
+            await event.client.send_file(
+                event.chat_id,
+                batch_paths,
+                caption=caption,
+                parse_mode="md",
+                force_document=False,  # ← به‌صورت photo
+                silent=True,  # بدون نوتیفیکیشن صدا
+            )
+            return len(batch_paths)
         except Exception as e:
             logger.error(f"[Sarrast] Album send failed (batch {batch_start_idx}): {e}")
             # Fallback: send one by one
             count = 0
-            for m in input_media:
+            for i, p in enumerate(batch_paths):
                 try:
-                    await event.client.send_file(event.chat_id, m)
+                    cap = caption if i == 0 else ""
+                    await event.client.send_file(
+                        event.chat_id,
+                        p,
+                        caption=cap,
+                        parse_mode="md",
+                        force_document=False,  # photo
+                        silent=True,
+                    )
                     count += 1
-                except Exception:
-                    pass
+                except Exception as e2:
+                    logger.warning(f"[Sarrast] Single send failed {batch_start_idx + i}: {e2}")
             return count
 
-    # Process batches in parallel (up to 3 albums at the same time)
-    sem = asyncio.Semaphore(3)
+    # Process batches sequentially (Telethon's album send is already efficient)
+    # But we can run 2 in parallel for better throughput
+    sem = asyncio.Semaphore(2)
     async def process_batch(start: int, batch: list):
         async with sem:
             return await send_batch(start, batch)
@@ -13746,7 +13749,7 @@ async def sarrast_imgs_callback(event):
         elif isinstance(r, Exception):
             logger.error(f"[Sarrast] Batch exception: {r}")
 
-    await event.edit(f"✅ {sent_count}/{len(paths)} تصویر ارسال شد.")
+    await event.edit(f"✅ {sent_count}/{total_paths} تصویر ارسال شد.")
     # Cleanup
     try:
         shutil.rmtree(out_dir, ignore_errors=True)
