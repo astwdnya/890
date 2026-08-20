@@ -74,11 +74,14 @@ from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episod
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle, get_server_info, embed_subtitle_soft
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
+# sarrast handler (Persian adult visual stories)
+from sarrast_handler import is_sarrast_url
 
 # Iran server (doostihaa + farsiland)
 IRAN_SERVER = os.getenv('IRAN_SERVER', 'doostihaa')  # doostihaa or farsiland
 dc_states = {}  # diycraft states
 iran_states = {}
+sr_states = {}  # sarrast states (key: "{chat_id}_{msg_id}")
 user_iran_server = {}  # user_id -> 'doostihaa' or 'farsiland'
 from searcher.imdb.videotext_burn import burn_subtitles
 from ytdlp_handler import (
@@ -5165,6 +5168,47 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    # sarrast.com handler (Persian adult visual stories)
+    if is_sarrast_url(target_url):
+        logger.info(f"[URL] sarrast detected | url={target_url[:120]}")
+        status_msg = await event.reply("📖 در حال دریافت اطلاعات فصل...")
+        try:
+            from sarrast_handler import (
+                extract_chapter_info, download_chapter_pdf, download_chapter_images,
+            )
+            info = await extract_chapter_info(target_url)
+            if not info:
+                await status_msg.edit("❌ فصل پیدا نشد.")
+                processing_messages.discard(msg_id)
+                return
+            series_title = info.get("series_title", "")
+            chapter_title = info.get("title", "")
+            total_imgs = len(info.get("images", []))
+            await status_msg.edit(
+                f"📖 **{series_title}**\n"
+                f"📺 **{chapter_title}**\n"
+                f"🖼 تعداد تصاویر: {total_imgs}\n\n"
+                f"یکی از گزینه‌ها رو انتخاب کن:",
+                buttons=[
+                    [Button.inline("📄 دریافت PDF (تمام تصاویر)", f"sr_pdf_{event.id}")],
+                    [Button.inline("🖼 دریافت تصاویر (ZIP)", f"sr_zip_{event.id}")],
+                    [Button.inline("🖼 دریافت تصاویر (تک‌تک)", f"sr_imgs_{event.id}")],
+                ],
+                parse_mode="md",
+            )
+            # Save state for callback
+            sr_states[f"{event.chat_id}_{event.id}"] = {
+                "url": target_url,
+                "info": info,
+                "chat_id": event.chat_id,
+            }
+        except Exception as sr_err:
+            logger.error(f"[URL] sarrast error: {sr_err}", exc_info=True)
+            await status_msg.edit(f"❌ خطا: {sr_err}")
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if (
         YOUTUBE_RE.match(target_url)
         or "youtube.com" in target_url
@@ -6437,14 +6481,8 @@ async def _flush_video_send_batch(
     # دکمه اشتراک‌گذاری با لینک
     buttons.append([Button.inline("🔗 Share Link", f"sharelink_{batch_key}")])
 
-    # دکمه لینک مستقیم (۶ ساعت هاست روی سرور)
-    buttons.append([Button.inline("🌐 Direct Link (6h)", f"dlink_{batch_key}")])
-
     # دکمه آپلود به uplod.ir
     buttons.append([Button.inline("📤 Upload to uplod.ir", f"uplod_{batch_key}")])
-
-    # دکمه آپلود به MediaFire (بدون ثبت‌نام، 1GB/file)
-    buttons.append([Button.inline("🔥 Upload to MediaFire", f"mfup_{batch_key}")])
 
     if GITHUB_ENABLED:
         buttons.append([Button.inline("☁️ Upload to GitHub", f"vgh_batch_{batch_key}")])
@@ -7014,253 +7052,6 @@ async def uplod_callback(event):
     except Exception:
         pass
     await event.answer("✅ Upload complete!", alert=False)
-
-
-# ====================== DIRECT LINK (6h hosting) ======================
-
-
-async def direct_link_callback(event):
-    """دکمه Direct Link — فایل رو روی سرور بات ۶ ساعت هاست می‌کنه و لینک مستقیم می‌ده."""
-    if event.sender_id not in AUTHORIZED_USERS:
-        return await event.answer("⛔ Unauthorized", alert=True)
-
-    batch_key = event.data.decode().replace("dlink_", "")
-    batch = video_send_pending.get(batch_key)
-    if not batch or not batch.get("files"):
-        return await event.answer("❌ Session expired.", alert=True)
-
-    await event.answer("⏳ شروع...", alert=False)
-
-    files = batch["files"]
-    chat_id = batch["chat_id"]
-    public_base = os.environ.get("PUBLIC_BASE_URL", "")
-
-    # Register Flask routes once
-    try:
-        from file_server import register_flask_routes, serve_file, get_file_info
-        if not getattr(register_flask_routes, "_registered", False):
-            register_flask_routes(flask_app)
-            register_flask_routes._registered = True
-    except ImportError as e:
-        try:
-            await event.edit(f"❌ Module not available: {e}", buttons=None)
-        except Exception:
-            pass
-        return
-
-    await event.edit(f"🌐 آماده‌سازی {len(files)} فایل...", buttons=None)
-
-    results = []
-    for i, file_info in enumerate(files):
-        msg_id = file_info["message_id"]
-        filename = file_info["filename"]
-
-        status = f"📄 **File {i + 1}/{len(files)}:** `{filename}`\n"
-        await event.edit(status + "⬇️ Downloading from Telegram...", buttons=None, parse_mode="md")
-
-        tmp_path = os.path.join(OUTPUT_FOLDER, f"dlink_{int(time.time())}_{i}_{filename}")
-        try:
-            msg = await event.client.get_messages(chat_id, ids=msg_id)
-            await event.client.download_media(msg, file=tmp_path)
-        except Exception as e:
-            await event.edit(f"❌ Download failed: {e}", buttons=None)
-            continue
-
-        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
-            await event.edit(f"❌ Download failed — empty file", buttons=None)
-            continue
-
-        file_size = os.path.getsize(tmp_path)
-        await event.edit(status + f"🌐 Registering for 6h hosting ({human_readable_size(file_size)})...", buttons=None, parse_mode="md")
-
-        try:
-            info = serve_file(
-                tmp_path,
-                title=filename,
-                expires_in_hours=6.0,
-                public_base_url=public_base,
-                copy=False,  # symlink to save space
-            )
-            results.append({
-                "filename": filename,
-                "size": file_size,
-                "url": info["url"],
-                "token": info["token"],
-                "expires_at": info["expires_at"],
-            })
-        except Exception as e:
-            await event.edit(f"❌ Failed to register file: {e}", buttons=None)
-            continue
-
-    # Build final message
-    if not results:
-        await event.edit("❌ No files were hosted.", buttons=None)
-        return
-
-    lines = [f"🌐 **Direct Links (6 hours)** — {len(results)} file(s):\n"]
-    for r in results:
-        lines.append(f"🎬 **{r['filename']}**")
-        lines.append(f"   📦 Size: {human_readable_size(r['size'])}")
-        if public_base:
-            lines.append(f"   🔗 Direct: `{r['url']}`")
-            lines.append(f"   ▶️ Open in VLC: `{r['url']}`")
-        else:
-            # No public URL configured
-            lines.append(f"   🔗 Token: `{r['token']}`")
-            lines.append(f"   ⚠️ PUBLIC_BASE_URL not set in env — file served locally at /f/{r['token']}")
-        lines.append("")
-
-    # Send as a new message
-    try:
-        await event.client.send_message(
-            chat_id,
-            "\n".join(lines),
-            parse_mode="md",
-            link_preview=False,
-        )
-    except Exception as e:
-        await event.edit(f"❌ Failed to send links: {e}", buttons=None)
-        return
-
-    # Edit the original message
-    try:
-        await event.edit("✅ Links sent above. Files expire in 6 hours.", buttons=None)
-    except Exception:
-        pass
-
-
-# ====================== MEDIAFIRE UPLOAD ======================
-
-
-async def mediafire_upload_callback(event):
-    """دکمه Upload to MediaFire — آپلود به MediaFire به‌صورت مهمان (1GB limit)."""
-    if event.sender_id not in AUTHORIZED_USERS:
-        return await event.answer("⛔ Unauthorized", alert=True)
-
-    batch_key = event.data.decode().replace("mfup_", "")
-    batch = video_send_pending.get(batch_key)
-    if not batch or not batch.get("files"):
-        return await event.answer("❌ Session expired.", alert=True)
-
-    await event.answer("🔥 شروع...", alert=False)
-
-    try:
-        from mediafire_uploader import upload_to_mediafire
-    except ImportError as e:
-        try:
-            await event.edit(f"❌ mediafire_uploader module not available: {e}", buttons=None)
-        except Exception:
-            pass
-        return
-
-    files = batch["files"]
-    chat_id = batch["chat_id"]
-    results = []
-
-    for i, file_info in enumerate(files):
-        msg_id = file_info["message_id"]
-        filename = file_info["filename"]
-
-        status = f"📄 **File {i + 1}/{len(files)}:** `{filename}`\n"
-        await event.edit(status + "⬇️ Downloading from Telegram...", buttons=None, parse_mode="md")
-
-        tmp_path = os.path.join(OUTPUT_FOLDER, f"mfup_{int(time.time())}_{i}_{filename}")
-        try:
-            msg = await event.client.get_messages(chat_id, ids=msg_id)
-            await event.client.download_media(msg, file=tmp_path)
-        except Exception as e:
-            await event.edit(f"❌ Download failed: {e}", buttons=None)
-            continue
-
-        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
-            await event.edit(f"❌ Download failed — empty file", buttons=None)
-            continue
-
-        file_size = os.path.getsize(tmp_path)
-        size_mb = file_size / (1024 * 1024)
-
-        # Check 1GB limit
-        if file_size > 1024 * 1024 * 1024:
-            await event.edit(
-                f"{status}❌ File too large for MediaFire guest upload (1GB limit).\n"
-                f"📦 Size: {size_mb:.1f} MB",
-                buttons=None, parse_mode="md",
-            )
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-            continue
-
-        await event.edit(
-            f"{status}🔥 Uploading to MediaFire (guest)...\n"
-            f"📦 {size_mb:.1f} MB — fresh session each time to bypass 1GB quota",
-            buttons=None, parse_mode="md",
-        )
-
-        # Run upload (each call creates a new session, bypassing 1GB guest limit)
-        try:
-            result = await upload_to_mediafire(tmp_path)
-            if result and result.get("download_url"):
-                results.append({
-                    "filename": filename,
-                    "size": file_size,
-                    "url": result.get("download_url"),
-                    "direct_url": result.get("direct_url"),
-                    "quickkey": result.get("quickkey"),
-                })
-                await event.edit(
-                    f"{status}✅ Uploaded: {result.get('download_url')[:80]}",
-                    buttons=None, parse_mode="md",
-                )
-            elif result and result.get("error") == "file_too_large":
-                await event.edit(
-                    f"{status}❌ File too large ({size_mb:.1f} MB > 1GB MediaFire limit)",
-                    buttons=None, parse_mode="md",
-                )
-            else:
-                await event.edit(
-                    f"{status}❌ Upload failed — MediaFire API may be unavailable",
-                    buttons=None, parse_mode="md",
-                )
-        except Exception as e:
-            logger.error(f"[MediaFire] Upload error: {e}", exc_info=True)
-            await event.edit(f"{status}❌ Upload error: {e}", buttons=None, parse_mode="md")
-
-        # Cleanup local file
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-
-    # Build final message with all links
-    if not results:
-        await event.edit("❌ No files uploaded.", buttons=None)
-        return
-
-    lines = [f"🔥 **MediaFire Upload Complete** — {len(results)} file(s):\n"]
-    for r in results:
-        lines.append(f"🎬 **{r['filename']}**")
-        lines.append(f"   📦 Size: {human_readable_size(r['size'])}")
-        lines.append(f"   🔗 Download: {r['url']}")
-        if r.get("direct_url") and r["direct_url"] != r["url"]:
-            lines.append(f"   ⚡ Direct: {r['direct_url']}")
-        lines.append("")
-
-    try:
-        await event.client.send_message(
-            chat_id,
-            "\n".join(lines),
-            parse_mode="md",
-            link_preview=False,
-        )
-    except Exception:
-        pass
-
-    try:
-        await event.edit("✅ Links sent above.", buttons=None)
-    except Exception:
-        pass
 
 
 # ====================== SUBTITLE HANDLER ======================
@@ -13437,32 +13228,12 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                         await status_msg.edit("💬 در حال جستجوی زیرنویس فارسی...")
                     except Exception:
                         pass
-                    # Check if user selected "imdbsub" server → use subf2m.co
-                    iran_srv = user_iran_server.get(user_id, "imdb")
-                    if iran_srv == "imdbsub":
-                        try:
-                            from searcher.imdb.subf2m_subtitle import get_subtitle_for_imdb as _get_subf2m_sub
-                            title_str = info.get("title", "") if info else ""
-                            year_str = info.get("year") if info else None
-                            persian_sub_path = await _get_subf2m_sub(
-                                imdb_id, title_str,
-                                year=year_str,
-                                season=season, episode=episode,
-                                out_dir=sub_out_dir,
-                            )
-                            if persian_sub_path:
-                                logger.info(f"[IMDB] subf2m.co subtitle: {persian_sub_path}")
-                                sub_name = "Persian (subf2m.co)"
-                        except Exception as e:
-                            logger.warning(f"[IMDB] subf2m fetch failed: {e}")
-                    # Fallback: imdbplay's built-in Persian subtitles
-                    if not persian_sub_path:
-                        persian_sub_path = await get_persian_subtitle(
-                            imdb_id,
-                            season=season,
-                            episode=episode,
-                            out_dir=sub_out_dir,
-                        )
+                    persian_sub_path = await get_persian_subtitle(
+                        imdb_id,
+                        season=season,
+                        episode=episode,
+                        out_dir=sub_out_dir,
+                    )
                 else:
                     persian_sub_path = sub_path
 
@@ -13617,20 +13388,16 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
 
 
 async def server_cmd(event):
-    """انتخاب سرور بین IMDb و Doostihaa و Farsiland و Film2Movie و IMDb+Subf2m"""
+    """انتخاب سرور بین IMDb و Doostihaa و Farsiland"""
     user_id = event.sender_id
     buttons = [
         [Button.inline("🌍 IMDb (imdbplay)", "srv_imdb")],
-        [Button.inline("🌍 IMDb + زیرنویس فارسی (subf2m)", "srv_imdbsub")],
-        [Button.inline("🇮🇷 فیلم‌تو‌مووی (film2movie)", "srv_film2movie")],
         [Button.inline("🇮🇷 دوستی‌ها (doostihaa)", "srv_doostihaa")],
         [Button.inline("🇮🇷 فارسی‌لند (farsiland)", "srv_farsiland")],
     ]
     current = user_iran_server.get(user_id, "none")
     await event.reply(
-        f"🖥 انتخاب سرور جستجو\n\nسرور فعلی: **{current}**\n\nیکی را انتخاب کنید:\n\n"
-        "💡 **imdb + subf2m**: فیلم/سریال از منابع خارجی + زیرنویس فارسی از subf2m.co (قابل استفاده از خارج ایران)\n"
-        "💡 **film2movie**: هاردساب فارسی، نیاز به IP ایران",
+        f"🖥 انتخاب سرور جستجو\n\nسرور فعلی: **{current}**\n\nیکی را انتخاب کنید:",
         buttons=buttons,
         parse_mode="md",
     )
@@ -13642,110 +13409,26 @@ async def server_callback(event):
     user_id = event.sender_id
     server = data.replace("srv_", "")
     user_iran_server[user_id] = server
-    names = {
-        "imdb": "IMDb (imdbplay)",
-        "imdbsub": "IMDb + زیرنویس فارسی (subf2m)",
-        "doostihaa": "دوستی‌ها (doostihaa)",
-        "farsiland": "فارسی‌لند (farsiland)",
-        "film2movie": "فیلم‌تو‌مووی (film2movie) — هاردساب فارسی",
-    }
-    prefixes = {
-        "imdb": "imd:",
-        "imdbsub": "imd:",
-        "doostihaa": "iran:",
-        "farsiland": "iran:",
-        "film2movie": "iran:",
-    }
+    names = {"imdb": "IMDb (imdbplay)", "doostihaa": "دوستی‌ها (doostihaa)", "farsiland": "فارسی‌لند (farsiland)"}
     await event.answer(f"سرور انتخاب شد: {names.get(server, server)}", alert=False)
-    await event.edit(
-        f"✅ سرور انتخاب شد: **{names.get(server, server)}**\n\n"
-        f"برای جستجو از پیشوند `{prefixes.get(server, 'iran:')}` استفاده کنید",
-        parse_mode="md",
-    )
+    await event.edit(f"✅ سرور انتخاب شد: **{names.get(server, server)}**\n\nبرای جستجو از @bot استفاده کنید با پیشوند iran: (برای دوستی‌ها) یا imd: (برای IMDb)", parse_mode="md")
 
 
 
 # ─── Iran server (doostihaa) callbacks ───
 
 async def iran_cb_title(event):
-    """Handle iran title selection — show qualities (doostihaa) or seasons (film2movie series)"""
+    """Handle iran title selection — show qualities"""
     data = event.data.decode()
-    payload = data.replace("irn_sel_", "")
+    post_id = data.replace("irn_sel_", "")
     user_id = event.sender_id
-    iran_srv = user_iran_server.get(user_id, "doostihaa")
     await event.edit("\U0001F50D \u062F\u0631 \u062D\u0627\u0644 \u062F\u0631\u06CC\u0627\u0641\u062A \u0644\u06CC\u0633\u062A \u06A9\u06CC\u0641\u06CC\u062A\u200C\u0647\u0627...", buttons=None)
-
-    if iran_srv == "film2movie":
-        # film2movie: payload is the post URL (encoded) — not a numeric post_id
-        # Format: irn_sel_{url_safe_encoded}
-        try:
-            from urllib.parse import unquote
-            post_url = unquote(payload)
-        except Exception:
-            post_url = payload
-
-        from searcher.iranserver.film2movie_search import (
-            get_qualities_film2movie, get_episodes_film2movie,
-        )
-        # Try episodes first (series)
-        episodes = await get_episodes_film2movie(post_url)
-        if episodes:
-            # It's a series — show seasons
-            iran_states[user_id] = {
-                "post_url": post_url, "episodes": episodes, "server": "film2movie",
-            }
-            buttons = []
-            row = []
-            for s in sorted(episodes.keys(), key=lambda x: -x):
-                ep_count = len(episodes[s])
-                row.append(Button.inline(f"\U0001F4C2 فصل {s} · {ep_count} قسمت", f"if2_s_{s}"))
-                if len(row) == 2:
-                    buttons.append(row)
-                    row = []
-            if row:
-                buttons.append(row)
-            buttons.append([Button.inline("\U0001F6AB بستن", "irn_close")])
-            await event.edit("\U0001F4FA سریال — فصل رو انتخاب کن:", buttons=buttons)
-            return
-        # Otherwise treat as movie — get qualities
-        qualities = await get_qualities_film2movie(post_url)
-        if not qualities:
-            await event.edit("\u274C \u06A9\u06CC\u0641\u06CC\u062A\u06CC \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F.", buttons=None)
-            return
-        iran_states[user_id] = {
-            "post_url": post_url, "qualities": qualities, "server": "film2movie",
-        }
-        # Build quality buttons (deduplicate by label, prefer hardsub Persian)
-        buttons = []
-        row = []
-        seen_labels = set()
-        for q in qualities:
-            label = q["label"]
-            # Skip BW variant if main exists
-            if q.get("variant") == "bw":
-                continue
-            if label in seen_labels:
-                continue
-            seen_labels.add(label)
-            # Show hardsub indicator
-            btn_label = f"{label} {'🔒هاردساب' if q.get('is_hardsub') else '🎭دوبله'}"
-            row.append(Button.inline(btn_label, f"if2_q_{label}"))
-            if len(row) == 2:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-        buttons.append([Button.inline("\U0001F6AB بستن", "irn_close")])
-        await event.edit("\U0001F3AF کیفیت رو انتخاب کن:", buttons=buttons)
-        return
-
-    # Default: doostihaa
     from searcher.iranserver.doostihaa_search import get_qualities_doostihaa
-    qualities = await get_qualities_doostihaa(payload)
+    qualities = await get_qualities_doostihaa(post_id)
     if not qualities:
         await event.edit("\u274C \u06A9\u06CC\u0641\u06CC\u062A\u06CC \u067E\u06CC\u062F\u0627 \u0646\u0634\u062F.", buttons=None)
         return
-    iran_states[user_id] = {"post_id": payload, "qualities": qualities, "server": "doostihaa"}
+    iran_states[user_id] = {"post_id": post_id, "qualities": qualities}
     # Build quality buttons
     buttons = []
     row = []
@@ -13763,206 +13446,6 @@ async def iran_cb_title(event):
         buttons.append(row)
     buttons.append([Button.inline("\U0001F6AB \u0628\u0633\u062A\u0646", "irn_close")])
     await event.edit("\U0001F3AF \u06A9\u06CC\u0641\u06CC\u062A \u0631\u0648 \u0627\u0646\u062A\u062E\u0627\u0628 \u06A9\u0646:", buttons=buttons)
-
-
-# ─── Film2Movie series callbacks ───
-
-async def film2movie_cb_season(event):
-    """Show episodes for a season (film2movie)"""
-    user_id = event.sender_id
-    state = iran_states.get(user_id)
-    if not state or state.get("server") != "film2movie":
-        await event.answer("\u23F0 نشست شما منقضی شده. دوباره سرچ کنید.", alert=True)
-        return
-    data = event.data.decode()
-    season = int(data.replace("if2_s_", ""))
-    episodes = state.get("episodes", {})
-    if season not in episodes:
-        await event.answer("فصل نامعتبر", alert=True)
-        return
-    state["selected_season"] = season
-    ep_list = sorted(episodes[season])
-    buttons = []
-    row = []
-    for ep in ep_list:
-        row.append(Button.inline(f"\U0001F3AC {ep}", f"if2_e_{season}_{ep}"))
-        if len(row) == 5:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([Button.inline("\u2B05\uFE0F برگشت", "if2_back")])
-    await event.edit(f"\U0001F4FA فصل {season} — {len(ep_list)} قسمت\n\nقسمت رو انتخاب کن:", buttons=buttons)
-
-
-async def film2movie_cb_back(event):
-    """Back to seasons list"""
-    user_id = event.sender_id
-    state = iran_states.get(user_id)
-    if not state or state.get("server") != "film2movie":
-        await event.answer("\u23F0 نشست شما منقضی شده.", alert=True)
-        return
-    episodes = state.get("episodes", {})
-    if not episodes:
-        await event.edit("اطلاعات فصل موجود نیست.", buttons=None)
-        return
-    buttons = []
-    row = []
-    for s in sorted(episodes.keys(), key=lambda x: -x):
-        ep_count = len(episodes[s])
-        row.append(Button.inline(f"\U0001F4C2 فصل {s} · {ep_count} قسمت", f"if2_s_{s}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([Button.inline("\U0001F6AB بستن", "irn_close")])
-    await event.edit("\U0001F4FA سریال — فصل رو انتخاب کن:", buttons=buttons)
-
-
-async def film2movie_cb_episode(event):
-    """Show qualities for an episode (film2movie)"""
-    user_id = event.sender_id
-    state = iran_states.get(user_id)
-    if not state or state.get("server") != "film2movie":
-        await event.answer("\u23F0 نشست شما منقضی شده. دوباره سرچ کنید.", alert=True)
-        return
-    data = event.data.decode()
-    parts = data.replace("if2_e_", "").split("_")
-    if len(parts) != 2:
-        await event.answer("داده نامعتبر", alert=True)
-        return
-    season, episode = int(parts[0]), int(parts[1])
-    state["selected_season"] = season
-    state["selected_episode"] = episode
-
-    post_url = state["post_url"]
-    await event.edit("\U0001F50D در حال گرفتن لینک‌های قسمت...", buttons=None)
-    from searcher.iranserver.film2movie_search import get_episode_links_film2movie
-    links = await get_episode_links_film2movie(post_url, season, episode)
-    if not links:
-        await event.edit("\u274C لینکی برای این قسمت پیدا نشد.", buttons=None)
-        return
-    state["qualities"] = links
-    iran_states[user_id] = state
-    # Build quality buttons — only main variant, prefer hardsub Persian (هاردساب فارسی)
-    buttons = []
-    row = []
-    seen_labels = set()
-    for q in links:
-        if q.get("variant") == "bw":
-            continue  # skip black-and-white variant
-        label = q["label"]
-        # Prefer hardsub (first occurrence)
-        key = label
-        if key in seen_labels:
-            continue
-        seen_labels.add(key)
-        btn_label = f"{label} {'🔒هاردساب' if q.get('is_hardsub') else '🎭دوبله'}"
-        row.append(Button.inline(btn_label, f"if2_q_{label}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    buttons.append([Button.inline("\u2B05\uFE0F برگشت به فصل", "if2_back")])
-    buttons.append([Button.inline("\U0001F6AB بستن", "irn_close")])
-    await event.edit(
-        f"\U0001F3AC **S{season:02d}E{episode:02d}** — کیفیت رو انتخاب کن:",
-        buttons=buttons, parse_mode="md",
-    )
-
-
-async def film2movie_cb_quality(event):
-    """Download episode or movie with selected quality (film2movie)"""
-    user_id = event.sender_id
-    state = iran_states.get(user_id)
-    if not state or state.get("server") != "film2movie":
-        await event.answer("\u23F0 نشست شما منقضی شده. دوباره سرچ کنید.", alert=True)
-        return
-    data = event.data.decode()
-    quality_label = data.replace("if2_q_", "")
-    qualities = state.get("qualities", [])
-    # Find the URL — prefer hardsub (Persian) version
-    url = None
-    is_hardsub = None
-    # First pass: hardsub=True
-    for q in qualities:
-        if q["label"] == quality_label and q.get("is_hardsub") and q.get("variant") != "bw":
-            url = q["url"]
-            is_hardsub = True
-            break
-    # Fallback: any matching
-    if not url:
-        for q in qualities:
-            if q["label"] == quality_label and q.get("variant") != "bw":
-                url = q["url"]
-                is_hardsub = q.get("is_hardsub", False)
-                break
-    if not url:
-        await event.answer("کیفیت نامعتبر", alert=True)
-        return
-    await event.answer("✅ شروع دانلود...", alert=False)
-    asyncio.create_task(_film2movie_download_task(event, user_id, url, quality_label, is_hardsub))
-
-
-async def _film2movie_download_task(event, user_id, url, quality_label, is_hardsub):
-    """Download task for film2movie (movie or episode)"""
-    state = iran_states.get(user_id, {})
-    season = state.get("selected_season")
-    episode = state.get("selected_episode")
-    out_dir = os.path.join(IMDB_OUTPUT_FOLDER, f"f2m_{user_id}_{int(time.time())}")
-    os.makedirs(out_dir, exist_ok=True)
-    dl_id = f"f2m_dl_{event.chat_id}_{event.id}_{int(time.time())}"
-    active_downloads[dl_id] = {"paused": False, "cancelled": False}
-    cancel_btn = [[Button.inline("\u274C Cancel", f"dlcancel_{dl_id}")]]
-    try:
-        try:
-            se_label = f"S{season:02d}E{episode:02d} " if season and episode else ""
-            sub_label = "🔒هاردساب" if is_hardsub else "🎭دوبله"
-            status_msg = await event.client.send_message(
-                event.chat_id,
-                f"\U0001F4E5 دانلود {se_label}{quality_label} ({sub_label}) از film2movie...",
-            )
-        except Exception:
-            status_msg = await event.edit("\U0001F4E5 دانلود...", buttons=cancel_btn)
-        from searcher.iranserver.film2movie_search import download_film2movie
-        video_path = await download_film2movie(url, out_dir, progress_cb=None)
-        if not video_path or not os.path.exists(video_path):
-            await status_msg.edit("\u274C دانلود ناموفق بود.", buttons=None)
-            return
-        size_mb = os.path.getsize(video_path) / 1024 / 1024
-        await status_msg.edit(
-            f"\u2705 ویدیو دانلود شد ({size_mb:.1f} MB)", buttons=None
-        )
-        se_label = f"S{season:02d}E{episode:02d} " if season and episode else ""
-        sub_label = "🔒هاردساب فارسی" if is_hardsub else "🎭دوبله فارسی"
-        await send_file_with_progress(
-            client=event.client,
-            chat_id=event.chat_id,
-            filepath=video_path,
-            caption=f"\U0001F3AC film2movie | {se_label}{quality_label} | {sub_label}\n\U0001F4BE {size_mb:.1f} MB",
-            status_msg=status_msg,
-            buttons=None,
-            supports_streaming=True,
-            ul_id=f"f2m_ul_{dl_id}",
-        )
-        active_downloads.pop(dl_id, None)
-    except asyncio.CancelledError:
-        active_downloads.pop(dl_id, None)
-        try: await status_msg.edit("\u274C دانلود لغو شد.", buttons=None)
-        except: pass
-    except Exception as e:
-        active_downloads.pop(dl_id, None)
-        logger.error(f"[F2M] download failed: {e}", exc_info=True)
-        try: await status_msg.edit(f"\u274C خطا: {e}", buttons=None)
-        except: pass
-    finally:
-        # Cleanup output dir
-        try:
-            shutil.rmtree(out_dir, ignore_errors=True)
-        except Exception:
-            pass
 
 
 async def iran_cb_quality(event):
@@ -14053,6 +13536,197 @@ async def _iran_download_task(event, user_id, url, quality_label):
 # ─── diycraft series episode callbacks ───
 
 dc_states = {}  # diycraft states (defined here if not already)
+
+
+# ─── sarrast.com callbacks (PDF/ZIP/images) ───
+
+async def sarrast_pdf_callback(event):
+    """ساخت PDF از فصل sarrast."""
+    data = event.data.decode()
+    msg_id = data.replace("sr_pdf_", "")
+    state_key = f"{event.chat_id}_{msg_id}"
+    state = sr_states.get(state_key)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده. دوباره لینک رو بفرست.", alert=True)
+        return
+    await event.answer("📄 شروع ساخت PDF...", alert=False)
+    from sarrast_handler import download_chapter_pdf
+    info = state["info"]
+    url = state["url"]
+    series_title = info.get("series_title", "sarrast")
+    chapter_title = info.get("title", "")
+    safe_series = re.sub(r'[<>:"/\\|?*]', "_", series_title)[:60]
+    safe_chapter = re.sub(r'[<>:"/\\|?*]', "_", chapter_title)[:60]
+    out_path = os.path.join(OUTPUT_FOLDER, f"sr_{safe_series}_{safe_chapter}_{int(time.time())}.pdf")
+    await event.edit(f"📄 در حال دانلود {len(info['images'])} تصویر و ساخت PDF...", buttons=None)
+    try:
+        result = await download_chapter_pdf(url, out_path, progress_cb=None)
+        if not result or not os.path.exists(result):
+            await event.edit("❌ ساخت PDF ناموفق بود.")
+            return
+        size_mb = os.path.getsize(result) / 1024 / 1024
+        await event.edit(f"✅ PDF ساخته شد ({size_mb:.1f} MB)\n📤 در حال آپلود...")
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=result,
+            caption=f"📖 **{series_title}**\n📺 **{chapter_title}**\n🖼 {len(info['images'])} تصویر\n💾 {size_mb:.1f} MB\n📄 PDF",
+            status_msg=event,
+            buttons=None,
+            supports_streaming=False,
+            force_document=True,
+        )
+        # Cleanup
+        try:
+            os.unlink(result)
+        except Exception:
+            pass
+        # Cleanup state
+        sr_states.pop(state_key, None)
+    except Exception as e:
+        logger.error(f"[Sarrast] PDF error: {e}", exc_info=True)
+        await event.edit(f"❌ خطا: {e}")
+
+
+async def sarrast_zip_callback(event):
+    """دانلود همه‌ی تصاویر به‌صورت ZIP."""
+    data = event.data.decode()
+    msg_id = data.replace("sr_zip_", "")
+    state_key = f"{event.chat_id}_{msg_id}"
+    state = sr_states.get(state_key)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    await event.answer("🖼 شروع دانلود ZIP...", alert=False)
+    from sarrast_handler import download_chapter_as_zip
+    info = state["info"]
+    url = state["url"]
+    series_title = info.get("series_title", "sarrast")
+    chapter_title = info.get("title", "")
+    safe_series = re.sub(r'[<>:"/\\|?*]', "_", series_title)[:60]
+    safe_chapter = re.sub(r'[<>:"/\\|?*]', "_", chapter_title)[:60]
+    out_path = os.path.join(OUTPUT_FOLDER, f"sr_{safe_series}_{safe_chapter}_{int(time.time())}.zip")
+    await event.edit(f"🖼 در حال دانلود {len(info['images'])} تصویر و ساخت ZIP...", buttons=None)
+    try:
+        result = await download_chapter_as_zip(url, out_path, progress_cb=None)
+        if not result or not os.path.exists(result):
+            await event.edit("❌ ساخت ZIP ناموفق بود.")
+            return
+        size_mb = os.path.getsize(result) / 1024 / 1024
+        await event.edit(f"✅ ZIP ساخته شد ({size_mb:.1f} MB)\n📤 در حال آپلود...")
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=result,
+            caption=f"📖 **{series_title}**\n📺 **{chapter_title}**\n🖼 {len(info['images'])} تصویر\n💾 {size_mb:.1f} MB\n📦 ZIP",
+            status_msg=event,
+            buttons=None,
+            supports_streaming=False,
+            force_document=True,
+        )
+        try:
+            os.unlink(result)
+        except Exception:
+            pass
+        sr_states.pop(state_key, None)
+    except Exception as e:
+        logger.error(f"[Sarrast] ZIP error: {e}", exc_info=True)
+        await event.edit(f"❌ خطا: {e}")
+
+
+async def sarrast_imgs_callback(event):
+    """ارسال تک‌تک تصاویر (به‌صورت آلبوم)."""
+    data = event.data.decode()
+    msg_id = data.replace("sr_imgs_", "")
+    state_key = f"{event.chat_id}_{msg_id}"
+    state = sr_states.get(state_key)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    await event.answer("🖼 شروع دانلود تصاویر...", alert=False)
+    from sarrast_handler import download_chapter_images
+    info = state["info"]
+    url = state["url"]
+    series_title = info.get("series_title", "sarrast")
+    chapter_title = info.get("title", "")
+    total = len(info["images"])
+    out_dir = os.path.join(OUTPUT_FOLDER, f"sr_imgs_{event.chat_id}_{int(time.time())}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Progress callback
+    last_pct = [-1]
+    async def progress_cb(done, total, current_url):
+        pct = done * 100 // total if total else 0
+        if pct != last_pct[0] and pct % 10 == 0:
+            last_pct[0] = pct
+            try:
+                await event.edit(f"🖼 دانلود تصاویر: {done}/{total} ({pct}%)", buttons=None)
+            except Exception:
+                pass
+
+    await event.edit(f"🖼 در حال دانلود {total} تصویر...", buttons=None)
+    try:
+        paths = await download_chapter_images(url, out_dir, progress_cb=progress_cb, max_concurrent=5)
+        if not paths:
+            await event.edit("❌ هیچ تصویری دانلود نشد.")
+            return
+        await event.edit(f"📤 در حال ارسال {len(paths)} تصویر به‌صورت آلبوم...")
+        # Send as album (up to 10 per album)
+        import shutil
+        from telethon.tl.functions.messages import SendMultiMediaRequest
+        from telethon.tl.types import InputMediaUploadedPhoto
+
+        BATCH_SIZE = 10
+        sent_count = 0
+        for batch_start in range(0, len(paths), BATCH_SIZE):
+            batch = paths[batch_start:batch_start + BATCH_SIZE]
+            # Upload each image
+            input_media = []
+            for i, p in enumerate(batch):
+                try:
+                    # Use FastTelethon for faster upload
+                    uploaded = await fast_upload_file(event.client, p)
+                    caption = (
+                        f"📖 **{series_title}**\n📺 **{chapter_title}**\n"
+                        f"🖼 تصویر {batch_start + i + 1}/{len(paths)}"
+                    ) if i == 0 else ""
+                    input_media.append(
+                        InputMediaUploadedPhoto(
+                            file=uploaded,
+                            caption=caption,
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"[Sarrast] Failed to upload image {batch_start + i}: {e}")
+                    continue
+            if input_media:
+                try:
+                    await event.client(SendMultiMediaRequest(
+                        peer=event.chat_id,
+                        multiquote=False,
+                        reply_to_msg_id=event.id if batch_start == 0 else None,
+                        media=input_media,
+                    ))
+                    sent_count += len(input_media)
+                except Exception as e:
+                    logger.error(f"[Sarrast] Album send failed: {e}")
+                    # Fallback: send one by one
+                    for m in input_media:
+                        try:
+                            await event.client.send_file(event.chat_id, m)
+                            sent_count += 1
+                        except Exception:
+                            pass
+        await event.edit(f"✅ {sent_count} تصویر ارسال شد.")
+        # Cleanup
+        try:
+            shutil.rmtree(out_dir, ignore_errors=True)
+        except Exception:
+            pass
+        sr_states.pop(state_key, None)
+    except Exception as e:
+        logger.error(f"[Sarrast] Images error: {e}", exc_info=True)
+        await event.edit(f"❌ خطا: {e}")
 
 
 async def diycraft_cb_episode(event):
@@ -14211,13 +13885,9 @@ async def xnxx_inline_handler(event):
                 elif default_src == "wh":
                     is_wh = True
                     parsed = parse_wh_inline_query(inner)
-            elif iran_srv and iran_srv in ("doostihaa", "farsiland", "film2movie"):
+            elif iran_srv and iran_srv in ("doostihaa", "farsiland"):
                 # کاربر /server رو روی سرور ایرانی گذاشته
                 is_iran = True
-                inner = raw
-            elif iran_srv == "imdbsub":
-                # کاربر IMDb + subf2m انتخاب کرده — مثل IMDb سرچ کن
-                is_imd = True
                 inner = raw
             else:
                 # دیفالت: XNXX
@@ -14416,25 +14086,13 @@ async def xnxx_inline_handler(event):
             query = inner
             page = 1
             sort = ""
-            iran_srv = user_iran_server.get(event.sender_id, "doostihaa")
-            logger.info(f"[INLINE] IRAN ({iran_srv}): q='{query}'")
-
-            # Dispatch based on selected server
-            if iran_srv == "film2movie":
-                from searcher.iranserver.film2movie_search import search_film2movie
-                from urllib.parse import quote
-                results = await search_film2movie(query, limit=10)
-            elif iran_srv == "farsiland":
-                from searcher.iranserver.farsiland_search import search_farsiland
-                results = await search_farsiland(query, limit=10)
-            else:  # doostihaa (default)
-                from searcher.iranserver.doostihaa_search import search_doostihaa
-                results = await search_doostihaa(query, limit=10)
-
+            logger.info(f"[INLINE] IRAN: q='{query}'")
+            # Use doostihaa search
+            from searcher.iranserver.doostihaa_search import search_doostihaa
+            results = await search_doostihaa(query, limit=10)  # محدود کردن نتایج برای سرعت بیشتر
             if not results:
                 await event.answer([], cache_time=30)
                 return
-
             iran_results = []
             builder = event.builder
             for item in results:
@@ -14443,27 +14101,11 @@ async def xnxx_inline_handler(event):
                 url = item.get("url", "")
                 cover = item.get("img", "")
                 is_series = item.get("is_series", False)
-                year = item.get("year", "")
                 type_icon = "\U0001F4FA" if is_series else "\U0001F3AC"
                 display_title = f"{type_icon} {title}"
-                # Server-specific labels
-                if iran_srv == "film2movie":
-                    src_label = "🎬 film2movie | 🔒 هاردساب فارسی"
-                elif iran_srv == "farsiland":
-                    src_label = "🎬 فارسی‌لند"
-                else:
-                    src_label = "🎬 دوستی‌ها"
-                desc_parts = [src_label]
-                if year:
-                    desc_parts.append(f"📅 {year}")
-                desc = " | ".join(desc_parts)
+                desc = "\U0001F4C0 \u062F\u0648\u0633\u062A\u06CC\u200C\u0647\u0627 | \U0001F310 \u062F\u0648\u0633\u062A\u06CC\u200C\u0647\u0627"
                 message_text = f"\U0001F3AC **{title}**\n\n\U0001F510 {url}"
-                # For film2movie, encode URL as payload (not post_id, since URL is needed)
-                if iran_srv == "film2movie":
-                    button_payload = f"irn_sel_{quote(url, safe='')}"
-                else:
-                    button_payload = f"irn_sel_{post_id}"
-                buttons = [[Button.inline("\U0001F4E5 \u062F\u0627\u0646\u0644\u0648\u062F", button_payload)]]
+                buttons = [[Button.inline("\U0001F4E5 \u062F\u0627\u0646\u0644\u0648\u062F", f"irn_sel_{post_id}")]]
                 try:
                     if cover:
                         thumb_doc = InputWebDocument(url=cover, size=0, mime_type="image/jpeg", attributes=[])
@@ -14476,7 +14118,7 @@ async def xnxx_inline_handler(event):
                 await event.answer(iran_results, cache_time=30)
             except Exception as ans_err:
                 logger.warning(f"[INLINE] IRAN answer error: {ans_err}")
-            logger.info(f"[INLINE] IRAN ({iran_srv}): {len(iran_results)} results for '{query}'")
+            logger.info(f"[INLINE] IRAN: {len(iran_results)} results for '{query}'")
             return
 
 
@@ -18670,12 +18312,6 @@ async def main():
         sharelink_callback, events.CallbackQuery(pattern=r"sharelink_(.+)")
     )
     client.add_event_handler(
-        direct_link_callback, events.CallbackQuery(pattern=r"dlink_(.+)")
-    )
-    client.add_event_handler(
-        mediafire_upload_callback, events.CallbackQuery(pattern=r"mfup_(.+)")
-    )
-    client.add_event_handler(
         uplod_callback, events.CallbackQuery(pattern=r"uplod_(.+)")
     )
     client.add_event_handler(
@@ -19221,17 +18857,16 @@ async def main():
     # diycraft series callbacks
     client.add_event_handler(diycraft_cb_episode, events.CallbackQuery(pattern=r"dcep_"))
     client.add_event_handler(diycraft_cb_close, events.CallbackQuery(pattern=r"dcclose$"))
+    # sarrast.com callbacks
+    client.add_event_handler(sarrast_pdf_callback, events.CallbackQuery(pattern=r"sr_pdf_"))
+    client.add_event_handler(sarrast_zip_callback, events.CallbackQuery(pattern=r"sr_zip_"))
+    client.add_event_handler(sarrast_imgs_callback, events.CallbackQuery(pattern=r"sr_imgs_"))
 
         # Iran server (doostihaa) callbacks
     client.add_event_handler(iran_cb_title, events.CallbackQuery(pattern=r"irn_sel_"))
     client.add_event_handler(iran_cb_quality, events.CallbackQuery(pattern=r"irn_q_"))
     client.add_event_handler(iran_cb_nosub, events.CallbackQuery(pattern=r"irn_nosub$"))
     client.add_event_handler(iran_cb_close, events.CallbackQuery(pattern=r"irn_close$"))
-    # Film2movie series/episode/quality callbacks
-    client.add_event_handler(film2movie_cb_season, events.CallbackQuery(pattern=r"if2_s_"))
-    client.add_event_handler(film2movie_cb_back, events.CallbackQuery(pattern=r"if2_back$"))
-    client.add_event_handler(film2movie_cb_episode, events.CallbackQuery(pattern=r"if2_e_"))
-    client.add_event_handler(film2movie_cb_quality, events.CallbackQuery(pattern=r"if2_q_"))
 
     client.add_event_handler(imdb_cb_title, events.CallbackQuery(pattern=r"imd_sel_"))
     client.add_event_handler(imdb_cb_season, events.CallbackQuery(pattern=r"imd_season_"))
