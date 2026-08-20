@@ -13677,20 +13677,51 @@ async def sarrast_imgs_callback(event):
         return
 
     # Step 2: ارسال به‌صورت آلبوم‌های ۱۰ تایی موازی
-    # از client.send_file خود Telethon استفاده می‌کنیم — به‌صورت photo (نه document)
-    await event.edit(f"📤 در حال ارسال {len(paths)} تصویر به‌صورت photo...", buttons=None)
+    # ابتدا WebP → JPEG تبدیل می‌کنیم چون Telegram WebP رو به‌عنوان استیکر می‌شناسه
+    await event.edit(f"🔄 در حال تبدیل WebP → JPEG و ارسال {len(paths)} تصویر...", buttons=None)
     import shutil
+
+    def _convert_to_jpeg(src_path: str) -> str:
+        """تبدیل WebP به JPEG (در همان پوشه، با پسوند .jpg)."""
+        try:
+            from PIL import Image
+            img = Image.open(src_path)
+            # Convert to RGB (JPEG doesn't support alpha)
+            if img.mode in ("RGBA", "P", "LA"):
+                # Composite over white background
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                if img.mode == "P":
+                    img = img.convert("RGBA")
+                bg.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+                img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            jpg_path = src_path.rsplit(".", 1)[0] + ".jpg"
+            img.save(jpg_path, "JPEG", quality=92, optimize=True)
+            return jpg_path
+        except Exception as e:
+            logger.warning(f"[Sarrast] JPEG conversion failed for {src_path}: {e}")
+            return src_path  # Fallback to original
+
+    # Convert all WebP to JPEG (in thread executor to not block event loop)
+    loop = asyncio.get_event_loop()
+    jpg_paths = []
+    for p in paths:
+        try:
+            jpg_p = await loop.run_in_executor(None, _convert_to_jpeg, p)
+            jpg_paths.append(jpg_p)
+        except Exception as e:
+            logger.warning(f"[Sarrast] convert error: {e}")
+            jpg_paths.append(p)  # Fallback
+
+    await event.edit(f"📤 در حال ارسال {len(jpg_paths)} تصویر به‌صورت photo...", buttons=None)
 
     BATCH_SIZE = 10
     sent_count = 0
-    total_paths = len(paths)
-    first_caption = (
-        f"📖 **{series_title}**\n📺 **{chapter_title}**\n"
-        f"🖼 تصاویر ۱-{min(BATCH_SIZE, total_paths)}/{total_paths}"
-    )
+    total_paths = len(jpg_paths)
 
     async def send_batch(batch_start_idx: int, batch_paths: list):
-        """ارسال یه آلبوم ۱۰ تایی به‌صورت photo."""
+        """ارسال یه آلبوم ۱۰ تایی به‌صورت photo (JPEG)."""
         nonlocal sent_count
         # Caption فقط روی اولین تصویر
         caption = (
@@ -13700,6 +13731,7 @@ async def sarrast_imgs_callback(event):
         try:
             # client.send_file با لیست فایل‌ها → آلبوم خودکار می‌سازه
             # force_document=False → به‌صورت photo (نه document) ارسال می‌شه
+            # چون JPEG هست، به‌عنوان photo شناخته می‌شه (نه استیکر)
             await event.client.send_file(
                 event.chat_id,
                 batch_paths,
@@ -13737,8 +13769,8 @@ async def sarrast_imgs_callback(event):
             return await send_batch(start, batch)
 
     batch_tasks = []
-    for batch_start in range(0, len(paths), BATCH_SIZE):
-        batch = paths[batch_start:batch_start + BATCH_SIZE]
+    for batch_start in range(0, len(jpg_paths), BATCH_SIZE):
+        batch = jpg_paths[batch_start:batch_start + BATCH_SIZE]
         batch_tasks.append(process_batch(batch_start, batch))
 
     # Wait for all batches to complete
