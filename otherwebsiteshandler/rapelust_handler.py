@@ -354,7 +354,7 @@ def _parse_iso8601_duration(s: str) -> Optional[int]:
 
 
 def _extract_video_source(html: str) -> Optional[dict]:
-    """
+    r"""
     استخراج URL ویدیو از data-item attribute روی <div class="flowplayer">.
 
     الگوی HTML:

@@ -13559,10 +13559,40 @@ async def sarrast_pdf_callback(event):
     safe_chapter = re.sub(r'[<>:"/\\|?*]', "_", chapter_title)[:60]
     out_path = os.path.join(OUTPUT_FOLDER, f"sr_{safe_series}_{safe_chapter}_{int(time.time())}.pdf")
     await event.edit(f"📄 در حال دانلود {len(info['images'])} تصویر و ساخت PDF...", buttons=None)
+
+    # progress callback برای نمایش پیشرفت دانلود به کاربر
+    last_pct = [-1]
+    last_update_time = [0.0]
+    total_images = len(info['images'])
+
+    async def _progress_cb(done, total, current_url):
+        if not total:
+            return
+        pct = done * 100 // total
+        now = time.time()
+        # فقط هر ۵ ثانیه یا در درصد کلیدی آپدیت کن (محدود کردن rate)
+        if pct != last_pct[0] and (pct % 20 == 0 or now - last_update_time[0] > 5):
+            last_pct[0] = pct
+            last_update_time[0] = now
+            try:
+                if done < total:
+                    await event.edit(
+                        f"📄 در حال دانلود تصاویر: {done}/{total} ({pct}%)",
+                        buttons=None,
+                    )
+                else:
+                    await event.edit(
+                        f"📄 دانلود کامل شد. در حال ساخت PDF از {total} تصویر...",
+                        buttons=None,
+                    )
+            except Exception:
+                pass  # ignore edit errors (event may be stale)
+
     try:
-        result = await download_chapter_pdf(url, out_path, progress_cb=None)
+        result = await download_chapter_pdf(url, out_path, progress_cb=_progress_cb)
         if not result or not os.path.exists(result):
-            await event.edit("❌ ساخت PDF ناموفق بود.")
+            await event.edit("❌ ساخت PDF ناموفق بود. لطفاً دوباره تلاش کن.")
+            sr_states.pop(state_key, None)
             return
         size_mb = os.path.getsize(result) / 1024 / 1024
         await event.edit(f"✅ PDF ساخته شد ({size_mb:.1f} MB)\n📤 در حال آپلود...")
@@ -13585,7 +13615,11 @@ async def sarrast_pdf_callback(event):
         sr_states.pop(state_key, None)
     except Exception as e:
         logger.error(f"[Sarrast] PDF error: {e}", exc_info=True)
-        await event.edit(f"❌ خطا: {e}")
+        try:
+            await event.edit(f"❌ خطا در ساخت PDF: {e}\n\nدوباره تلاش کن یا از گزینه ZIP استفاده کن.")
+        except Exception:
+            pass
+        sr_states.pop(state_key, None)
 
 
 async def sarrast_zip_callback(event):

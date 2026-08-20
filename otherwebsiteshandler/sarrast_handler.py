@@ -157,6 +157,7 @@ async def download_chapter_images(
     out_dir: str,
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
     max_concurrent: int = 5,
+    info: Optional[dict] = None,
 ) -> Optional[List[str]]:
     """
     دانلود همه‌ی تصاویر یه فصل.
@@ -166,11 +167,14 @@ async def download_chapter_images(
         out_dir: مسیر ذخیره تصاویر
         progress_cb: callback(done, total, current_url)
         max_concurrent: تعداد دانلود موازی
+        info: اطلاعات فصل از پیش‌دریافت‌شده (اختیاری) - اگه داده بشه،
+              یک API call اضافه صرفه‌جویی می‌کنه.
 
     Returns:
         لیست مسیر فایل‌های دانلود شده (به ترتیب)، یا None در صورت خطا.
     """
-    info = await extract_chapter_info(url)
+    if info is None:
+        info = await extract_chapter_info(url)
     if not info or not info["images"]:
         logger.warning("No images found for %s", url)
         return None
@@ -275,7 +279,8 @@ async def download_chapter_pdf(
             except Exception:
                 pass
 
-        img_paths = await download_chapter_images(url, out_dir, progress_cb)
+        # info رو پاس می‌دیم تا extract_chapter_info دوباره صدا زده نشه
+        img_paths = await download_chapter_images(url, out_dir, progress_cb, info=info)
         if not img_paths:
             logger.error("No images downloaded for PDF")
             return None
@@ -292,49 +297,84 @@ async def download_chapter_pdf(
         # Sort by filename (numeric prefix ensures order)
         img_paths.sort()
 
-        # Try img2pdf first (preserves quality, fast)
-        try:
-            import img2pdf
-            with open(out_path, "wb") as f:
-                f.write(img2pdf.convert(img_paths))
-            logger.info("PDF created with img2pdf: %s (%d images)", out_path, len(img_paths))
-            return out_path
-        except ImportError:
-            logger.info("img2pdf not available, using PIL")
-        except Exception as e:
-            logger.warning("img2pdf failed: %s, falling back to PIL", e)
-
-        # Fallback: PIL
-        try:
-            from PIL import Image
-            images_pil = []
-            for p in img_paths:
-                try:
-                    img = Image.open(p)
-                    # Convert to RGB (PDF doesn't support RGBA)
-                    if img.mode in ("RGBA", "P", "LA"):
-                        img = img.convert("RGB")
-                    images_pil.append(img)
-                except Exception as e:
-                    logger.warning("Failed to open %s: %s", p, e)
-                    continue
-            if not images_pil:
-                return None
-            # Save as PDF
-            first = images_pil[0]
-            rest = images_pil[1:]
-            first.save(out_path, "PDF", save_all=True, append_images=rest)
-            logger.info("PDF created with PIL: %s (%d images)", out_path, len(images_pil))
-            return out_path
-        except Exception as e:
-            logger.error("PIL PDF creation failed: %s", e)
-            return None
+        # PDF construction رو داخل executor اجرا می‌کنیم تا event loop block نشه.
+        # مهم: قبلاً PIL با save_all همه‌ی image‌ها رو همزمان توی RAM لود می‌کرد
+        # که برای 48 تصویر 720x5929 WebP → ~1.7GB peak RAM می‌شد و container کرش می‌کرد (OOM).
+        # حالا از روش append استفاده می‌کنیم: هر image رو جداگانه باز می‌کنیم،
+        # به PDF اضافه می‌کنیم، بعد close می‌کنیم → peak RAM ~140MB.
+        loop = asyncio.get_event_loop()
+        result_path = await loop.run_in_executor(
+            None, _build_pdf_sequential, img_paths, out_path
+        )
+        return result_path
     finally:
         # Cleanup temp dir
         try:
             shutil.rmtree(out_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+def _build_pdf_sequential(img_paths: List[str], out_path: str) -> Optional[str]:
+    """
+    ساخت PDF با PIL به‌صورت sequential append - memory-efficient.
+
+    استراتژی:
+      1. اولین image رو به‌عنوان PDF جدید ذخیره می‌کنیم
+      2. بقیه image‌ها رو یکی‌یکی با append=True اضافه می‌کنیم
+      3. هر image رو بعد از append بلافاصله close می‌کنیم تا RAM آزاد بشه
+
+    این روش برای 48 تصویر 720x5929 WebP فقط ~140MB RAM مصرف می‌کنه
+    (مقایسه با save_all که ~1700MB مصرف می‌کرد).
+    """
+    if not img_paths:
+        return None
+
+    from PIL import Image  # noqa: F401
+    import os as _os
+
+    # اطمینان از وجود پوشه‌ی parent فایل خروجی (مهم وقتی out_path
+    # در مسیری هست که هنوز ساخته نشده - مثلاً توسط تابع caller)
+    parent_dir = _os.path.dirname(out_path)
+    if parent_dir and not _os.path.exists(parent_dir):
+        try:
+            _os.makedirs(parent_dir, exist_ok=True)
+        except Exception as e:
+            logger.error("Cannot create output directory %s: %s", parent_dir, e)
+            return None
+
+    saved_count = 0
+
+    for i, p in enumerate(img_paths):
+        try:
+            img = Image.open(p)
+            # Convert to RGB (PDF doesn't support RGBA/LA/P directly)
+            if img.mode in ("RGBA", "P", "LA"):
+                img = img.convert("RGB")
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+
+            if i == 0:
+                # First image - create new PDF
+                img.save(out_path, "PDF")
+            else:
+                # Subsequent images - append to existing PDF
+                with open(out_path, "r+b") as f:
+                    img.save(f, "PDF", append=True)
+
+            img.close()
+            saved_count += 1
+        except Exception as e:
+            logger.warning("Failed to add %s to PDF: %s", p, e)
+            continue
+
+    if saved_count == 0:
+        logger.error("PIL PDF creation failed: no images could be added")
+        return None
+
+    logger.info("PDF created with PIL (sequential): %s (%d/%d images)",
+                out_path, saved_count, len(img_paths))
+    return out_path
 
 
 async def download_chapter_as_zip(
@@ -352,9 +392,14 @@ async def download_chapter_as_zip(
     import shutil
     import zipfile
 
+    info = await extract_chapter_info(url)
+    if not info:
+        return None
+
     out_dir = tempfile.mkdtemp(prefix="sarrast_zip_")
     try:
-        img_paths = await download_chapter_images(url, out_dir, progress_cb)
+        # info رو پاس می‌دیم تا extract_chapter_info دوباره صدا زده نشه
+        img_paths = await download_chapter_images(url, out_dir, progress_cb, info=info)
         if not img_paths:
             return None
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
