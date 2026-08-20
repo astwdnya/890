@@ -486,6 +486,66 @@ from otherwebsiteshandler.luxuretv_handler import (
     extract_luxuretv_qualities,
     download_luxuretv_direct,
 )
+# ─── New site handlers (27 sites) ──────────────────────────
+from otherwebsiteshandler.kvs_handler import (
+    is_hellporno_url, is_alphaporno_url, is_bravoteens_url, is_bravotube_url,
+    is_crocotube_url, is_porngo_url,
+    extract_hellporno_qualities, extract_alphaporno_qualities,
+    extract_bravoteens_qualities, extract_bravotube_qualities,
+    extract_crocotube_qualities, extract_porngo_qualities,
+    download_hellporno_direct, download_hellporno_m3u8,
+    download_alphaporno_direct, download_alphaporno_m3u8,
+    download_bravoteens_direct, download_bravoteens_m3u8,
+    download_bravotube_direct, download_bravotube_m3u8,
+    download_crocotube_direct, download_crocotube_m3u8,
+    download_porngo_direct, download_porngo_m3u8,
+    hellporno_sessions, alphaporno_sessions, bravoteens_sessions,
+    bravotube_sessions, crocotube_sessions, porngo_sessions,
+)
+from otherwebsiteshandler.txxx_network_handler import (
+    is_txxx_url, is_hclips_url, is_upornia_url, is_vjav_url, is_hdzog_url,
+    extract_txxx_qualities, extract_hclips_qualities,
+    extract_upornia_qualities, extract_vjav_qualities, extract_hdzog_qualities,
+    download_txxx_direct, download_txxx_m3u8,
+    download_hclips_direct, download_hclips_m3u8,
+    download_upornia_direct, download_upornia_m3u8,
+    download_vjav_direct, download_vjav_m3u8,
+    download_hdzog_direct, download_hdzog_m3u8,
+    txxx_sessions, hclips_sessions, upornia_sessions,
+    vjav_sessions, hdzog_sessions,
+)
+from otherwebsiteshandler.drtuber_handler import (
+    is_drtuber_url, extract_drtuber_qualities,
+    download_drtuber_direct, download_drtuber_m3u8, drtuber_sessions,
+)
+from otherwebsiteshandler.porntop_handler import (
+    is_porntop_url, extract_porntop_qualities,
+    download_porntop_direct, download_porntop_m3u8, porntop_sessions,
+)
+from otherwebsiteshandler.generic_handler import (
+    is_pornone_url, is_pornhd_url, is_xtube_url, is_mofosex_url, is_fapvid_url,
+    is_monsterporn_url, is_fetishkitsch_url, is_javhihi_url, is_tokyoporn_url,
+    is_javwhores_url, is_goodporn_url, is_porn365_url, is_fapcake_url, is_fux_url,
+    extract_pornone_qualities, extract_pornhd_qualities, extract_xtube_qualities,
+    extract_mofosex_qualities, extract_fapvid_qualities, extract_monsterporn_qualities,
+    extract_fetishkitsch_qualities, extract_javhihi_qualities, extract_tokyoporn_qualities,
+    extract_javwhores_qualities, extract_goodporn_qualities, extract_porn365_qualities,
+    extract_fapcake_qualities, extract_fux_qualities,
+    download_pornone_direct, download_pornhd_direct, download_xtube_direct,
+    download_mofosex_direct, download_fapvid_direct, download_monsterporn_direct,
+    download_fetishkitsch_direct, download_javhihi_direct, download_tokyoporn_direct,
+    download_javwhores_direct, download_goodporn_direct, download_porn365_direct,
+    download_fapcake_direct, download_fux_direct,
+    download_pornone_m3u8, download_pornhd_m3u8, download_xtube_m3u8,
+    download_mofosex_m3u8, download_fapvid_m3u8, download_monsterporn_m3u8,
+    download_fetishkitsch_m3u8, download_javhihi_m3u8, download_tokyoporn_m3u8,
+    download_javwhores_m3u8, download_goodporn_m3u8, download_porn365_m3u8,
+    download_fapcake_m3u8, download_fux_m3u8,
+    pornone_sessions, pornhd_sessions, xtube_sessions, mofosex_sessions,
+    fapvid_sessions, monsterporn_sessions, fetishkitsch_sessions,
+    javhihi_sessions, tokyoporn_sessions, javwhores_sessions,
+    goodporn_sessions, porn365_sessions, fapcake_sessions, fux_sessions,
+)
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -5208,6 +5268,23 @@ async def generic_url_handler(event):
         finally:
             processing_messages.discard(msg_id)
         return
+
+    # ─── New sites (27 sites) - generic dispatch loop ──────────
+    for _is_url_fn, _process_fn, _log_name in NEW_SITE_HANDLERS:
+        if _is_url_fn(target_url):
+            logger.info(f"[URL] {_log_name} detected | url={target_url[:120]}")
+            status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+            try:
+                await _process_fn(event, target_url, status_msg)
+            except Exception as _e:
+                logger.error(f"[URL] {_log_name} error: {_e}", exc_info=True)
+                try:
+                    await status_msg.edit(f"❌ خطا: {_e}")
+                except Exception:
+                    pass
+            finally:
+                processing_messages.discard(msg_id)
+            return
 
     if (
         YOUTUBE_RE.match(target_url)
@@ -14845,6 +14922,159 @@ async def process_pornzog_request(event, url: str, status_msg):
     "Pornzog",
 )[1:]
 
+# ─── New site handlers (27 sites) ──────────────────────────
+# هر سایت یه prefix منحصر به فرد داره (هیچ تداخلی با prefix‌های موجود نداره)
+
+# KVS-based sites (6 sites)
+process_hellporno_request, hellporno_quality_callback, hellporno_cancel_callback = _make_site_handler(
+    "hpo", extract_hellporno_qualities, download_hellporno_direct, download_hellporno_m3u8,
+    hellporno_sessions, "HellPorno",
+)
+process_alphaporno_request, alphaporno_quality_callback, alphaporno_cancel_callback = _make_site_handler(
+    "apo", extract_alphaporno_qualities, download_alphaporno_direct, download_alphaporno_m3u8,
+    alphaporno_sessions, "AlphaPorno",
+)
+process_bravoteens_request, bravoteens_quality_callback, bravoteens_cancel_callback = _make_site_handler(
+    "bte", extract_bravoteens_qualities, download_bravoteens_direct, download_bravoteens_m3u8,
+    bravoteens_sessions, "BravoTeens",
+)
+process_bravotube_request, bravotube_quality_callback, bravotube_cancel_callback = _make_site_handler(
+    "btu", extract_bravotube_qualities, download_bravotube_direct, download_bravotube_m3u8,
+    bravotube_sessions, "BravoTube",
+)
+process_crocotube_request, crocotube_quality_callback, crocotube_cancel_callback = _make_site_handler(
+    "ctu", extract_crocotube_qualities, download_crocotube_direct, download_crocotube_m3u8,
+    crocotube_sessions, "CrocoTube",
+)
+process_porngo_request, porngo_quality_callback, porngo_cancel_callback = _make_site_handler(
+    "pgo", extract_porngo_qualities, download_porngo_direct, download_porngo_m3u8,
+    porngo_sessions, "PornGo",
+)
+
+# Txxx network (5 sites)
+process_txxx_request, txxx_quality_callback, txxx_cancel_callback = _make_site_handler(
+    "txx", extract_txxx_qualities, download_txxx_direct, download_txxx_m3u8,
+    txxx_sessions, "Txxx",
+)
+process_hclips_request, hclips_quality_callback, hclips_cancel_callback = _make_site_handler(
+    "hcl", extract_hclips_qualities, download_hclips_direct, download_hclips_m3u8,
+    hclips_sessions, "HClips",
+)
+process_upornia_request, upornia_quality_callback, upornia_cancel_callback = _make_site_handler(
+    "upn2", extract_upornia_qualities, download_upornia_direct, download_upornia_m3u8,
+    upornia_sessions, "Upornia",
+)
+process_vjav_request, vjav_quality_callback, vjav_cancel_callback = _make_site_handler(
+    "vja", extract_vjav_qualities, download_vjav_direct, download_vjav_m3u8,
+    vjav_sessions, "VJAV",
+)
+process_hdzog_request, hdzog_quality_callback, hdzog_cancel_callback = _make_site_handler(
+    "hdz2", extract_hdzog_qualities, download_hdzog_direct, download_hdzog_m3u8,
+    hdzog_sessions, "HDzog",
+)
+
+# DrTuber (custom API extraction)
+process_drtuber_request, drtuber_quality_callback, drtuber_cancel_callback = _make_site_handler(
+    "drt", extract_drtuber_qualities, download_drtuber_direct, download_drtuber_m3u8,
+    drtuber_sessions, "DrTuber",
+)
+
+# PornTop (KVS + yt-dlp fallback)
+process_porntop_request, porntop_quality_callback, porntop_cancel_callback = _make_site_handler(
+    "ptp2", extract_porntop_qualities, download_porntop_direct, download_porntop_m3u8,
+    porntop_sessions, "PornTop",
+)
+
+# Generic yt-dlp fallback (14 sites)
+process_pornone_request, pornone_quality_callback, pornone_cancel_callback = _make_site_handler(
+    "pon", extract_pornone_qualities, download_pornone_direct, download_pornone_m3u8,
+    pornone_sessions, "PornOne",
+)
+process_pornhd_request, pornhd_quality_callback, pornhd_cancel_callback = _make_site_handler(
+    "phd2", extract_pornhd_qualities, download_pornhd_direct, download_pornhd_m3u8,
+    pornhd_sessions, "PornHD",
+)
+process_xtube_request, xtube_quality_callback, xtube_cancel_callback = _make_site_handler(
+    "xtu", extract_xtube_qualities, download_xtube_direct, download_xtube_m3u8,
+    xtube_sessions, "xTube",
+)
+process_mofosex_request, mofosex_quality_callback, mofosex_cancel_callback = _make_site_handler(
+    "mfs2", extract_mofosex_qualities, download_mofosex_direct, download_mofosex_m3u8,
+    mofosex_sessions, "MofoSex",
+)
+process_fapvid_request, fapvid_quality_callback, fapvid_cancel_callback = _make_site_handler(
+    "fpv", extract_fapvid_qualities, download_fapvid_direct, download_fapvid_m3u8,
+    fapvid_sessions, "FapVid",
+)
+process_monsterporn_request, monsterporn_quality_callback, monsterporn_cancel_callback = _make_site_handler(
+    "mst", extract_monsterporn_qualities, download_monsterporn_direct, download_monsterporn_m3u8,
+    monsterporn_sessions, "MonsterPorn",
+)
+process_fetishkitsch_request, fetishkitsch_quality_callback, fetishkitsch_cancel_callback = _make_site_handler(
+    "ftk", extract_fetishkitsch_qualities, download_fetishkitsch_direct, download_fetishkitsch_m3u8,
+    fetishkitsch_sessions, "FetishKitsch",
+)
+process_javhihi_request, javhihi_quality_callback, javhihi_cancel_callback = _make_site_handler(
+    "jhh", extract_javhihi_qualities, download_javhihi_direct, download_javhihi_m3u8,
+    javhihi_sessions, "JAVHiHi",
+)
+process_tokyoporn_request, tokyoporn_quality_callback, tokyoporn_cancel_callback = _make_site_handler(
+    "tkp", extract_tokyoporn_qualities, download_tokyoporn_direct, download_tokyoporn_m3u8,
+    tokyoporn_sessions, "TokyoPorn",
+)
+process_javwhores_request, javwhores_quality_callback, javwhores_cancel_callback = _make_site_handler(
+    "jwh", extract_javwhores_qualities, download_javwhores_direct, download_javwhores_m3u8,
+    javwhores_sessions, "JAVWhores",
+)
+process_goodporn_request, goodporn_quality_callback, goodporn_cancel_callback = _make_site_handler(
+    "gdp", extract_goodporn_qualities, download_goodporn_direct, download_goodporn_m3u8,
+    goodporn_sessions, "GoodPorn",
+)
+process_porn365_request, porn365_quality_callback, porn365_cancel_callback = _make_site_handler(
+    "p3652", extract_porn365_qualities, download_porn365_direct, download_porn365_m3u8,
+    porn365_sessions, "Porn365",
+)
+process_fapcake_request, fapcake_quality_callback, fapcake_cancel_callback = _make_site_handler(
+    "fpc", extract_fapcake_qualities, download_fapcake_direct, download_fapcake_m3u8,
+    fapcake_sessions, "FapCup",
+)
+process_fux_request, fux_quality_callback, fux_cancel_callback = _make_site_handler(
+    "fux", extract_fux_qualities, download_fux_direct, download_fux_m3u8,
+    fux_sessions, "Fux",
+)
+
+
+# Helper: list of (is_url_fn, process_fn, log_name) for fast URL dispatch
+NEW_SITE_HANDLERS = [
+    (is_hellporno_url, process_hellporno_request, "HellPorno"),
+    (is_alphaporno_url, process_alphaporno_request, "AlphaPorno"),
+    (is_bravoteens_url, process_bravoteens_request, "BravoTeens"),
+    (is_bravotube_url, process_bravotube_request, "BravoTube"),
+    (is_crocotube_url, process_crocotube_request, "CrocoTube"),
+    (is_porngo_url, process_porngo_request, "PornGo"),
+    (is_txxx_url, process_txxx_request, "Txxx"),
+    (is_hclips_url, process_hclips_request, "HClips"),
+    (is_upornia_url, process_upornia_request, "Upornia"),
+    (is_vjav_url, process_vjav_request, "VJAV"),
+    (is_hdzog_url, process_hdzog_request, "HDzog"),
+    (is_drtuber_url, process_drtuber_request, "DrTuber"),
+    (is_porntop_url, process_porntop_request, "PornTop"),
+    (is_pornone_url, process_pornone_request, "PornOne"),
+    (is_pornhd_url, process_pornhd_request, "PornHD"),
+    (is_xtube_url, process_xtube_request, "xTube"),
+    (is_mofosex_url, process_mofosex_request, "MofoSex"),
+    (is_fapvid_url, process_fapvid_request, "FapVid"),
+    (is_monsterporn_url, process_monsterporn_request, "MonsterPorn"),
+    (is_fetishkitsch_url, process_fetishkitsch_request, "FetishKitsch"),
+    (is_javhihi_url, process_javhihi_request, "JAVHiHi"),
+    (is_tokyoporn_url, process_tokyoporn_request, "TokyoPorn"),
+    (is_javwhores_url, process_javwhores_request, "JAVWhores"),
+    (is_goodporn_url, process_goodporn_request, "GoodPorn"),
+    (is_porn365_url, process_porn365_request, "Porn365"),
+    (is_fapcake_url, process_fapcake_request, "FapCup"),
+    (is_fux_url, process_fux_request, "Fux"),
+]
+
 # ─── XXXBP (custom handlers: needs page_url + video_url) ───
 
 xxxbp_sessions: dict = {}
@@ -18875,6 +19105,63 @@ async def main():
     client.add_event_handler(
         setsearch_callback, events.CallbackQuery(pattern=r"setsearch_.+")
     )
+
+    # ─── New site handlers (27 sites) ─────────────────
+    # ثبت callback‌های همه‌ی سایت‌های جدید
+    client.add_event_handler(hellporno_quality_callback, events.CallbackQuery(pattern=r"hpo_q_.+"))
+    client.add_event_handler(hellporno_cancel_callback, events.CallbackQuery(pattern=r"hpo_cancel_.+"))
+    client.add_event_handler(alphaporno_quality_callback, events.CallbackQuery(pattern=r"apo_q_.+"))
+    client.add_event_handler(alphaporno_cancel_callback, events.CallbackQuery(pattern=r"apo_cancel_.+"))
+    client.add_event_handler(bravoteens_quality_callback, events.CallbackQuery(pattern=r"bte_q_.+"))
+    client.add_event_handler(bravoteens_cancel_callback, events.CallbackQuery(pattern=r"bte_cancel_.+"))
+    client.add_event_handler(bravotube_quality_callback, events.CallbackQuery(pattern=r"btu_q_.+"))
+    client.add_event_handler(bravotube_cancel_callback, events.CallbackQuery(pattern=r"btu_cancel_.+"))
+    client.add_event_handler(crocotube_quality_callback, events.CallbackQuery(pattern=r"ctu_q_.+"))
+    client.add_event_handler(crocotube_cancel_callback, events.CallbackQuery(pattern=r"ctu_cancel_.+"))
+    client.add_event_handler(porngo_quality_callback, events.CallbackQuery(pattern=r"pgo_q_.+"))
+    client.add_event_handler(porngo_cancel_callback, events.CallbackQuery(pattern=r"pgo_cancel_.+"))
+    client.add_event_handler(txxx_quality_callback, events.CallbackQuery(pattern=r"txx_q_.+"))
+    client.add_event_handler(txxx_cancel_callback, events.CallbackQuery(pattern=r"txx_cancel_.+"))
+    client.add_event_handler(hclips_quality_callback, events.CallbackQuery(pattern=r"hcl_q_.+"))
+    client.add_event_handler(hclips_cancel_callback, events.CallbackQuery(pattern=r"hcl_cancel_.+"))
+    client.add_event_handler(upornia_quality_callback, events.CallbackQuery(pattern=r"upn2_q_.+"))
+    client.add_event_handler(upornia_cancel_callback, events.CallbackQuery(pattern=r"upn2_cancel_.+"))
+    client.add_event_handler(vjav_quality_callback, events.CallbackQuery(pattern=r"vja_q_.+"))
+    client.add_event_handler(vjav_cancel_callback, events.CallbackQuery(pattern=r"vja_cancel_.+"))
+    client.add_event_handler(hdzog_quality_callback, events.CallbackQuery(pattern=r"hdz2_q_.+"))
+    client.add_event_handler(hdzog_cancel_callback, events.CallbackQuery(pattern=r"hdz2_cancel_.+"))
+    client.add_event_handler(drtuber_quality_callback, events.CallbackQuery(pattern=r"drt_q_.+"))
+    client.add_event_handler(drtuber_cancel_callback, events.CallbackQuery(pattern=r"drt_cancel_.+"))
+    client.add_event_handler(porntop_quality_callback, events.CallbackQuery(pattern=r"ptp2_q_.+"))
+    client.add_event_handler(porntop_cancel_callback, events.CallbackQuery(pattern=r"ptp2_cancel_.+"))
+    client.add_event_handler(pornone_quality_callback, events.CallbackQuery(pattern=r"pon_q_.+"))
+    client.add_event_handler(pornone_cancel_callback, events.CallbackQuery(pattern=r"pon_cancel_.+"))
+    client.add_event_handler(pornhd_quality_callback, events.CallbackQuery(pattern=r"phd2_q_.+"))
+    client.add_event_handler(pornhd_cancel_callback, events.CallbackQuery(pattern=r"phd2_cancel_.+"))
+    client.add_event_handler(xtube_quality_callback, events.CallbackQuery(pattern=r"xtu_q_.+"))
+    client.add_event_handler(xtube_cancel_callback, events.CallbackQuery(pattern=r"xtu_cancel_.+"))
+    client.add_event_handler(mofosex_quality_callback, events.CallbackQuery(pattern=r"mfs2_q_.+"))
+    client.add_event_handler(mofosex_cancel_callback, events.CallbackQuery(pattern=r"mfs2_cancel_.+"))
+    client.add_event_handler(fapvid_quality_callback, events.CallbackQuery(pattern=r"fpv_q_.+"))
+    client.add_event_handler(fapvid_cancel_callback, events.CallbackQuery(pattern=r"fpv_cancel_.+"))
+    client.add_event_handler(monsterporn_quality_callback, events.CallbackQuery(pattern=r"mst_q_.+"))
+    client.add_event_handler(monsterporn_cancel_callback, events.CallbackQuery(pattern=r"mst_cancel_.+"))
+    client.add_event_handler(fetishkitsch_quality_callback, events.CallbackQuery(pattern=r"ftk_q_.+"))
+    client.add_event_handler(fetishkitsch_cancel_callback, events.CallbackQuery(pattern=r"ftk_cancel_.+"))
+    client.add_event_handler(javhihi_quality_callback, events.CallbackQuery(pattern=r"jhh_q_.+"))
+    client.add_event_handler(javhihi_cancel_callback, events.CallbackQuery(pattern=r"jhh_cancel_.+"))
+    client.add_event_handler(tokyoporn_quality_callback, events.CallbackQuery(pattern=r"tkp_q_.+"))
+    client.add_event_handler(tokyoporn_cancel_callback, events.CallbackQuery(pattern=r"tkp_cancel_.+"))
+    client.add_event_handler(javwhores_quality_callback, events.CallbackQuery(pattern=r"jwh_q_.+"))
+    client.add_event_handler(javwhores_cancel_callback, events.CallbackQuery(pattern=r"jwh_cancel_.+"))
+    client.add_event_handler(goodporn_quality_callback, events.CallbackQuery(pattern=r"gdp_q_.+"))
+    client.add_event_handler(goodporn_cancel_callback, events.CallbackQuery(pattern=r"gdp_cancel_.+"))
+    client.add_event_handler(porn365_quality_callback, events.CallbackQuery(pattern=r"p3652_q_.+"))
+    client.add_event_handler(porn365_cancel_callback, events.CallbackQuery(pattern=r"p3652_cancel_.+"))
+    client.add_event_handler(fapcake_quality_callback, events.CallbackQuery(pattern=r"fpc_q_.+"))
+    client.add_event_handler(fapcake_cancel_callback, events.CallbackQuery(pattern=r"fpc_cancel_.+"))
+    client.add_event_handler(fux_quality_callback, events.CallbackQuery(pattern=r"fux_q_.+"))
+    client.add_event_handler(fux_cancel_callback, events.CallbackQuery(pattern=r"fux_cancel_.+"))
 
     # ===== Command handlers =====
     client.add_event_handler(
