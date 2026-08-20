@@ -75,7 +75,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
-from sarrast_handler import is_sarrast_url
+from otherwebsiteshandler.sarrast_handler import is_sarrast_url
 
 # Iran server (doostihaa + farsiland)
 IRAN_SERVER = os.getenv('IRAN_SERVER', 'doostihaa')  # doostihaa or farsiland
@@ -5173,7 +5173,7 @@ async def generic_url_handler(event):
         logger.info(f"[URL] sarrast detected | url={target_url[:120]}")
         status_msg = await event.reply("📖 در حال دریافت اطلاعات فصل...")
         try:
-            from sarrast_handler import (
+            from otherwebsiteshandler.sarrast_handler import (
                 extract_chapter_info, download_chapter_pdf, download_chapter_images,
             )
             info = await extract_chapter_info(target_url)
@@ -5191,8 +5191,8 @@ async def generic_url_handler(event):
                 f"یکی از گزینه‌ها رو انتخاب کن:",
                 buttons=[
                     [Button.inline("📄 دریافت PDF (تمام تصاویر)", f"sr_pdf_{event.id}")],
-                    [Button.inline("🖼 دریافت تصاویر (ZIP)", f"sr_zip_{event.id}")],
-                    [Button.inline("🖼 دریافت تصاویر (تک‌تک)", f"sr_imgs_{event.id}")],
+                    [Button.inline("🖼 دریافت تک‌تک تصاویر (سریع)", f"sr_imgs_{event.id}")],
+                    [Button.inline("📦 دریافت ZIP", f"sr_zip_{event.id}")],
                 ],
                 parse_mode="md",
             )
@@ -13550,7 +13550,7 @@ async def sarrast_pdf_callback(event):
         await event.answer("⏰ نشست منقضی شده. دوباره لینک رو بفرست.", alert=True)
         return
     await event.answer("📄 شروع ساخت PDF...", alert=False)
-    from sarrast_handler import download_chapter_pdf
+    from otherwebsiteshandler.sarrast_handler import download_chapter_pdf
     info = state["info"]
     url = state["url"]
     series_title = info.get("series_title", "sarrast")
@@ -13598,7 +13598,7 @@ async def sarrast_zip_callback(event):
         await event.answer("⏰ نشست منقضی شده.", alert=True)
         return
     await event.answer("🖼 شروع دانلود ZIP...", alert=False)
-    from sarrast_handler import download_chapter_as_zip
+    from otherwebsiteshandler.sarrast_handler import download_chapter_as_zip
     info = state["info"]
     url = state["url"]
     series_title = info.get("series_title", "sarrast")
@@ -13635,7 +13635,7 @@ async def sarrast_zip_callback(event):
 
 
 async def sarrast_imgs_callback(event):
-    """ارسال تک‌تک تصاویر (به‌صورت آلبوم)."""
+    """ارسال تک‌تک تصاویر به‌صورت آلبوم‌های ۱۰ تایی (سریع - دانلود + ارسال موازی)."""
     data = event.data.decode()
     msg_id = data.replace("sr_imgs_", "")
     state_key = f"{event.chat_id}_{msg_id}"
@@ -13643,8 +13643,8 @@ async def sarrast_imgs_callback(event):
     if not state:
         await event.answer("⏰ نشست منقضی شده.", alert=True)
         return
-    await event.answer("🖼 شروع دانلود تصاویر...", alert=False)
-    from sarrast_handler import download_chapter_images
+    await event.answer("🖼 شروع دانلود و ارسال تصاویر...", alert=False)
+    from otherwebsiteshandler.sarrast_handler import download_chapter_images
     info = state["info"]
     url = state["url"]
     series_title = info.get("series_title", "sarrast")
@@ -13653,80 +13653,106 @@ async def sarrast_imgs_callback(event):
     out_dir = os.path.join(OUTPUT_FOLDER, f"sr_imgs_{event.chat_id}_{int(time.time())}")
     os.makedirs(out_dir, exist_ok=True)
 
-    # Progress callback
+    await event.edit(f"🖼 در حال دانلود {total} تصویر (موازی)...", buttons=None)
+
+    # Step 1: دانلود همه‌ی تصاویر موازی
     last_pct = [-1]
-    async def progress_cb(done, total, current_url):
-        pct = done * 100 // total if total else 0
+    async def progress_cb(done, total_count, current_url):
+        pct = done * 100 // total_count if total_count else 0
         if pct != last_pct[0] and pct % 10 == 0:
             last_pct[0] = pct
             try:
-                await event.edit(f"🖼 دانلود تصاویر: {done}/{total} ({pct}%)", buttons=None)
+                await event.edit(f"⬇️ دانلود تصاویر: {done}/{total_count} ({pct}%)", buttons=None)
             except Exception:
                 pass
 
-    await event.edit(f"🖼 در حال دانلود {total} تصویر...", buttons=None)
     try:
-        paths = await download_chapter_images(url, out_dir, progress_cb=progress_cb, max_concurrent=5)
+        paths = await download_chapter_images(url, out_dir, progress_cb=progress_cb, max_concurrent=8)
         if not paths:
             await event.edit("❌ هیچ تصویری دانلود نشد.")
             return
-        await event.edit(f"📤 در حال ارسال {len(paths)} تصویر به‌صورت آلبوم...")
-        # Send as album (up to 10 per album)
-        import shutil
-        from telethon.tl.functions.messages import SendMultiMediaRequest
-        from telethon.tl.types import InputMediaUploadedPhoto
-
-        BATCH_SIZE = 10
-        sent_count = 0
-        for batch_start in range(0, len(paths), BATCH_SIZE):
-            batch = paths[batch_start:batch_start + BATCH_SIZE]
-            # Upload each image
-            input_media = []
-            for i, p in enumerate(batch):
-                try:
-                    # Use FastTelethon for faster upload
-                    uploaded = await fast_upload_file(event.client, p)
-                    caption = (
-                        f"📖 **{series_title}**\n📺 **{chapter_title}**\n"
-                        f"🖼 تصویر {batch_start + i + 1}/{len(paths)}"
-                    ) if i == 0 else ""
-                    input_media.append(
-                        InputMediaUploadedPhoto(
-                            file=uploaded,
-                            caption=caption,
-                        )
-                    )
-                except Exception as e:
-                    logger.warning(f"[Sarrast] Failed to upload image {batch_start + i}: {e}")
-                    continue
-            if input_media:
-                try:
-                    await event.client(SendMultiMediaRequest(
-                        peer=event.chat_id,
-                        multiquote=False,
-                        reply_to_msg_id=event.id if batch_start == 0 else None,
-                        media=input_media,
-                    ))
-                    sent_count += len(input_media)
-                except Exception as e:
-                    logger.error(f"[Sarrast] Album send failed: {e}")
-                    # Fallback: send one by one
-                    for m in input_media:
-                        try:
-                            await event.client.send_file(event.chat_id, m)
-                            sent_count += 1
-                        except Exception:
-                            pass
-        await event.edit(f"✅ {sent_count} تصویر ارسال شد.")
-        # Cleanup
-        try:
-            shutil.rmtree(out_dir, ignore_errors=True)
-        except Exception:
-            pass
-        sr_states.pop(state_key, None)
     except Exception as e:
-        logger.error(f"[Sarrast] Images error: {e}", exc_info=True)
-        await event.edit(f"❌ خطا: {e}")
+        logger.error(f"[Sarrast] download error: {e}", exc_info=True)
+        await event.edit(f"❌ خطا در دانلود: {e}")
+        return
+
+    # Step 2: ارسال به‌صورت آلبوم‌های ۱۰ تایی موازی
+    await event.edit(f"📤 در حال ارسال {len(paths)} تصویر (آلبوم‌های ۱۰ تایی)...", buttons=None)
+    import shutil
+    from telethon.tl.functions.messages import SendMultiMediaRequest
+    from telethon.tl.types import InputMediaUploadedPhoto
+
+    BATCH_SIZE = 10
+    sent_count = 0
+
+    async def send_batch(batch_start_idx: int, batch_paths: list):
+        """ارسال یه آلبوم ۱۰ تایی."""
+        nonlocal sent_count
+        input_media = []
+        for i, p in enumerate(batch_paths):
+            try:
+                uploaded = await fast_upload_file(event.client, p)
+                caption = (
+                    f"📖 **{series_title}**\n📺 **{chapter_title}**\n"
+                    f"🖼 تصویر {batch_start_idx + i + 1}/{len(paths)}"
+                ) if i == 0 else ""
+                input_media.append(
+                    InputMediaUploadedPhoto(
+                        file=uploaded,
+                        caption=caption,
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"[Sarrast] Upload image {batch_start_idx + i}: {e}")
+                continue
+        if not input_media:
+            return 0
+        try:
+            await event.client(SendMultiMediaRequest(
+                peer=event.chat_id,
+                multiquote=False,
+                reply_to_msg_id=event.id if batch_start_idx == 0 else None,
+                media=input_media,
+            ))
+            return len(input_media)
+        except Exception as e:
+            logger.error(f"[Sarrast] Album send failed (batch {batch_start_idx}): {e}")
+            # Fallback: send one by one
+            count = 0
+            for m in input_media:
+                try:
+                    await event.client.send_file(event.chat_id, m)
+                    count += 1
+                except Exception:
+                    pass
+            return count
+
+    # Process batches in parallel (up to 3 albums at the same time)
+    sem = asyncio.Semaphore(3)
+    async def process_batch(start: int, batch: list):
+        async with sem:
+            return await send_batch(start, batch)
+
+    batch_tasks = []
+    for batch_start in range(0, len(paths), BATCH_SIZE):
+        batch = paths[batch_start:batch_start + BATCH_SIZE]
+        batch_tasks.append(process_batch(batch_start, batch))
+
+    # Wait for all batches to complete
+    results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+    for r in results:
+        if isinstance(r, int):
+            sent_count += r
+        elif isinstance(r, Exception):
+            logger.error(f"[Sarrast] Batch exception: {r}")
+
+    await event.edit(f"✅ {sent_count}/{len(paths)} تصویر ارسال شد.")
+    # Cleanup
+    try:
+        shutil.rmtree(out_dir, ignore_errors=True)
+    except Exception:
+        pass
+    sr_states.pop(state_key, None)
 
 
 async def diycraft_cb_episode(event):
