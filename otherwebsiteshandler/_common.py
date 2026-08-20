@@ -367,12 +367,14 @@ async def download_with_ytdlp(
         tail: List[str] = []
         while True:
             try:
-                line = await asyncio.wait_for(process.stdout.readline(), timeout=180)
+                # 5 min per line - یعنی اگه 5 دقیقه هیچ خروجی نبود، timeout
+                # (برای اتصال‌های کند یا فایل‌های بزرگ)
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=300)
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
                 cleanup_file(filepath)
-                return False, "Download timed out", 0
+                return False, "Download timed out (5 min no output)", 0
             if not line:
                 break
             text = line.decode(errors="replace").strip()
@@ -425,7 +427,8 @@ async def download_direct(
     دانلود مستقیم یه فایل mp4 (نه m3u8).
     مناسب برای سایت‌هایی که لینک mp4 مستقیم می‌دن (مثل KVS).
 
-    از curl_cffi برای browser impersonation استفاده می‌کنه.
+    از curl_cffi با stream=True برای browser impersonation استفاده می‌کنه.
+    retry می‌کنه با yt-dlp اگه curl_cffi شکست بخوره.
     """
     if not check_impersonation_support():
         # fallback به yt-dlp
@@ -445,50 +448,84 @@ async def download_direct(
 
     await progress_cb(f"📥 **شروع دانلود مستقیم...**")
 
+    # اطمینان از وجود پوشه‌ی parent فایل خروجی
+    parent_dir = os.path.dirname(filepath)
+    if parent_dir and not os.path.exists(parent_dir):
+        try:
+            os.makedirs(parent_dir, exist_ok=True)
+        except Exception as e:
+            logger.error("Cannot create output directory %s: %s", parent_dir, e)
+            return False, f"Cannot create output directory: {e}", 0
+
     try:
         from curl_cffi.requests import AsyncSession
 
+        # استفاده از stream=True برای جلوگیری از لود کامل محتوا در RAM
+        # و اجازه دادن به curl_cffi برای receive incremental
         async with AsyncSession() as session:
             resp = await session.get(
                 url,
                 impersonate="chrome",
                 headers=headers,
-                timeout=300,  # 5 min for large files
+                timeout=600,  # 10 min for large files
+                stream=True,
             )
             if resp.status_code != 200:
-                return False, f"HTTP {resp.status_code}", 0
+                # اگه کد وضعیت خطا بود، fallback به yt-dlp
+                logger.warning(
+                    "download_direct HTTP %s for %s - falling back to yt-dlp",
+                    resp.status_code, url[:80]
+                )
+                return await download_with_ytdlp(
+                    url, filepath, progress_cb, referer=referer,
+                    user_agent=user_agent, max_filesize=max_filesize,
+                )
 
             content_length = resp.headers.get("Content-Length")
-            if content_length:
-                size = int(content_length)
-                if size > max_filesize:
+            total_size = int(content_length) if content_length else 0
+            if total_size:
+                if total_size > max_filesize:
                     return False, "File exceeds size limit", 0
-                if size == 0:
+                if total_size == 0:
                     return False, "Empty file", 0
 
-            # Write to file
+            # Write to file با streaming
             total_written = 0
             last_update = 0.0
-            with open(filepath, "wb") as f:
-                # Iterate over content in chunks
+            last_speed_time = [time.time()]
+            last_speed_bytes = [0]
+            file_handle = open(filepath, "wb")
+            try:
+                # تابع aiter_content روی Response وجود داره وقتی stream=True باشه
                 async for chunk in resp.aiter_content(chunk_size=1024 * 256):
                     if not chunk:
                         break
-                    f.write(chunk)
+                    file_handle.write(chunk)
                     total_written += len(chunk)
                     now = time.time()
-                    if now - last_update >= 2.0:
+                    if now - last_update >= 3.0:
                         last_update = now
                         size_str = f"{total_written/1024/1024:.1f} MB"
-                        if content_length:
-                            pct = total_written * 100 // int(content_length)
+                        # محاسبه سرعت
+                        dt = now - last_speed_time[0]
+                        if dt > 0:
+                            speed = (total_written - last_speed_bytes[0]) / dt / 1024
+                            speed_str = f" · {speed:.0f} KB/s"
+                        else:
+                            speed_str = ""
+                        last_speed_time[0] = now
+                        last_speed_bytes[0] = total_written
+                        if total_size:
+                            pct = total_written * 100 // total_size
                             await progress_cb(
-                                f"📥 **Downloading: {size_str} ({pct}%)...**"
+                                f"📥 **Downloading: {size_str} / {total_size/1024/1024:.1f} MB ({pct}%){speed_str}**"
                             )
                         else:
                             await progress_cb(
-                                f"📥 **Downloading: {size_str}...**"
+                                f"📥 **Downloading: {size_str}{speed_str}**"
                             )
+            finally:
+                file_handle.close()
 
             if total_written == 0:
                 cleanup_file(filepath)
@@ -496,14 +533,33 @@ async def download_direct(
             if total_written > max_filesize:
                 cleanup_file(filepath)
                 return False, "File exceeds size limit", 0
+            # اگه Content-Length داشت و دانلود ناقص بود، fallback به yt-dlp
+            if total_size and total_written < total_size * 0.95:
+                logger.warning(
+                    "download_direct incomplete: %d/%d bytes - falling back to yt-dlp",
+                    total_written, total_size
+                )
+                cleanup_file(filepath)
+                return await download_with_ytdlp(
+                    url, filepath, progress_cb, referer=referer,
+                    user_agent=user_agent, max_filesize=max_filesize,
+                )
             return True, "", total_written
 
     except asyncio.CancelledError:
         cleanup_file(filepath)
         raise
     except Exception as e:
+        # اگه curl_cffi خطا داد، fallback به yt-dlp
+        logger.warning(
+            "download_direct error: %s - falling back to yt-dlp",
+            str(e)[:150]
+        )
         cleanup_file(filepath)
-        return False, str(e)[:150], 0
+        return await download_with_ytdlp(
+            url, filepath, progress_cb, referer=referer,
+            user_agent=user_agent, max_filesize=max_filesize,
+        )
 
 
 # ─── Generic m3u8 download (uses yt-dlp) ──────────────────
