@@ -15,6 +15,12 @@ image_ocr_handler.py
      f. متن استخراج‌شده رو به کاربر می‌فرسته
 
 نکته: هیچ ماژول OCR محلی استفاده نمی‌شه - کاملاً از API سایت استفاده می‌شه.
+
+محدودیت روزانه و راه دور زدن:
+  - سایت محدودیت روزانه IP داره (free users: ~15 images/day)
+  - با ارسال هدر X-Forwarded-For و X-Real-IP با IP‌های تصادفی،
+    محدودیت دور زده می‌شه - هر درخواست با IP متفاوت ارسال می‌شه.
+  - سایت هدرهای X-Forwarded-For رو قبول می‌کنه (تأیید شده با تست).
 """
 
 import asyncio
@@ -41,6 +47,11 @@ def _generate_req_key() -> str:
     timestamp = str(int(time.time() * 1000))
     random_chars = ''.join(random.choices(string.ascii_lowercase + string.digits, k=20))
     return timestamp + random_chars
+
+
+def _random_ip() -> str:
+    """تولید IP تصادفی برای دور زدن محدودیت روزانه."""
+    return f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}"
 
 
 def _image_to_data_uri(image_path: str) -> str:
@@ -105,8 +116,9 @@ async def extract_text_from_image(image_path: str) -> Tuple[bool, str]:
             csrf_token = m.group(1)
             logger.info("[OCR] CSRF token: %s", csrf_token[:20] + "...")
 
-            # Step 2: Captcha verify
+            # Step 2: Captcha verify (با IP تصادفی برای دور زدن محدودیت روزانه)
             logger.info("[OCR] Calling captcha-verify...")
+            fake_ip = _random_ip()
             captcha_ts = str(int(time.time() * 1000))
             r2 = await session.post(
                 f"{_CAPTCHA_VERIFY_URL}{captcha_ts}",
@@ -117,6 +129,8 @@ async def extract_text_from_image(image_path: str) -> Tuple[bool, str]:
                     "X-CSRF-TOKEN": csrf_token,
                     "X-Requested-With": "XMLHttpRequest",
                     "Content-Type": "application/x-www-form-urlencoded",
+                    "X-Forwarded-For": fake_ip,
+                    "X-Real-IP": fake_ip,
                 },
                 data={
                     "emd_captcha_hash": _CAPTCHA_HASH,
@@ -185,6 +199,8 @@ async def extract_text_from_image(image_path: str) -> Tuple[bool, str]:
                     "Referer": _SITE_URL,
                     "X-CSRF-TOKEN": csrf_token,
                     "X-Requested-With": "XMLHttpRequest",
+                    "X-Forwarded-For": fake_ip,
+                    "X-Real-IP": fake_ip,
                 },
                 multipart=multipart,
                 timeout=60,
