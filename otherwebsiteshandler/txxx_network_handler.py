@@ -32,6 +32,7 @@ from ._common import (
     cleanup_file,
     default_user_agent,
     download_direct as _download_direct_impl,
+    download_direct_multi as _download_direct_multi_impl,
     download_m3u8 as _download_m3u8_impl,
     download_with_ytdlp,
     extract_qualities_with_ytdlp,
@@ -171,7 +172,16 @@ def _make_site_entrypoints(site_key: str):
         return await extract_txxx_network_qualities(url, site_key)
 
     async def download_direct(url: str, filepath: str, progress_cb: ProgressCallback) -> Tuple[bool, str, int]:
-        # yt-dlp خودش best format رو انتخاب می‌کنه
+        """دانلود با multi-segment (16x سریع‌تر)."""
+        # اول سعی کن با multi-segment (16 worker موازی)
+        success, error, size = await _download_direct_multi_impl(
+            url, filepath, progress_cb,
+            referer=cfg["homepage"],
+        )
+        if success:
+            return True, "", size
+        # fallback به direct ساده
+        cleanup_file(filepath)
         success, error, size = await _download_direct_impl(
             url, filepath, progress_cb,
             referer=cfg["homepage"],

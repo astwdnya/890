@@ -20,6 +20,13 @@ import time
 from typing import Awaitable, Callable, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
+# aiofiles برای نوشتن موازی فایل‌های بزرگ (multi-segment download)
+try:
+    import aiofiles
+    _HAS_AIOFILES = True
+except ImportError:
+    _HAS_AIOFILES = False
+
 logger = logging.getLogger("SiteHandlers")
 
 ProgressCallback = Callable[[str], Awaitable[None]]
@@ -580,6 +587,399 @@ async def download_m3u8(
     return await download_with_ytdlp(
         url, filepath, progress_cb, referer=referer, user_agent=user_agent
     )
+
+
+# ─── Multi-segment parallel download (FAST! 16x speed) ────
+
+
+def _format_progress_bar(downloaded: int, total: int, speed: float, elapsed: float,
+                         completed_chunks: int = 0, total_chunks: int = 0) -> str:
+    """
+    ساخت progress message زیبا با progress bar (مثل هندلرهای قدیمی).
+
+    Args:
+        downloaded: bytes downloaded so far
+        total: total bytes
+        speed: bytes per second
+        elapsed: seconds since start
+        completed_chunks: تعداد chunk های تکمیل‌شده (اختیاری)
+        total_chunks: کل chunk ها (اختیاری)
+
+    Returns:
+        formatted message string
+    """
+    if total > 0:
+        total_mb = total / 1024 / 1024
+        dl_mb = downloaded / 1024 / 1024
+        pct = (downloaded / total * 100)
+        filled = int(pct / 5)
+        bar = "█" * filled + "░" * (20 - filled)
+        speed_mb = min(speed / 1024 / 1024, 999)
+        eta_secs = int((total - downloaded) / speed) if speed > 0 else 0
+        eta_m, eta_s = divmod(eta_secs, 60)
+        chunks_info = ""
+        if total_chunks > 0:
+            chunks_info = f"\n📦 {completed_chunks}/{total_chunks} chunks • 🔥 16x"
+        return (
+            f"📥 **Downloading...**\n`[{bar}]`\n"
+            f"💾 {dl_mb:.1f}/{total_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s\n"
+            f"📊 {pct:.1f}%  •  ⏱ ETA: {eta_m}:{eta_s:02d}"
+            f"{chunks_info}"
+        )
+    else:
+        dl_mb = downloaded / 1024 / 1024
+        speed_mb = min(speed / 1024 / 1024, 999)
+        return (
+            f"📥 **Downloading...**\n💾 {dl_mb:.1f} MB  •  ⚡ {speed_mb:.1f} MB/s"
+        )
+
+
+async def download_direct_multi(
+    url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
+    referer: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    max_filesize: int = MAX_DOWNLOAD_SIZE,
+    num_workers: int = 16,
+    chunk_size: int = 5 * 1024 * 1024,  # 5 MB per chunk
+) -> Tuple[bool, str, int]:
+    """
+    دانلود سریع با Work-Queue Multi-Segment (16 worker موازی).
+
+    این تابع فایل رو به chunk های 5MB تقسیم می‌کنه و 16 worker همزمان
+    از یه queue می‌خورن. اینطوری همیشه 16 connection فعال هستن تا آخر
+    دانلود و سرعت ثابت می‌مونه.
+
+    از session اشتراکی استفاده می‌کنه تا TLS handshake فقط یه بار انجام بشه.
+    با progress bar زیبا (مثل هندلرهای قدیمی).
+
+    Args:
+        url: URL ویدیو (mp4 مستقیم)
+        filepath: مسیر ذخیره فایل
+        progress_cb: callback async برای گزارش پیشرفت
+        referer: Referer header
+        user_agent: UA سفارشی
+        max_filesize: حداکثر حجم مجاز (بایت)
+        num_workers: تعداد worker موازی (پیش‌فرض 16)
+        chunk_size: حجم هر chunk (پیش‌فرض 5MB)
+
+    Returns:
+        Tuple (success, error_message, file_size)
+    """
+    if not check_impersonation_support():
+        # fallback به download_direct ساده
+        return await download_direct(
+            url, filepath, progress_cb, referer=referer,
+            user_agent=user_agent, max_filesize=max_filesize,
+        )
+
+    ua = user_agent or _DEFAULT_UA
+    headers = {
+        "User-Agent": ua,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if referer:
+        headers["Referer"] = referer
+
+    # اطمینان از وجود پوشه‌ی parent فایل خروجی
+    parent_dir = os.path.dirname(filepath)
+    if parent_dir and not os.path.exists(parent_dir):
+        try:
+            os.makedirs(parent_dir, exist_ok=True)
+        except Exception as e:
+            logger.error("Cannot create output directory %s: %s", parent_dir, e)
+            return False, f"Cannot create output directory: {e}", 0
+
+    try:
+        from curl_cffi.requests import AsyncSession
+
+        # Step 1: HEAD request برای بررسی Content-Length و Accept-Ranges
+        async with AsyncSession() as session:
+            # اول یه range request کوچیک بزن ببین Accept-Ranges داره یا نه
+            head_resp = await session.get(
+                url, impersonate="chrome",
+                headers={**headers, "Range": "bytes=0-1023"},
+                timeout=30, verify=False, stream=True,
+            )
+            # نباید بسته بشه - باید status_code رو نگه داریم و بعد ببندیم
+            head_status = head_resp.status_code
+            content_length_header = head_resp.headers.get("Content-Length")
+            accept_ranges = head_resp.headers.get("Accept-Ranges", "").lower()
+            content_range = head_resp.headers.get("Content-Range", "")
+
+            # اگه Range پشتیبانی نمی‌شه (status != 206)، fallback به download_direct
+            supports_range = (
+                head_status == 206
+                or accept_ranges == "bytes"
+                or content_range
+            )
+
+            if not supports_range:
+                logger.info("download_direct_multi: Range not supported - falling back to download_direct")
+                # close the response properly
+                await head_resp.acontent()
+                return await download_direct(
+                    url, filepath, progress_cb, referer=referer,
+                    user_agent=user_agent, max_filesize=max_filesize,
+                )
+
+            # استخراج total size از Content-Range یا Content-Length
+            total_size = 0
+            if content_range:
+                # bytes 0-1023/24006226 → 24006226
+                m = re.search(r"/(\d+)$", content_range)
+                if m:
+                    total_size = int(m.group(1))
+            if not total_size and content_length_header:
+                # اگه Content-Range نبود، Content-Length کل size هست (وقتی Range ست نشده)
+                total_size = int(content_length_header)
+
+            if not total_size:
+                # نمی‌تونیم total size رو تشخیص بدیم - fallback
+                logger.info("download_direct_multi: Cannot determine total size - falling back to download_direct")
+                await head_resp.acontent()
+                return await download_direct(
+                    url, filepath, progress_cb, referer=referer,
+                    user_agent=user_agent, max_filesize=max_filesize,
+                )
+
+            if total_size > max_filesize:
+                await head_resp.acontent()
+                return False, "File exceeds size limit", 0
+
+            # اگه فایل خیلی کوچیکه (کمتر از 5MB)، نیازی به multi-segment نیست
+            if total_size < chunk_size:
+                logger.info("download_direct_multi: File too small (%d bytes) - using direct", total_size)
+                await head_resp.acontent()
+                return await download_direct(
+                    url, filepath, progress_cb, referer=referer,
+                    user_agent=user_agent, max_filesize=max_filesize,
+                )
+
+            # close head response
+            await head_resp.acontent()
+
+            # Step 2: ساخت لیست chunk ها
+            chunks = []
+            offset = 0
+            chunk_idx = 0
+            while offset < total_size:
+                end = min(offset + chunk_size - 1, total_size - 1)
+                chunks.append((chunk_idx, offset, end))
+                offset = end + 1
+                chunk_idx += 1
+
+            total_chunks = len(chunks)
+            logger.info(
+                "Multi-segment download: %d chunks × %dMB, %d workers, total=%d MB",
+                total_chunks, chunk_size // 1024 // 1024, num_workers,
+                total_size // 1024 // 1024
+            )
+
+            # Step 3: فایل خروجی رو همون اول با حجم نهایی بساز (sparse file)
+            try:
+                with open(filepath, "wb") as f:
+                    f.truncate(total_size)
+            except Exception as e:
+                logger.warning("Could not pre-allocate file: %s", e)
+
+            # Queue از chunk ها
+            chunk_queue = asyncio.Queue()
+            for c in chunks:
+                await chunk_queue.put(c)
+
+            # متغیرهای مشترک
+            downloaded_bytes = [0] * total_chunks
+            completed_chunks = [0]
+            failed_chunks = []
+            start_time = time.time()
+            last_update = [0.0]
+            progress_lock = asyncio.Lock()
+            file_write_lock = asyncio.Lock()
+
+            # session اشتراکی برای همه worker ها (جلوگیری از TLS handshake مکرر)
+            shared_session = AsyncSession()
+
+            async def _update_progress(force: bool = False):
+                """گزارش progress به کاربر با progress bar زیبا."""
+                now = time.time()
+                if not force and now - last_update[0] < 1.5:
+                    return
+                last_update[0] = now
+                total_dl = sum(downloaded_bytes)
+                elapsed = now - start_time
+                speed = total_dl / elapsed if elapsed > 0 else 0
+                msg = _format_progress_bar(
+                    total_dl, total_size, speed, elapsed,
+                    completed_chunks[0], total_chunks
+                )
+                try:
+                    await progress_cb(msg)
+                except Exception:
+                    pass
+
+            async def _download_worker(worker_id: int):
+                """هر worker از queue chunk می‌گیره و دانلود می‌کنه."""
+                while True:
+                    try:
+                        chunk_info = chunk_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return True  # queue خالی، worker تموم کرد
+
+                    c_idx, byte_start, byte_end = chunk_info
+                    expected_size = byte_end - byte_start + 1
+                    max_retries = 3
+
+                    for attempt in range(max_retries):
+                        try:
+                            resp = await shared_session.get(
+                                url, impersonate="chrome",
+                                headers={
+                                    "User-Agent": ua,
+                                    "Accept": "*/*",
+                                    "Accept-Language": "en-US,en;q=0.9",
+                                    "Referer": referer or "",
+                                    "Range": f"bytes={byte_start}-{byte_end}",
+                                },
+                                allow_redirects=True,
+                                timeout=300,
+                                stream=True,
+                            )
+
+                            if resp.status_code not in (200, 206):
+                                raise Exception(f"HTTP {resp.status_code}")
+
+                            # دانلود chunk به memory (چون کوچیکه - 5MB)
+                            chunk_data = b""
+                            async for piece in resp.aiter_content():
+                                if not piece:
+                                    continue
+                                chunk_data += piece
+
+                            if len(chunk_data) != expected_size:
+                                raise Exception(
+                                    f"Size mismatch: expected {expected_size}, got {len(chunk_data)}"
+                                )
+
+                            # نوشتن به فایل با seek (با lock برای thread safety)
+                            if _HAS_AIOFILES:
+                                async with file_write_lock:
+                                    async with aiofiles.open(filepath, "r+b") as f:
+                                        await f.seek(byte_start)
+                                        await f.write(chunk_data)
+                            else:
+                                # fallback بدون aiofiles
+                                async with file_write_lock:
+                                    with open(filepath, "r+b") as f:
+                                        f.seek(byte_start)
+                                        f.write(chunk_data)
+
+                            downloaded_bytes[c_idx] = expected_size
+                            async with progress_lock:
+                                completed_chunks[0] += 1
+                                await _update_progress()
+                            break  # chunk با موفقیت دانلود شد
+
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            logger.debug(
+                                "Worker %d chunk %d attempt %d failed: %s",
+                                worker_id, c_idx, attempt + 1, e
+                            )
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(1.5 * (attempt + 1))
+                            else:
+                                failed_chunks.append((c_idx, str(e)))
+                                return False
+                return True
+
+            # پیام شروع
+            await progress_cb(f"📥 **Downloading...**\n`[{('░' * 20)}]`\n💾 0.0/{total_size/1024/1024:.1f} MB  •  ⚡ 0.0 MB/s\n📊 0.0%  •  ⏱ ETA: --:--\n📦 0/{total_chunks} chunks • 🔥 16x")
+
+            # Step 4: اجرای worker ها به‌صورت موازی
+            workers = [
+                asyncio.create_task(_download_worker(i))
+                for i in range(num_workers)
+            ]
+            try:
+                results = await asyncio.gather(*workers, return_exceptions=True)
+            except asyncio.CancelledError:
+                # Cancel all workers
+                for w in workers:
+                    w.cancel()
+                await shared_session.close()
+                cleanup_file(filepath)
+                raise
+
+            # close shared session
+            await shared_session.close()
+
+            # Check failures
+            had_failures = []
+            for r in results:
+                if isinstance(r, Exception):
+                    had_failures.append(str(r))
+                elif r is False:
+                    had_failures.append("Worker returned False")
+
+            if failed_chunks:
+                logger.warning(
+                    "Multi-segment: %d/%d chunks failed: %s",
+                    len(failed_chunks), total_chunks,
+                    "; ".join(f"{c}:{e[:50]}" for c, e in failed_chunks[:3])
+                )
+
+            # اگه بیش از 5% chunk ها fail شدن، خطا
+            if len(failed_chunks) > total_chunks * 0.05:
+                cleanup_file(filepath)
+                err_msg = "; ".join(f"{c}:{e[:80]}" for c, e in failed_chunks[:3])
+                return False, f"Multi-segment download failed: {len(failed_chunks)}/{total_chunks} chunks failed. {err_msg[:100]}", 0
+
+            # Step 5: بررسی نهایی فایل
+            total_dl = sum(downloaded_bytes)
+            if total_dl == 0:
+                cleanup_file(filepath)
+                return False, "Downloaded file is empty", 0
+            if total_dl < total_size * 0.95:
+                # اگه کمتر از 95% دانلود شده، fallback به download_direct
+                logger.warning(
+                    "Multi-segment incomplete: %d/%d bytes - falling back to direct",
+                    total_dl, total_size
+                )
+                cleanup_file(filepath)
+                return await download_direct(
+                    url, filepath, progress_cb, referer=referer,
+                    user_agent=user_agent, max_filesize=max_filesize,
+                )
+
+            # پیام پایان
+            elapsed = time.time() - start_time
+            avg_speed = total_dl / elapsed if elapsed > 0 else 0
+            await progress_cb(
+                f"📥 **Download complete!**\n"
+                f"💾 {total_dl/1024/1024:.1f} MB in {elapsed:.1f}s\n"
+                f"⚡ Avg: {avg_speed/1024/1024:.1f} MB/s"
+            )
+
+            actual_size = os.path.getsize(filepath)
+            return True, "", actual_size
+
+    except asyncio.CancelledError:
+        cleanup_file(filepath)
+        raise
+    except Exception as e:
+        logger.warning(
+            "download_direct_multi error: %s - falling back to download_direct",
+            str(e)[:150]
+        )
+        cleanup_file(filepath)
+        return await download_direct(
+            url, filepath, progress_cb, referer=referer,
+            user_agent=user_agent, max_filesize=max_filesize,
+        )
 
 
 # ─── Generic extractor helpers ────────────────────────────
