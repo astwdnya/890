@@ -13789,6 +13789,39 @@ async def sarrast_pdf_translated_callback(event):
             pass
         # Cleanup state
         sr_states.pop(state_key, None)
+    except RuntimeError as e:
+        # خطاهای مربوط به وابستگی‌ها یا فونت - به کاربر نشون بده
+        logger.error(f"[Sarrast] PDF translated RuntimeError: {e}", exc_info=True)
+        err_str = str(e)
+        # اگه خطا درباره وابستگی‌هاست، پیام واضح بده
+        if "نصب نیست" in err_str or "pip install" in err_str:
+            try:
+                await event.edit(
+                    f"❌ **ترجمه کار نمی‌کنه!**\n\n"
+                    f"وابستگی‌های لازم نصب نیست:\n`{err_str[:300]}`\n\n"
+                    f"این پکیج‌ها رو به requirements.txt اضافه کن و کانتینر رو rebuild کن:\n"
+                    f"```\narabic-reshaper\npython-bidi\nfonttools\n```"
+                )
+            except Exception:
+                pass
+        elif "فونت" in err_str:
+            try:
+                await event.edit(
+                    f"❌ **دانلود فونت ناموفق بود**\n\n"
+                    f"{err_str[:300]}\n\n"
+                    f"ممکنه سایت sarrast موقتاً در دسترس نباشه. دوباره تلاش کن."
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await event.edit(
+                    f"❌ خطا در ساخت PDF با ترجمه:\n`{err_str[:300]}`\n\n"
+                    f"دوباره تلاش کن یا از گزینه بدون ترجمه استفاده کن."
+                )
+            except Exception:
+                pass
+        sr_states.pop(state_key, None)
     except Exception as e:
         logger.error(f"[Sarrast] PDF translated error: {e}", exc_info=True)
         try:
