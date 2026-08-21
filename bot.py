@@ -5244,16 +5244,31 @@ async def generic_url_handler(event):
             series_title = info.get("series_title", "")
             chapter_title = info.get("title", "")
             total_imgs = len(info.get("images", []))
+            # بررسی آیا ترجمه فارسی موجود هست
+            has_translation = bool(
+                info.get("translate") and info.get("translate", {}).get("html")
+            )
+            lang = info.get("lang", "")
+            translation_info = ""
+            if has_translation:
+                translation_info = f"\n🌐 ترجمه: {lang if lang else 'فارسی'} ✅"
+            
+            buttons = []
+            # اگه ترجمه موجود بود، دکمه PDF با ترجمه رو اول بذار
+            if has_translation:
+                buttons.append([Button.inline("📄 PDF با ترجمه فارسی 🌐", f"sr_pdftr_{event.id}")])
+                buttons.append([Button.inline("📄 PDF بدون ترجمه", f"sr_pdf_{event.id}")])
+            else:
+                buttons.append([Button.inline("📄 دریافت PDF (تمام تصاویر)", f"sr_pdf_{event.id}")])
+            buttons.append([Button.inline("🖼 دریافت تک‌تک تصاویر (سریع)", f"sr_imgs_{event.id}")])
+            buttons.append([Button.inline("📦 دریافت ZIP", f"sr_zip_{event.id}")])
+            
             await status_msg.edit(
                 f"📖 **{series_title}**\n"
                 f"📺 **{chapter_title}**\n"
-                f"🖼 تعداد تصاویر: {total_imgs}\n\n"
+                f"🖼 تعداد تصاویر: {total_imgs}{translation_info}\n\n"
                 f"یکی از گزینه‌ها رو انتخاب کن:",
-                buttons=[
-                    [Button.inline("📄 دریافت PDF (تمام تصاویر)", f"sr_pdf_{event.id}")],
-                    [Button.inline("🖼 دریافت تک‌تک تصاویر (سریع)", f"sr_imgs_{event.id}")],
-                    [Button.inline("📦 دریافت ZIP", f"sr_zip_{event.id}")],
-                ],
+                buttons=buttons,
                 parse_mode="md",
             )
             # Save state for callback
@@ -13699,6 +13714,90 @@ async def sarrast_pdf_callback(event):
         sr_states.pop(state_key, None)
 
 
+async def sarrast_pdf_translated_callback(event):
+    """ساخت PDF با ترجمه فارسی از فصل sarrast."""
+    data = event.data.decode()
+    msg_id = data.replace("sr_pdftr_", "")
+    state_key = f"{event.chat_id}_{msg_id}"
+    state = sr_states.get(state_key)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده. دوباره لینک رو بفرست.", alert=True)
+        return
+    await event.answer("📄 شروع ساخت PDF با ترجمه...", alert=False)
+    from otherwebsiteshandler.sarrast_handler import download_chapter_pdf_translated
+    info = state["info"]
+    url = state["url"]
+    series_title = info.get("series_title", "sarrast")
+    chapter_title = info.get("title", "")
+    safe_series = re.sub(r'[<>:"/\\|?*]', "_", series_title)[:60]
+    safe_chapter = re.sub(r'[<>:"/\\|?*]', "_", chapter_title)[:60]
+    out_path = os.path.join(OUTPUT_FOLDER, f"sr_tr_{safe_series}_{safe_chapter}_{int(time.time())}.pdf")
+    await event.edit(
+        f"🌐 در حال ساخت PDF با ترجمه فارسی از {len(info['images'])} تصویر...",
+        buttons=None,
+    )
+
+    # progress callback برای نمایش پیشرفت
+    last_pct = [-1]
+    last_update_time = [0.0]
+    total_images = len(info['images'])
+
+    async def _progress_cb(done, total, current_url):
+        if not total:
+            return
+        pct = done * 100 // total
+        now = time.time()
+        if pct != last_pct[0] and (pct % 20 == 0 or now - last_update_time[0] > 5):
+            last_pct[0] = pct
+            last_update_time[0] = now
+            try:
+                if done < total:
+                    await event.edit(
+                        f"🌐 در حال دانلود تصاویر: {done}/{total} ({pct}%)",
+                        buttons=None,
+                    )
+                else:
+                    await event.edit(
+                        f"🌐 دانلود کامل شد. در حال رسم ترجمه فارسی و ساخت PDF از {total} تصویر...",
+                        buttons=None,
+                    )
+            except Exception:
+                pass
+
+    try:
+        result = await download_chapter_pdf_translated(url, out_path, progress_cb=_progress_cb)
+        if not result or not os.path.exists(result):
+            await event.edit("❌ ساخت PDF با ترجمه ناموفق بود. لطفاً دوباره تلاش کن.")
+            sr_states.pop(state_key, None)
+            return
+        size_mb = os.path.getsize(result) / 1024 / 1024
+        await event.edit(f"✅ PDF با ترجمه ساخته شد ({size_mb:.1f} MB)\n📤 در حال آپلود...")
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=result,
+            caption=f"📖 **{series_title}**\n📺 **{chapter_title}**\n🖼 {len(info['images'])} تصویر\n💾 {size_mb:.1f} MB\n🌐 PDF با ترجمه فارسی",
+            status_msg=event,
+            buttons=None,
+            supports_streaming=False,
+            force_document=True,
+        )
+        # Cleanup
+        try:
+            os.unlink(result)
+        except Exception:
+            pass
+        # Cleanup state
+        sr_states.pop(state_key, None)
+    except Exception as e:
+        logger.error(f"[Sarrast] PDF translated error: {e}", exc_info=True)
+        try:
+            await event.edit(f"❌ خطا در ساخت PDF با ترجمه: {e}\n\nدوباره تلاش کن یا از گزینه بدون ترجمه استفاده کن.")
+        except Exception:
+            pass
+        sr_states.pop(state_key, None)
+
+
 async def sarrast_zip_callback(event):
     """دانلود همه‌ی تصاویر به‌صورت ZIP."""
     data = event.data.decode()
@@ -19240,6 +19339,8 @@ async def main():
     client.add_event_handler(diycraft_cb_episode, events.CallbackQuery(pattern=r"dcep_"))
     client.add_event_handler(diycraft_cb_close, events.CallbackQuery(pattern=r"dcclose$"))
     # sarrast.com callbacks
+    # مهم: sr_pdftr_ باید قبل از sr_pdf_ ثبت بشه تا اولویت داشته باشه
+    client.add_event_handler(sarrast_pdf_translated_callback, events.CallbackQuery(pattern=r"sr_pdftr_"))
     client.add_event_handler(sarrast_pdf_callback, events.CallbackQuery(pattern=r"sr_pdf_"))
     client.add_event_handler(sarrast_zip_callback, events.CallbackQuery(pattern=r"sr_zip_"))
     client.add_event_handler(sarrast_imgs_callback, events.CallbackQuery(pattern=r"sr_imgs_"))
