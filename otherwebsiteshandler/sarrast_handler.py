@@ -146,6 +146,8 @@ async def extract_chapter_info(url: str) -> Optional[dict]:
                 "next": data.get("next"),
                 "all_episodes": serie.get("posts", []),
                 "api_url": api_url,
+                "translate": post.get("translate"),  # ترجمه فارسی (اگه موجود باشه)
+                "lang": post.get("lang", ""),  # زبان (مثل "فارسی")
             }
     except Exception as e:
         logger.error("sarrast extract_chapter_info error: %s", e)
@@ -412,6 +414,426 @@ async def download_chapter_as_zip(
             shutil.rmtree(out_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+# ─── Translated PDF (با ترجمه فارسی) ─────────────────────
+
+
+# مسیر فونت Mikhak (برای رسم متن فارسی روی تصاویر)
+# این فونت از sarrast.com دانلود می‌شه و cache می‌شه
+_MIKHAK_FONT_PATH = "/tmp/Mikhak-Medium.ttf"
+_MIKHAK_FONT_URL = f"{_BASE}/public/fonts/Mikhak-Medium1.woff2"
+
+
+async def _download_mikhak_font() -> Optional[str]:
+    """دانلود فونت Mikhak از sarrast.com (cache شده در /tmp)."""
+    if os.path.exists(_MIKHAK_FONT_PATH):
+        try:
+            if os.path.getsize(_MIKHAK_FONT_PATH) > 10000:
+                return _MIKHAK_FONT_PATH
+        except Exception:
+            pass
+
+    try:
+        async with AsyncSession() as s:
+            r = await s.get(
+                _MIKHAK_FONT_URL,
+                impersonate=_IMPERSONATE,
+                timeout=20,
+                headers={"User-Agent": _USER_AGENT, "Referer": _BASE + "/"},
+            )
+            if r.status_code != 200 or not r.content:
+                logger.warning("Failed to download Mikhak font: HTTP %d", r.status_code)
+                return None
+
+            # Convert woff2 to ttf using fonttools
+            woff2_path = "/tmp/Mikhak-Medium.woff2"
+            with open(woff2_path, "wb") as f:
+                f.write(r.content)
+
+            try:
+                from fontTools.ttLib import TTFont
+                font = TTFont(woff2_path)
+                font.flavor = None  # convert to TTF
+                font.save(_MIKHAK_FONT_PATH)
+                logger.info("Mikhak font downloaded and converted: %s", _MIKHAK_FONT_PATH)
+                return _MIKHAK_FONT_PATH
+            except Exception as e:
+                logger.warning("fonttools conversion failed: %s - using woff2 directly", e)
+                # PIL may not support woff2; return None
+                return None
+    except Exception as e:
+        logger.warning("Failed to download Mikhak font: %s", e)
+        return None
+
+
+def _render_translation_on_image(
+    img_path: str,
+    out_path: str,
+    translate_data: dict,
+    img_y_start: int,
+    img_height: int,
+    editor_draw_panel_margin: float,
+) -> bool:
+    """
+    رسم ترجمه فارسی روی یک تصویر.
+
+    Args:
+        img_path: مسیر تصویر اصلی
+        out_path: مسیر تصویر خروجی (با ترجمه)
+        translate_data: dict شامل html (لیست box ها)
+        img_y_start: موقعیت y شروع تصویر در پنل کلی (برای جدا کردن box های هر تصویر)
+        img_height: ارتفاع تصویر
+        editor_draw_panel_margin: margin افقی پنل ترجمه
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+        import re as _re
+    except ImportError as e:
+        logger.warning("PIL/arabic_reshaper/bidi not available: %s", e)
+        return False
+
+    font_path = _MIKHAK_FONT_PATH
+    if not os.path.exists(font_path):
+        logger.warning("Mikhak font not available at %s", font_path)
+        return False
+
+    try:
+        img = Image.open(img_path).convert("RGBA")
+    except Exception as e:
+        logger.warning("Failed to open image %s: %s", img_path, e)
+        return False
+
+    boxes = translate_data.get("html", []) if translate_data else []
+    if not boxes:
+        # No translation for this chapter
+        try:
+            img.convert("RGB").save(out_path, "JPEG", quality=85)
+            return True
+        except Exception:
+            return False
+
+    # Find boxes that belong to this image (y in [img_y_start, img_y_start + img_height))
+    img_boxes = [
+        b for b in boxes
+        if img_y_start <= b.get("y", 0) < img_y_start + img_height
+    ]
+
+    if not img_boxes:
+        # No boxes for this image - just save as is
+        try:
+            img.convert("RGB").save(out_path, "JPEG", quality=85)
+            return True
+        except Exception:
+            return False
+
+    # Create overlay
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    img_w, img_h_actual = img.size
+
+    for box in img_boxes:
+        # Adjust x by editor_draw_panel_margin (boxes are in editor space)
+        # اگه endX/endY یا x/y برابر None بودن، skip کن
+        try:
+            x = (box.get("x") or 0) - editor_draw_panel_margin
+            y = (box.get("y") or 0) - img_y_start  # relative to this image
+            end_x = (box.get("endX") or box.get("x") or 0) - editor_draw_panel_margin
+            end_y = (box.get("endY") or box.get("y") or 0) - img_y_start
+        except (TypeError, ValueError):
+            continue
+        box_w = end_x - x
+        box_h = end_y - y
+
+        # Skip if box is outside image bounds
+        if box_w <= 0 or box_h <= 0:
+            continue
+        if x < -50 or end_x > img_w + 50:
+            # box is mostly outside image - skip but log
+            continue
+
+        # Clamp to image bounds
+        x_clamped = max(0, x)
+        y_clamped = max(0, y)
+        end_x_clamped = min(img_w, end_x)
+        end_y_clamped = min(img_h_actual, end_y)
+
+        if end_x_clamped - x_clamped <= 5 or end_y_clamped - y_clamped <= 5:
+            continue
+
+        # Background color
+        bg_color = box.get("background", "#FFFFFF")
+        if bg_color and bg_color.lower() in ("#000000", "#000"):
+            bg_rgba = (0, 0, 0, 230)
+            text_color = (255, 255, 255, 255)
+        else:
+            bg_rgba = (255, 255, 255, 230)
+            text_color = (0, 0, 0, 255)
+
+        # Draw background rectangle (clamped)
+        draw.rectangle(
+            [x_clamped, y_clamped, end_x_clamped, end_y_clamped],
+            fill=bg_rgba,
+        )
+
+        # Get text content (parse multiple divs as separate lines)
+        content = box.get("content", "") or ""
+        divs = _re.findall(r"<div[^>]*>([^<]*)</div>", content)
+        if not divs:
+            text = _re.sub(r"<[^>]+>", "", content).strip()
+            divs = [text] if text else []
+
+        if not divs:
+            continue
+
+        # Calculate font size based on box height
+        num_lines = len(divs)
+        # Try to fit font size to box
+        font_size = min(
+            int((end_y_clamped - y_clamped) / (num_lines * 1.4)),
+            int((end_x_clamped - x_clamped) / 8),
+        )
+        font_size = max(11, min(font_size, 36))
+
+        try:
+            font = ImageFont.truetype(font_path, font_size)
+        except Exception:
+            continue
+
+        # Draw each line
+        line_height = (end_y_clamped - y_clamped) / (num_lines + 0.3)
+        start_y = y_clamped + ((end_y_clamped - y_clamped) - line_height * num_lines) / 2
+
+        for i, line_text in enumerate(divs):
+            line_text = (line_text or "").strip()
+            if not line_text:
+                continue
+            # Reshape Persian text for proper rendering
+            try:
+                reshaped = arabic_reshaper.reshape(line_text)
+                bidi_text = get_display(reshaped)
+            except Exception:
+                bidi_text = line_text  # fallback to raw text
+
+            # Get text size
+            try:
+                bbox = draw.textbbox((0, 0), bidi_text, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+            except Exception:
+                continue
+
+            # If text is too wide, decrease font size and retry
+            attempts = 0
+            while text_w > (end_x_clamped - x_clamped - 10) and font_size > 9 and attempts < 5:
+                font_size -= 2
+                try:
+                    font = ImageFont.truetype(font_path, font_size)
+                    bbox = draw.textbbox((0, 0), bidi_text, font=font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                except Exception:
+                    break
+                attempts += 1
+
+            # Center horizontally
+            text_x = x_clamped + ((end_x_clamped - x_clamped) - text_w) / 2
+            text_y = start_y + i * line_height + (line_height - text_h) / 2
+
+            # Draw text (with subtle shadow for readability)
+            shadow_offset = 1
+            draw.text(
+                (text_x + shadow_offset, text_y + shadow_offset),
+                bidi_text, fill=(0, 0, 0, 80), font=font,
+            )
+            draw.text((text_x, text_y), bidi_text, fill=text_color, font=font)
+
+    # Composite overlay onto image
+    try:
+        result = Image.alpha_composite(img, overlay)
+        result.convert("RGB").save(out_path, "JPEG", quality=85)
+        return True
+    except Exception as e:
+        logger.warning("Failed to save translated image: %s", e)
+        return False
+
+
+async def download_chapter_pdf_translated(
+    url: str,
+    out_path: str,
+    progress_cb: Optional[Callable[[int, int, str], None]] = None,
+) -> Optional[str]:
+    """
+    دانلود همه‌ی تصاویر، رسم ترجمه فارسی روی هر تصویر، و ساخت PDF.
+
+    این تابع مثل download_chapter_pdf هست، ولی:
+      - تصاویر ترجمه‌شده (با متن فارسی) رو به PDF تبدیل می‌کنه
+      - از فونت Mikhak (همون فونت سایت sarrast) استفاده می‌کنه
+      - اگر ترجمه موجود نباشه، به fallback به PDF بدون ترجمه
+
+    Returns:
+        مسیر فایل PDF ترجمه‌شده، یا None در صورت خطا.
+    """
+    import tempfile
+    import shutil
+
+    info = await extract_chapter_info(url)
+    if not info:
+        return None
+
+    translate = info.get("translate")
+    if not translate or not translate.get("html"):
+        logger.info("No translation available - falling back to regular PDF")
+        return await download_chapter_pdf(url, out_path, progress_cb)
+
+    logger.info("Translation available: %d boxes",
+                len(translate.get("html", [])))
+
+    # Download Mikhak font
+    font_path = await _download_mikhak_font()
+    if not font_path:
+        logger.warning("Mikhak font unavailable - falling back to regular PDF")
+        return await download_chapter_pdf(url, out_path, progress_cb)
+
+    out_dir = tempfile.mkdtemp(prefix="sarrast_translated_")
+    try:
+        # Step 1: Download all images
+        if progress_cb:
+            try:
+                await progress_cb(0, 1, "Downloading images...") \
+                    if asyncio.iscoroutinefunction(progress_cb) \
+                    else progress_cb(0, 1, "Downloading images...")
+            except Exception:
+                pass
+
+        img_paths = await download_chapter_images(url, out_dir, progress_cb, info=info)
+        if not img_paths:
+            logger.error("No images downloaded for translated PDF")
+            return None
+
+        # Step 2: Render translation on each image
+        if progress_cb:
+            try:
+                await progress_cb(len(img_paths), len(img_paths), "Rendering Persian translation...") \
+                    if asyncio.iscoroutinefunction(progress_cb) \
+                    else progress_cb(len(img_paths), len(img_paths), "Rendering Persian translation...")
+            except Exception:
+                pass
+
+        img_paths.sort()
+        translated_paths = []
+        editor_draw_panel_margin = translate.get("editorDrawPanelMargin", 0)
+        boxes = translate.get("html", [])
+
+        # Calculate y offset for each image (با استفاده از info["images"] که به ترتیب اصلی هست)
+        y_offset = 0
+        for i, img_path in enumerate(img_paths):
+            # Find image height from info (به ترتیب اصلی - نه sort شده)
+            if i < len(info["images"]):
+                img_h = info["images"][i].get("height", 0) or 0
+            else:
+                # Fallback: get image size from PIL
+                try:
+                    from PIL import Image as _PILImage
+                    with _PILImage.open(img_path) as im:
+                        img_h = im.height
+                except Exception:
+                    img_h = 0
+
+            # Render translation on this image
+            # مسیر خروجی: همون نام + _translated.jpg
+            base, _ = os.path.splitext(img_path)
+            translated_path = base + "_translated.jpg"
+
+            success = _render_translation_on_image(
+                img_path,
+                translated_path,
+                translate,
+                y_offset,
+                img_h,
+                editor_draw_panel_margin,
+            )
+
+            if success:
+                translated_paths.append(translated_path)
+            else:
+                # Fallback to original image
+                translated_paths.append(img_path)
+
+            y_offset += img_h
+
+        # Step 3: Build PDF from translated images
+        if progress_cb:
+            try:
+                await progress_cb(len(translated_paths), len(translated_paths), "Building PDF with translation...") \
+                    if asyncio.iscoroutinefunction(progress_cb) \
+                    else progress_cb(len(translated_paths), len(translated_paths), "Building PDF with translation...")
+            except Exception:
+                pass
+
+        # اطمینان از وجود پوشه‌ی parent فایل خروجی
+        parent_dir = os.path.dirname(out_path)
+        if parent_dir and not os.path.exists(parent_dir):
+            try:
+                os.makedirs(parent_dir, exist_ok=True)
+            except Exception as e:
+                logger.error("Cannot create output directory: %s", e)
+                return None
+
+        # ساخت PDF به‌صورت sequential append (memory-efficient)
+        loop = asyncio.get_event_loop()
+        result_path = await loop.run_in_executor(
+            None, _build_translated_pdf_sequential, translated_paths, out_path
+        )
+        return result_path
+    finally:
+        try:
+            shutil.rmtree(out_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _build_translated_pdf_sequential(img_paths: List[str], out_path: str) -> Optional[str]:
+    """
+    ساخت PDF از تصاویر ترجمه‌شده با PIL (sequential append - memory-efficient).
+    """
+    if not img_paths:
+        return None
+
+    from PIL import Image  # noqa: F401
+    import os as _os
+
+    saved_count = 0
+
+    for i, p in enumerate(img_paths):
+        try:
+            img = Image.open(p)
+            if img.mode in ("RGBA", "P", "LA"):
+                img = img.convert("RGB")
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+
+            if i == 0:
+                img.save(out_path, "PDF")
+            else:
+                with open(out_path, "r+b") as f:
+                    img.save(f, "PDF", append=True)
+            img.close()
+            saved_count += 1
+        except Exception as e:
+            logger.warning("Failed to add %s to PDF: %s", p, e)
+            continue
+
+    if saved_count == 0:
+        logger.error("Translated PDF creation failed: no images could be added")
+        return None
+
+    logger.info("Translated PDF created: %s (%d/%d images)",
+                out_path, saved_count, len(img_paths))
+    return out_path
 
 
 # ─── Test ─────────────────────────────────────────────────
