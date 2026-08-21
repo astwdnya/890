@@ -104,6 +104,7 @@ SITES = {
         "search_url_patterns": [
             r"^https?://(?:www\.)?sexkomix2\.com/tag_pagex/.*$",
             r"^https?://(?:www\.)?sexkomix2\.com/search.*$",
+            r"^https?://(?:www\.)?sexkomix2\.com/tag_pagex.*$",
         ],
         "image_patterns": [
             r'https://imgen\.sexkomix2\.com/uploads_images/[^"\']+\.jpg',
@@ -119,6 +120,9 @@ SITES = {
         "allowed_hosts": frozenset({"hentai.name", "www.hentai.name"}),
         "allowed_suffixes": (".hentai.name",),
         "homepage": "https://www.hentai.name/",
+        # NOTE: This site has Cloudflare 403 protection.
+        # May work from some servers but not others.
+        "needs_ytdlp_fallback": True,
         "comic_url_patterns": [
             r"^https?://(?:www\.)?hentai\.name/g/\d+/?$",
         ],
@@ -159,6 +163,8 @@ SITES = {
         "allowed_hosts": frozenset({"novelcrow.com", "www.novelcrow.com"}),
         "allowed_suffixes": (".novelcrow.com",),
         "homepage": "https://novelcrow.com/",
+        # NOTE: Cloudflare 403 protection.
+        "needs_ytdlp_fallback": True,
         "comic_url_patterns": [
             r"^https?://(?:www\.)?novelcrow\.com/comic/[\w\-]+/[\w\-]+/?$",
         ],
@@ -178,6 +184,8 @@ SITES = {
         "allowed_hosts": frozenset({"3hentai.net", "www.3hentai.net"}),
         "allowed_suffixes": (".3hentai.net",),
         "homepage": "https://3hentai.net/",
+        # NOTE: Site appears to be down (404). May come back.
+        "is_dead": True,
         "comic_url_patterns": [
             r"^https?://(?:www\.)?3hentai\.net/d/\d+/?$",
         ],
@@ -264,6 +272,7 @@ SITES = {
         "search_url_patterns": [
             r"^https?://(?:www\.)?hentai18\.net/search\?.*$",
             r"^https?://(?:www\.)?hentai18\.net/[\w\-]+-sex-comics/?$",
+            r"^https?://(?:www\.)?hentai18\.net/[\w\-]+-sex-comics",
         ],
         "image_patterns": [
             r'https://cdn\.hentai18\.net/images/manga/[^"\']+\.jpg',
@@ -285,10 +294,13 @@ SITES = {
         "search_url_patterns": [
             r"^https?://(?:www\.)?sexcomix\.me/[\w\-]+/\d+/?$",
         ],
-        # sexcomix.me: images are relative URLs like /photos/galleries/43/201/N_t.jpg
+        # sexcomix.me: full images are in data-img attribute (single quotes)
+        # Pattern: data-img='/photos/galleries/43/201/0_780' data-ext='.jpg'
+        # We extract both and combine to get full URL
         "image_patterns": [
-            r'/photos/galleries/\d+/\d+/\d+_t\.(?:jpg|webp|png)',
+            r"""data-img=['"](/photos/galleries/\d+/\d+/\d+_\d+)['"][^>]*data-ext=['"](\.(?:jpg|webp|png))['"]""",
         ],
+        "post_process": "sexcomix_me",
         "comic_link_patterns": [
             r'href="((?:https?://(?:www\.)?sexcomix\.me)?/galleries/[\w\-]+)/?"',
         ],
@@ -526,12 +538,16 @@ def _extract_images_from_html(html: str, site_key: str, base_url: str) -> List[s
     
     for pattern in cfg.get("image_patterns", []):
         for m in re.finditer(pattern, html, re.I):
-            url = m.group(0).replace('"', '').replace("'", "")
-            # پاک کردن کاراکتر‌های اضافی
-            url = url.split('"')[0].split("'")[0]
+            # اگه pattern گروه‌های capture داره (مثل sexcomix.me)، اون‌ها رو ترکیب کن
+            if m.groups():
+                # ترکیب همه گروه‌ها (group1 + group2 + ...)
+                url = "".join(m.groups())
+            else:
+                url = m.group(0).replace('"', '').replace("'", "")
+                url = url.split('"')[0].split("'")[0]
             url = _make_absolute_url(url, base_url)
             
-            # Skip فقط آیکون‌ها و لوگوها (نه thumbnail و cover چون بعضی سایت‌ها ازشون استفاده می‌کنن)
+            # Skip فقط آیکون‌ها و لوگوها
             if any(s in url.lower() for s in ['avatar', 'logo', 'favicon', 'icon-', 'banner']):
                 continue
             # Skip اگر خیلی کوتاهه
@@ -572,7 +588,8 @@ def _post_process_images(images: List[str], site_key: str) -> List[str]:
     if post_process == "nhentai":
         # nhentai: تبدیل thumbnail به full image
         # Thumbnail: https://t4.nhentai.net/galleries/4008082/76t.webp
-        # Full:      https://i.nhentai.net/galleries/4008082/76.jpg
+        # Full:      https://i7.nhentai.net/galleries/4008082/76.jpg (try multiple CDN hosts)
+        # CDN hosts: i2, i5, i7 - all work
         processed = []
         for url in images:
             # استخراج gallery_id و page از URL
@@ -583,10 +600,24 @@ def _post_process_images(images: List[str], site_key: str) -> List[str]:
             if m:
                 gallery_id = m.group(1)
                 page = m.group(2)
-                full_url = f"https://i5.nhentai.net/galleries/{gallery_id}/{page}.jpg"
+                # Use i7 first (most reliable), fallback to i5, i2
+                full_url = f"https://i7.nhentai.net/galleries/{gallery_id}/{page}.jpg"
                 processed.append(full_url)
             else:
                 processed.append(url)
+        return processed
+    
+    if post_process == "sexcomix_me":
+        # sexcomix.me: data-img="/photos/galleries/43/201/0_780" + data-ext=".jpg"
+        # → full URL: https://www.sexcomix.me/photos/galleries/43/201/0_780.jpg
+        processed = []
+        for url in images:
+            # URL is already the full path from data-img + data-ext
+            if url.startswith('/'):
+                full_url = "https://www.sexcomix.me" + url
+            else:
+                full_url = url
+            processed.append(full_url)
         return processed
     
     return images

@@ -14153,24 +14153,85 @@ async def process_comic_request(event, url: str, status_msg, site_key: str):
             "chat_id": event.chat_id,
         }
 
-        # نمایش لیست کمیک‌ها (حداکثر 20 تا)
-        buttons = []
-        for i, (comic_url, comic_title) in enumerate(comics[:20]):
-            safe_title = comic_title[:50] if comic_title else comic_url.split("/")[-1][:50]
-            buttons.append([Button.inline(f"📚 {safe_title}", f"cmsel_{session_id}_{i}")])
+        # نمایش لیست کمیک‌ها (20 تا در هر صفحه)
+        # ذخیره offset در state
+        comic_sessions[session_id]["offset"] = 0
 
-        if len(comics) > 20:
-            buttons.append([Button.inline(f"📖 نمایش بیشتر ({len(comics) - 20} مورد دیگر)", f"cmmore_{session_id}_20")])
+        buttons = _build_comic_search_buttons(session_id, comics, 0)
 
         await status_msg.edit(
             f"🔍 نتایج جستجو در {site_name}\n"
-            f"📚 {len(comics)} کمیک پیدا شد\n\n"
+            f"📚 {len(comics)} کمیک پیدا شد\n"
+            f"📄 صفحه 1/{(len(comics) - 1) // 20 + 1}\n\n"
             f"یکی رو انتخاب کن:",
             buttons=buttons,
             parse_mode="md",
         )
     else:
         await status_msg.edit("❌ URL قابل تشخیص نیست.")
+
+
+def _build_comic_search_buttons(session_id: str, comics: list, offset: int) -> list:
+    """ساخت دکمه‌های لیست کمیک با pagination (صفحه قبل/بعد)."""
+    PER_PAGE = 20
+    buttons = []
+    end = min(offset + PER_PAGE, len(comics))
+    page_num = offset // PER_PAGE + 1
+    total_pages = (len(comics) - 1) // PER_PAGE + 1
+
+    for i in range(offset, end):
+        comic_url, comic_title = comics[i]
+        safe_title = comic_title[:50] if comic_title else comic_url.split("/")[-1][:50]
+        buttons.append([Button.inline(f"📚 {safe_title}", f"cmsel_{session_id}_{i}")])
+
+    # دکمه‌های صفحه قبل/بعد
+    nav_buttons = []
+    if offset > 0:
+        nav_buttons.append(Button.inline("⬅️ صفحه قبل", f"cmpage_{session_id}_{offset - PER_PAGE}"))
+    nav_buttons.append(Button.inline(f"📄 {page_num}/{total_pages}", "noop_"))
+    if end < len(comics):
+        nav_buttons.append(Button.inline("صفحه بعد ➡️", f"cmpage_{session_id}_{offset + PER_PAGE}"))
+
+    if len(nav_buttons) > 1:
+        buttons.append(nav_buttons)
+
+    return buttons
+
+
+async def comic_page_callback(event):
+    """تغییر صفحه در لیست سرچ کمیک."""
+    data = event.data.decode()
+    # format: cmpage_{session_id}_{offset}
+    # پیدا کردن offset (آخرین عدد)
+    parts = data.split("_")
+    offset = int(parts[-1])
+    session_id = "_".join(parts[1:-1])
+
+    state = comic_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+
+    comics = state.get("comics", [])
+    site_key = state.get("site_key", "")
+    site_name = SITES.get(site_key, {}).get("display_name", "Comic") if site_key else "Comic"
+
+    buttons = _build_comic_search_buttons(session_id, comics, offset)
+    page_num = offset // 20 + 1
+    total_pages = (len(comics) - 1) // 20 + 1
+
+    await event.answer()
+    try:
+        await event.edit(
+            f"🔍 نتایج جستجو در {site_name}\n"
+            f"📚 {len(comics)} کمیک پیدا شد\n"
+            f"📄 صفحه {page_num}/{total_pages}\n\n"
+            f"یکی رو انتخاب کن:",
+            buttons=buttons,
+            parse_mode="md",
+        )
+    except Exception:
+        pass
 
 
 async def comic_pdf_callback(event):
@@ -19771,6 +19832,7 @@ async def main():
     client.add_event_handler(comic_images_callback, events.CallbackQuery(pattern=r"cmimg_"))
     client.add_event_handler(comic_video_callback, events.CallbackQuery(pattern=r"cmvid_"))
     client.add_event_handler(comic_select_callback, events.CallbackQuery(pattern=r"cmsel_"))
+    client.add_event_handler(comic_page_callback, events.CallbackQuery(pattern=r"cmpage_"))
 
         # Iran server (doostihaa) callbacks
     client.add_event_handler(iran_cb_title, events.CallbackQuery(pattern=r"irn_sel_"))
