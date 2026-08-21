@@ -567,7 +567,9 @@ from otherwebsiteshandler.comics_handler import (
 comic_sessions: dict = {}
 # OCR handler (extract text from image)
 from otherwebsiteshandler.image_ocr_handler import extract_text_from_image
+from otherwebsiteshandler.face_swap_handler import face_swap
 ocr_sessions: dict = {}
+faceswap_sessions: dict = {}
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -5128,6 +5130,12 @@ async def generic_url_handler(event):
     elif event.sender_id not in AUTHORIZED_USERS or event.raw_text.startswith("/"):
         return
 
+    # ─── Face Swap: بررسی آیا کاربر عکس face برای face swap فرستاده ───
+    if event.chat_id in user_state and user_state[event.chat_id].get("action") == "wait_for_face_swap":
+        handled = await faceswap_process_callback(event)
+        if handled:
+            return
+
     # ─── Image OCR: وقتی کاربر عکس می‌فرسته ───
     if event.message and event.message.photo:
         # Save the photo and show inline button
@@ -5143,7 +5151,10 @@ async def generic_url_handler(event):
             }
             await event.reply(
                 "📷 عکس دریافت شد!",
-                buttons=[Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
+                buttons=[
+                    [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
+                    [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
+                ],
             )
         except Exception as e:
             logger.error(f"[OCR] Image receive error: {e}", exc_info=True)
@@ -5165,7 +5176,10 @@ async def generic_url_handler(event):
                 }
                 await event.reply(
                     "📷 فایل تصویر دریافت شد!",
-                    buttons=[Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
+                    buttons=[
+                        [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
+                        [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
+                    ],
                 )
             except Exception as e:
                 logger.error(f"[OCR] Document receive error: {e}", exc_info=True)
@@ -14281,6 +14295,114 @@ async def comic_page_callback(event):
         pass
 
 
+async def faceswap_init_callback(event):
+    """شروع Face Swap - درخواست عکس face از کاربر."""
+    data = event.data.decode()
+    session_id = data.replace("fsinit_", "")
+
+    # پیدا کردن عکس target از OCR sessions
+    ocr_state = ocr_sessions.get(session_id)
+    if not ocr_state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+
+    target_image_path = ocr_state["image_path"]
+
+    # ساخت session جدید برای face swap
+    fs_session_id = f"fs_{event.chat_id}_{event.id}_{int(time.time())}"
+    faceswap_sessions[fs_session_id] = {
+        "target_image_path": target_image_path,
+        "chat_id": event.chat_id,
+        "waiting_for_face": True,
+    }
+
+    # تنظیم user_state برای دریافت عکس بعدی
+    user_state[event.chat_id] = {
+        "action": "wait_for_face_swap",
+        "fs_session_id": fs_session_id,
+    }
+
+    await event.answer()
+    await event.edit(
+        "🎭 **Face Swap**\n\n"
+        "عکس اصلی ذخیره شد!\n"
+        "حالا عکس **face** (چهره‌ای که می‌خوای جایگزین کنی) رو بفرست.",
+        buttons=None,
+        parse_mode="md",
+    )
+
+
+async def faceswap_process_callback(event):
+    """پردازش Face Swap با عکس face که کاربر فرستاده."""
+    chat_id = event.chat_id
+    state = user_state.get(chat_id)
+
+    if not state or state.get("action") != "wait_for_face_swap":
+        return False
+
+    fs_session_id = state.get("fs_session_id")
+    fs_state = faceswap_sessions.get(fs_session_id)
+    if not fs_state:
+        return False
+
+    # دریافت عکس face
+    if event.message and event.message.photo:
+        face_path = os.path.join(OUTPUT_FOLDER, f"fs_face_{chat_id}_{event.id}.jpg")
+        await event.message.download_media(face_path)
+    elif event.message and event.message.document:
+        mime = getattr(event.message.document, "mime_type", "") or ""
+        if mime.startswith("image/"):
+            face_path = os.path.join(OUTPUT_FOLDER, f"fs_face_{chat_id}_{event.id}")
+            await event.message.download_media(face_path)
+        else:
+            return False
+    else:
+        return False
+
+    # پاک کردن user_state
+    user_state.pop(chat_id, None)
+
+    target_path = fs_state["target_image_path"]
+    status_msg = await event.reply("🎭 در حال انجام Face Swap... این ممکنه چند ثانیه طول بکشه.")
+
+    try:
+        success, result = await face_swap(target_path, face_path)
+        if success and os.path.exists(result):
+            size_mb = os.path.getsize(result) / 1024 / 1024
+            await status_msg.edit(f"✅ Face Swap انجام شد! ({size_mb:.1f} MB)\n📤 در حال آپلود...")
+            await send_file_with_progress(
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=result,
+                caption="🎭 Face Swap Result",
+                status_msg=status_msg,
+                buttons=None,
+                supports_streaming=False,
+                force_document=False,
+            )
+            # Cleanup
+            try:
+                os.unlink(result)
+                os.unlink(face_path)
+                if os.path.exists(target_path):
+                    os.unlink(target_path)
+            except Exception:
+                pass
+        else:
+            await status_msg.edit(f"❌ Face Swap ناموفق: {result}")
+            # Cleanup
+            try:
+                os.unlink(face_path)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"[FaceSwap] Error: {e}", exc_info=True)
+        await status_msg.edit(f"❌ خطا: {e}")
+
+    faceswap_sessions.pop(fs_session_id, None)
+    return True
+
+
 async def ocr_extract_callback(event):
     """استخراج متن از تصویر با کلیک روی دکمه شیشه‌ای."""
     data = event.data.decode()
@@ -19929,6 +20051,8 @@ async def main():
     client.add_event_handler(comic_page_callback, events.CallbackQuery(pattern=r"cmpage_"))
     # OCR callback
     client.add_event_handler(ocr_extract_callback, events.CallbackQuery(pattern=r"ocrex_"))
+    # Face Swap callback
+    client.add_event_handler(faceswap_init_callback, events.CallbackQuery(pattern=r"fsinit_"))
 
         # Iran server (doostihaa) callbacks
     client.add_event_handler(iran_cb_title, events.CallbackQuery(pattern=r"irn_sel_"))
