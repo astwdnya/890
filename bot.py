@@ -13800,7 +13800,7 @@ async def sarrast_pdf_translated_callback(event):
                     f"❌ **ترجمه کار نمی‌کنه!**\n\n"
                     f"وابستگی‌های لازم نصب نیست:\n`{err_str[:300]}`\n\n"
                     f"این پکیج‌ها رو به requirements.txt اضافه کن و کانتینر رو rebuild کن:\n"
-                    f"```\narabic-reshaper\npython-bidi\nfonttools\n```"
+                    f"```\nfonttools\nPillow\n```"
                 )
             except Exception:
                 pass
