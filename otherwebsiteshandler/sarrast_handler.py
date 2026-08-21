@@ -488,11 +488,9 @@ def _render_translation_on_image(
     """
     try:
         from PIL import Image, ImageDraw, ImageFont
-        import arabic_reshaper
-        from bidi.algorithm import get_display
         import re as _re
     except ImportError as e:
-        logger.warning("PIL/arabic_reshaper/bidi not available: %s", e)
+        logger.warning("PIL not available: %s", e)
         return False
 
     font_path = _MIKHAK_FONT_PATH
@@ -518,7 +516,11 @@ def _render_translation_on_image(
     # Find boxes that belong to this image (y in [img_y_start, img_y_start + img_height))
     img_boxes = [
         b for b in boxes
-        if img_y_start <= b.get("y", 0) < img_y_start + img_height
+        if img_y_start <= b.get("y", 0) or 0 < img_y_start + img_height
+    ]
+    img_boxes = [
+        b for b in boxes
+        if img_y_start <= (b.get("y") or 0) < img_y_start + img_height
     ]
 
     if not img_boxes:
@@ -611,19 +613,21 @@ def _render_translation_on_image(
             line_text = (line_text or "").strip()
             if not line_text:
                 continue
-            # Reshape Persian text for proper rendering
-            try:
-                reshaped = arabic_reshaper.reshape(line_text)
-                bidi_text = get_display(reshaped)
-            except Exception:
-                bidi_text = line_text  # fallback to raw text
 
-            # Get text size
+            # روش جدید: استفاده از direction='rtl' داخلی PIL با HarfBuzz
+            # این روش خودش shapes (presentation forms) و reorders رو انجام می‌ده
+            # بنابراین نیازی به arabic_reshaper و python-bidi نیست
+
+            # Get text size با direction='rtl'
             try:
-                bbox = draw.textbbox((0, 0), bidi_text, font=font)
+                # textbbox با direction
+                bbox = draw.textbbox(
+                    (0, 0), line_text, font=font, direction="rtl", anchor="la"
+                )
                 text_w = bbox[2] - bbox[0]
                 text_h = bbox[3] - bbox[1]
-            except Exception:
+            except Exception as e:
+                logger.debug("textbbox failed for '%s': %s", line_text[:30], e)
                 continue
 
             # If text is too wide, decrease font size and retry
@@ -632,24 +636,40 @@ def _render_translation_on_image(
                 font_size -= 2
                 try:
                     font = ImageFont.truetype(font_path, font_size)
-                    bbox = draw.textbbox((0, 0), bidi_text, font=font)
+                    bbox = draw.textbbox(
+                        (0, 0), line_text, font=font, direction="rtl", anchor="la"
+                    )
                     text_w = bbox[2] - bbox[0]
                     text_h = bbox[3] - bbox[1]
                 except Exception:
                     break
                 attempts += 1
 
-            # Center horizontally
+            # Center horizontally - right-aligned within box (RTL)
             text_x = x_clamped + ((end_x_clamped - x_clamped) - text_w) / 2
             text_y = start_y + i * line_height + (line_height - text_h) / 2
 
-            # Draw text (with subtle shadow for readability)
+            # Draw text با direction='rtl' و anchor='la' (left-aligned position, RTL text)
+            # shadow for readability
             shadow_offset = 1
-            draw.text(
-                (text_x + shadow_offset, text_y + shadow_offset),
-                bidi_text, fill=(0, 0, 0, 80), font=font,
-            )
-            draw.text((text_x, text_y), bidi_text, fill=text_color, font=font)
+            try:
+                draw.text(
+                    (text_x + shadow_offset, text_y + shadow_offset),
+                    line_text, fill=(0, 0, 0, 80), font=font,
+                    direction="rtl", anchor="la",
+                )
+                draw.text(
+                    (text_x, text_y),
+                    line_text, fill=text_color, font=font,
+                    direction="rtl", anchor="la",
+                )
+            except Exception as e:
+                logger.debug("text draw failed for '%s': %s", line_text[:30], e)
+                # fallback: try without direction (older PIL)
+                try:
+                    draw.text((text_x, text_y), line_text, fill=text_color, font=font)
+                except Exception:
+                    continue
 
     # Composite overlay onto image
     try:
@@ -691,14 +711,6 @@ async def download_chapter_pdf_translated(
     # این بررسی مهم است! اگه وابستگی‌ها نباشن، ترجمه اعمال نمی‌شه
     # ولی PDF بدون ترجمه ساخته می‌شه که گمراه‌کننده است.
     missing_deps = []
-    try:
-        import arabic_reshaper  # noqa: F401
-    except ImportError:
-        missing_deps.append("arabic-reshaper")
-    try:
-        from bidi.algorithm import get_display  # noqa: F401
-    except ImportError:
-        missing_deps.append("python-bidi")
     try:
         from fontTools.ttLib import TTFont  # noqa: F401
     except ImportError:
