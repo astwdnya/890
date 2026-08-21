@@ -546,6 +546,25 @@ from otherwebsiteshandler.generic_handler import (
     javhihi_sessions, tokyoporn_sessions, javwhores_sessions,
     goodporn_sessions, porn365_sessions, fapcake_sessions, fux_sessions,
 )
+# ─── Comic sites handler (17 sites) ───────────────────────
+from otherwebsiteshandler.comics_handler import (
+    SITES as COMIC_SITES,
+    extract_comic_info,
+    extract_comic_search_results,
+    build_comic_pdf,
+    download_comic_video,
+    is_hdporncomics_url, is_sexkomix2_url, is_hentai_name_url,
+    is_porncomics_cloud_url, is_novelcrow_url, is_3hentai_url,
+    is_erofus_url, is_nhentai_url, is_ilikecomix_url,
+    is_hentai18_url, is_sexcomix_me_url, is_xlecx_url,
+    is_comics_moon_url, is_comicsporn_url, is_zzcartoon_url,
+    is_comicsflix_url, is_eggporncomics_url,
+    _get_site_key_from_url as _get_comic_site_key,
+    _is_comic_url as _is_comic_page_url,
+    _is_search_url as _is_comic_search_url,
+)
+# sessions dict برای همه سایت‌های کمیک
+comic_sessions: dict = {}
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -5283,6 +5302,36 @@ async def generic_url_handler(event):
         finally:
             processing_messages.discard(msg_id)
         return
+
+    # ─── Comic sites (17 sites) ─────────────────────────────────
+    # تشخیص URL کمیک
+    _comic_url_fns = [
+        is_hdporncomics_url, is_sexkomix2_url, is_hentai_name_url,
+        is_porncomics_cloud_url, is_novelcrow_url, is_3hentai_url,
+        is_erofus_url, is_nhentai_url, is_ilikecomix_url,
+        is_hentai18_url, is_sexcomix_me_url, is_xlecx_url,
+        is_comics_moon_url, is_comicsporn_url, is_zzcartoon_url,
+        is_comicsflix_url, is_eggporncomics_url,
+    ]
+    for _is_comic_fn in _comic_url_fns:
+        if _is_comic_fn(target_url):
+            site_key = _get_comic_site_key(target_url)
+            if site_key:
+                site_name = COMIC_SITES[site_key]["display_name"]
+                logger.info(f"[URL] {site_name} comic detected | url={target_url[:120]}")
+                status_msg = await event.reply("📚 در حال دریافت اطلاعات کمیک...")
+                try:
+                    await process_comic_request(event, target_url, status_msg, site_key)
+                except Exception as _e:
+                    logger.error(f"[URL] {site_name} comic error: {_e}", exc_info=True)
+                    try:
+                        await status_msg.edit(f"❌ خطا: {_e}")
+                    except Exception:
+                        pass
+                finally:
+                    processing_messages.discard(msg_id)
+                return
+            break
 
     # ─── New sites (27 sites) - generic dispatch loop ──────────
     for _is_url_fn, _process_fn, _log_name in NEW_SITE_HANDLERS:
@@ -13649,7 +13698,8 @@ async def sarrast_pdf_callback(event):
     chapter_title = info.get("title", "")
     safe_series = re.sub(r'[<>:"/\\|?*]', "_", series_title)[:60]
     safe_chapter = re.sub(r'[<>:"/\\|?*]', "_", chapter_title)[:60]
-    out_path = os.path.join(OUTPUT_FOLDER, f"sr_{safe_series}_{safe_chapter}_{int(time.time())}.pdf")
+    # نام فایل: فقط نام داستان و قسمت
+    out_path = os.path.join(OUTPUT_FOLDER, f"{safe_series}_{safe_chapter}.pdf")
     await event.edit(f"📄 در حال دانلود {len(info['images'])} تصویر و ساخت PDF...", buttons=None)
 
     # progress callback برای نمایش پیشرفت دانلود به کاربر
@@ -13731,7 +13781,8 @@ async def sarrast_pdf_translated_callback(event):
     chapter_title = info.get("title", "")
     safe_series = re.sub(r'[<>:"/\\|?*]', "_", series_title)[:60]
     safe_chapter = re.sub(r'[<>:"/\\|?*]', "_", chapter_title)[:60]
-    out_path = os.path.join(OUTPUT_FOLDER, f"sr_tr_{safe_series}_{safe_chapter}_{int(time.time())}.pdf")
+    # نام فایل: فقط نام داستان و قسمت - بدون prefix و timestamp
+    out_path = os.path.join(OUTPUT_FOLDER, f"{safe_series}_{safe_chapter}.pdf")
     await event.edit(
         f"🌐 در حال ساخت PDF با ترجمه فارسی از {len(info['images'])} تصویر...",
         buttons=None,
@@ -13848,7 +13899,8 @@ async def sarrast_zip_callback(event):
     chapter_title = info.get("title", "")
     safe_series = re.sub(r'[<>:"/\\|?*]', "_", series_title)[:60]
     safe_chapter = re.sub(r'[<>:"/\\|?*]', "_", chapter_title)[:60]
-    out_path = os.path.join(OUTPUT_FOLDER, f"sr_{safe_series}_{safe_chapter}_{int(time.time())}.zip")
+    # نام فایل: فقط نام داستان و قسمت
+    out_path = os.path.join(OUTPUT_FOLDER, f"{safe_series}_{safe_chapter}.zip")
     await event.edit(f"🖼 در حال دانلود {len(info['images'])} تصویر و ساخت ZIP...", buttons=None)
     try:
         result = await download_chapter_as_zip(url, out_path, progress_cb=None)
@@ -14031,6 +14083,343 @@ async def sarrast_imgs_callback(event):
     except Exception:
         pass
     sr_states.pop(state_key, None)
+
+
+# ─── Comic sites callbacks ───
+
+
+async def process_comic_request(event, url: str, status_msg, site_key: str):
+    """پردازش URL کمیک - تشخیص صفحه کمیک یا صفحه سرچ."""
+    # بررسی آیا URL صفحه کمیک هست یا سرچ
+    if _is_comic_page_url(url, site_key):
+        # صفحه کمیک - استخراج تصاویر/ویدیو
+        info = await extract_comic_info(url, site_key)
+        if not info:
+            await status_msg.edit("❌ کمیک پیدا نشد یا تصویری موجود نیست.")
+            return
+
+        title = info.get("title", "Comic")
+        images = info.get("images", [])
+        videos = info.get("videos", [])
+        site_name = info.get("display_name", "Comic")
+
+        # ذخیره state
+        session_id = f"comic_{event.chat_id}_{event.id}_{int(time.time())}"
+        comic_sessions[session_id] = {
+            "url": url,
+            "info": info,
+            "site_key": site_key,
+            "chat_id": event.chat_id,
+        }
+
+        # نمایش دکمه‌ها
+        buttons = []
+        if images:
+            buttons.append([Button.inline(f"📄 PDF ({len(images)} تصویر)", f"cmpdf_{session_id}")])
+            buttons.append([Button.inline(f"🖼 تک‌تک تصاویر ({len(images)})", f"cmimg_{session_id}")])
+        if videos:
+            buttons.append([Button.inline(f"🎬 ویدیو ({len(videos)})", f"cmvid_{session_id}")])
+
+        if not buttons:
+            await status_msg.edit("❌ هیچ تصویر یا ویدیویی پیدا نشد.")
+            comic_sessions.pop(session_id, None)
+            return
+
+        await status_msg.edit(
+            f"📚 **{title[:80]}**\n"
+            f"🌐 {site_name}\n"
+            f"🖼 تصاویر: {len(images)}\n"
+            f"🎬 ویدیو: {len(videos)}\n\n"
+            f"یکی از گزینه‌ها رو انتخاب کن:",
+            buttons=buttons,
+            parse_mode="md",
+        )
+
+    elif _is_comic_search_url(url, site_key):
+        # صفحه سرچ - استخراج لیست کمیک‌ها
+        results = await extract_comic_search_results(url, site_key)
+        if not results or not results.get("comics"):
+            await status_msg.edit("❌ کمیک‌ای پیدا نشد.")
+            return
+
+        comics = results["comics"]
+        site_name = results.get("display_name", "Comic")
+
+        # ذخیره state
+        session_id = f"comsearch_{event.chat_id}_{event.id}_{int(time.time())}"
+        comic_sessions[session_id] = {
+            "comics": comics,
+            "site_key": site_key,
+            "chat_id": event.chat_id,
+        }
+
+        # نمایش لیست کمیک‌ها (حداکثر 20 تا)
+        buttons = []
+        for i, (comic_url, comic_title) in enumerate(comics[:20]):
+            safe_title = comic_title[:50] if comic_title else comic_url.split("/")[-1][:50]
+            buttons.append([Button.inline(f"📚 {safe_title}", f"cmsel_{session_id}_{i}")])
+
+        if len(comics) > 20:
+            buttons.append([Button.inline(f"📖 نمایش بیشتر ({len(comics) - 20} مورد دیگر)", f"cmmore_{session_id}_20")])
+
+        await status_msg.edit(
+            f"🔍 نتایج جستجو در {site_name}\n"
+            f"📚 {len(comics)} کمیک پیدا شد\n\n"
+            f"یکی رو انتخاب کن:",
+            buttons=buttons,
+            parse_mode="md",
+        )
+    else:
+        await status_msg.edit("❌ URL قابل تشخیص نیست.")
+
+
+async def comic_pdf_callback(event):
+    """ساخت PDF از تصاویر کمیک."""
+    data = event.data.decode()
+    session_id = data.replace("cmpdf_", "")
+    state = comic_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    await event.answer("📄 شروع ساخت PDF...", alert=False)
+
+    info = state["info"]
+    site_key = state["site_key"]
+    images = info.get("images", [])
+    title = info.get("title", "comic")
+
+    safe_title = re.sub(r'[<>:"/\\|?*]', "_", title)[:60]
+    out_path = os.path.join(OUTPUT_FOLDER, f"{safe_title}.pdf")
+
+    await event.edit(f"📄 در حال دانلود {len(images)} تصویر و ساخت PDF...", buttons=None)
+
+    async def _progress_cb(done, total, current):
+        if total and done % max(1, total // 10) == 0:
+            try:
+                await event.edit(f"📄 دانلود تصاویر: {done}/{total}", buttons=None)
+            except Exception:
+                pass
+
+    try:
+        result = await build_comic_pdf(images, out_path, site_key, progress_cb=_progress_cb)
+        if not result or not os.path.exists(result):
+            await event.edit("❌ ساخت PDF ناموفق بود.")
+            comic_sessions.pop(session_id, None)
+            return
+
+        size_mb = os.path.getsize(result) / 1024 / 1024
+        await event.edit(f"✅ PDF ساخته شد ({size_mb:.1f} MB)\n📤 در حال آپلود...")
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=result,
+            caption=f"📚 **{title[:80]}**\n🖼 {len(images)} تصویر\n💾 {size_mb:.1f} MB",
+            status_msg=event,
+            buttons=None,
+            supports_streaming=False,
+            force_document=True,
+        )
+        try:
+            os.unlink(result)
+        except Exception:
+            pass
+        comic_sessions.pop(session_id, None)
+    except Exception as e:
+        logger.error(f"[Comic] PDF error: {e}", exc_info=True)
+        try:
+            await event.edit(f"❌ خطا: {e}")
+        except Exception:
+            pass
+        comic_sessions.pop(session_id, None)
+
+
+async def comic_images_callback(event):
+    """ارسال تک‌تک تصاویر کمیک."""
+    data = event.data.decode()
+    session_id = data.replace("cmimg_", "")
+    state = comic_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    await event.answer("🖼 شروع ارسال تصاویر...", alert=False)
+
+    info = state["info"]
+    site_key = state["site_key"]
+    images = info.get("images", [])
+    title = info.get("title", "comic")
+
+    await event.edit(f"🖼 در حال دانلود {len(images)} تصویر...", buttons=None)
+
+    # دانلود تصاویر
+    import tempfile, shutil
+    out_dir = tempfile.mkdtemp(prefix="comic_imgs_")
+    try:
+        from otherwebsiteshandler.comics_handler import download_comic_images
+        paths = await download_comic_images(images, out_dir, site_key, max_concurrent=8)
+        if not paths:
+            await event.edit("❌ هیچ تصویری دانلود نشد.")
+            return
+
+        await event.edit(f"📤 در حال ارسال {len(paths)} تصویر...", buttons=None)
+
+        # ارسال به‌صورت آلبوم‌های ۱۰ تایی
+        BATCH_SIZE = 10
+        sent_count = 0
+        for batch_start in range(0, len(paths), BATCH_SIZE):
+            batch = paths[batch_start:batch_start + BATCH_SIZE]
+            caption = f"📚 **{title[:60]}**\n🖼 {batch_start + 1}-{batch_start + len(batch)}/{len(paths)}" if batch_start == 0 else ""
+            try:
+                await event.client.send_file(
+                    event.chat_id, batch,
+                    caption=caption, parse_mode="md",
+                    force_document=False, silent=True,
+                )
+                sent_count += len(batch)
+            except Exception as e:
+                logger.error(f"[Comic] batch send error: {e}")
+                # fallback: send one by one
+                for p in batch:
+                    try:
+                        await event.client.send_file(event.chat_id, p, force_document=False, silent=True)
+                        sent_count += 1
+                    except Exception:
+                        pass
+
+        await event.edit(f"✅ {sent_count}/{len(paths)} تصویر ارسال شد.")
+        comic_sessions.pop(session_id, None)
+    finally:
+        try:
+            shutil.rmtree(out_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+async def comic_video_callback(event):
+    """دانلود و ارسال ویدیوی کمیک."""
+    data = event.data.decode()
+    session_id = data.replace("cmvid_", "")
+    state = comic_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    await event.answer("🎬 شروع دانلود ویدیو...", alert=False)
+
+    info = state["info"]
+    site_key = state["site_key"]
+    videos = info.get("videos", [])
+    title = info.get("title", "comic")
+
+    if not videos:
+        await event.edit("❌ ویدیویی موجود نیست.")
+        return
+
+    safe_title = re.sub(r'[<>:"/\\|?*]', "_", title)[:60]
+    out_path = os.path.join(OUTPUT_FOLDER, f"{safe_title}.mp4")
+
+    await event.edit(f"🎬 در حال دانلود ویدیو...", buttons=None)
+
+    async def _progress_cb(text):
+        try:
+            await event.edit(text[:200], buttons=None)
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_comic_video(
+            videos[0], out_path, site_key, _progress_cb
+        )
+        if not success or not os.path.exists(out_path):
+            await event.edit(f"❌ دانلود ناموفق: {error[:200]}")
+            return
+
+        size_mb = os.path.getsize(out_path) / 1024 / 1024
+        await event.edit(f"✅ ویدیو دانلود شد ({size_mb:.1f} MB)\n📤 در حال آپلود...")
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=out_path,
+            caption=f"🎬 **{title[:80]}**\n💾 {size_mb:.1f} MB",
+            status_msg=event,
+            buttons=None,
+            supports_streaming=True,
+        )
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
+        comic_sessions.pop(session_id, None)
+    except Exception as e:
+        logger.error(f"[Comic] video error: {e}", exc_info=True)
+        try:
+            await event.edit(f"❌ خطا: {e}")
+        except Exception:
+            pass
+
+
+async def comic_select_callback(event):
+    """وقتی کاربر از لیست سرچ یه کمیک انتخاب می‌کنه."""
+    data = event.data.decode()
+    # format: cmsel_{session_id}_{index}
+    parts = data.split("_")
+    # find the index (last part)
+    index = int(parts[-1])
+    session_id = "_".join(parts[1:-1])
+
+    state = comic_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+
+    comics = state.get("comics", [])
+    if index >= len(comics):
+        await event.answer("❌ کمیک پیدا نشد.", alert=True)
+        return
+
+    comic_url, comic_title = comics[index]
+    site_key = state["site_key"]
+
+    await event.answer()
+    await event.edit(f"📚 در حال دریافت: {comic_title[:60]}...", buttons=None)
+
+    # استخراج اطلاعات کمیک انتخاب‌شده
+    info = await extract_comic_info(comic_url, site_key)
+    if not info:
+        await event.edit("❌ کمیک پیدا نشد یا تصویری موجود نیست.")
+        return
+
+    # ذخیره state جدید برای این کمیک
+    new_session_id = f"comic_{event.chat_id}_{event.id}_{int(time.time())}"
+    comic_sessions[new_session_id] = {
+        "url": comic_url,
+        "info": info,
+        "site_key": site_key,
+        "chat_id": event.chat_id,
+    }
+
+    title = info.get("title", comic_title)
+    images = info.get("images", [])
+    videos = info.get("videos", [])
+
+    buttons = []
+    if images:
+        buttons.append([Button.inline(f"📄 PDF ({len(images)} تصویر)", f"cmpdf_{new_session_id}")])
+        buttons.append([Button.inline(f"🖼 تک‌تک تصاویر ({len(images)})", f"cmimg_{new_session_id}")])
+    if videos:
+        buttons.append([Button.inline(f"🎬 ویدیو ({len(videos)})", f"cmvid_{new_session_id}")])
+
+    if not buttons:
+        await event.edit("❌ هیچ تصویر یا ویدیویی پیدا نشد.")
+        comic_sessions.pop(new_session_id, None)
+        return
+
+    await event.edit(
+        f"📚 **{title[:80]}**\n"
+        f"🖼 تصاویر: {len(images)}\n"
+        f"🎬 ویدیو: {len(videos)}\n\n"
+        f"یکی از گزینه‌ها رو انتخاب کن:",
+        buttons=buttons,
+        parse_mode="md",
+    )
 
 
 async def diycraft_cb_episode(event):
@@ -19377,6 +19766,11 @@ async def main():
     client.add_event_handler(sarrast_pdf_callback, events.CallbackQuery(pattern=r"sr_pdf_"))
     client.add_event_handler(sarrast_zip_callback, events.CallbackQuery(pattern=r"sr_zip_"))
     client.add_event_handler(sarrast_imgs_callback, events.CallbackQuery(pattern=r"sr_imgs_"))
+    # comic sites callbacks
+    client.add_event_handler(comic_pdf_callback, events.CallbackQuery(pattern=r"cmpdf_"))
+    client.add_event_handler(comic_images_callback, events.CallbackQuery(pattern=r"cmimg_"))
+    client.add_event_handler(comic_video_callback, events.CallbackQuery(pattern=r"cmvid_"))
+    client.add_event_handler(comic_select_callback, events.CallbackQuery(pattern=r"cmsel_"))
 
         # Iran server (doostihaa) callbacks
     client.add_event_handler(iran_cb_title, events.CallbackQuery(pattern=r"irn_sel_"))
