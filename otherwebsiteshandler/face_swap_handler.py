@@ -133,7 +133,14 @@ async def face_swap(target_image_path: str, swap_image_path: str) -> Tuple[bool,
                 result_data = result.get("result") or {}
                 output_url = result_data.get("output_image_url", "")
 
-                if code == 100000 and output_url:
+                # output_image_url می‌تونه string یا list باشه
+                if isinstance(output_url, list):
+                    if len(output_url) > 0:
+                        output_url = output_url[0]
+                    else:
+                        output_url = ""
+
+                if code == 100000 and output_url and isinstance(output_url, str):
                     # Download result
                     logger.info("[FaceSwap] Success! Downloading result...")
                     r4 = await session.get(
