@@ -674,33 +674,82 @@ async def download_chapter_pdf_translated(
       - از فونت Mikhak (همون فونت سایت sarrast) استفاده می‌کنه
       - اگر ترجمه موجود نباشه، به fallback به PDF بدون ترجمه
 
+    IMPORTANT: اگه وابستگی‌های لازم نصب نباشن، این تابع exception می‌ده
+    تا کاربر بفهمه که ترجمه اعمال نشده. اینطوری کپشن "با ترجمه" همیشه واقعی هست.
+
+    Raises:
+        RuntimeError: اگه وابستگی‌های لازم (arabic_reshaper, bidi, fonttools)
+                     نصب نباشن یا فونت قابل دانلود نباشه.
+
     Returns:
-        مسیر فایل PDF ترجمه‌شده، یا None در صورت خطا.
+        مسیر فایل PDF ترجمه‌شده، یا None در صورت خطای دیگر.
     """
     import tempfile
     import shutil
 
+    # ─── Step 0: بررسی وابستگی‌های لازم ───────────────────────
+    # این بررسی مهم است! اگه وابستگی‌ها نباشن، ترجمه اعمال نمی‌شه
+    # ولی PDF بدون ترجمه ساخته می‌شه که گمراه‌کننده است.
+    missing_deps = []
+    try:
+        import arabic_reshaper  # noqa: F401
+    except ImportError:
+        missing_deps.append("arabic-reshaper")
+    try:
+        from bidi.algorithm import get_display  # noqa: F401
+    except ImportError:
+        missing_deps.append("python-bidi")
+    try:
+        from fontTools.ttLib import TTFont  # noqa: F401
+    except ImportError:
+        missing_deps.append("fonttools")
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # noqa: F401
+    except ImportError:
+        missing_deps.append("Pillow")
+
+    if missing_deps:
+        err_msg = (
+            f"وابستگی‌های لازم برای ترجمه نصب نیست: {', '.join(missing_deps)}. "
+            f"لطفاً این پکیج‌ها رو نصب کن: "
+            f"pip install {' '.join(missing_deps)}"
+        )
+        logger.error("[Sarrast] %s", err_msg)
+        raise RuntimeError(err_msg)
+
+    # ─── Step 1: استخراج اطلاعات فصل ─────────────────────────
     info = await extract_chapter_info(url)
     if not info:
         return None
 
     translate = info.get("translate")
     if not translate or not translate.get("html"):
-        logger.info("No translation available - falling back to regular PDF")
+        logger.info("[Sarrast] No translation available - falling back to regular PDF")
         return await download_chapter_pdf(url, out_path, progress_cb)
 
-    logger.info("Translation available: %d boxes",
+    logger.info("[Sarrast] Translation available: %d boxes",
                 len(translate.get("html", [])))
 
-    # Download Mikhak font
+    # ─── Step 2: دانلود فونت Mikhak ──────────────────────────
     font_path = await _download_mikhak_font()
     if not font_path:
-        logger.warning("Mikhak font unavailable - falling back to regular PDF")
-        return await download_chapter_pdf(url, out_path, progress_cb)
+        err_msg = (
+            "فونت Mikhak (فونت فارسی sarrast) قابل دانلود نیست. "
+            "این فونت از https://sarrast.com/public/fonts/Mikhak-Medium1.woff2 دانلود می‌شه. "
+            "ممکنه سایت sarrast موقتاً در دسترس نباشه."
+        )
+        logger.error("[Sarrast] %s", err_msg)
+        raise RuntimeError(err_msg)
 
+    # Verify the font file is actually usable
+    if not os.path.exists(font_path) or os.path.getsize(font_path) < 10000:
+        err_msg = f"فونت Mikhak در {font_path} قابل استفاده نیست یا خراب است."
+        logger.error("[Sarrast] %s", err_msg)
+        raise RuntimeError(err_msg)
+
+    # ─── Step 3: دانلود تصاویر ────────────────────────────────
     out_dir = tempfile.mkdtemp(prefix="sarrast_translated_")
     try:
-        # Step 1: Download all images
         if progress_cb:
             try:
                 await progress_cb(0, 1, "Downloading images...") \
@@ -711,10 +760,10 @@ async def download_chapter_pdf_translated(
 
         img_paths = await download_chapter_images(url, out_dir, progress_cb, info=info)
         if not img_paths:
-            logger.error("No images downloaded for translated PDF")
+            logger.error("[Sarrast] No images downloaded for translated PDF")
             return None
 
-        # Step 2: Render translation on each image
+        # ─── Step 4: رسم ترجمه روی هر تصویر ────────────────────
         if progress_cb:
             try:
                 await progress_cb(len(img_paths), len(img_paths), "Rendering Persian translation...") \
@@ -725,17 +774,17 @@ async def download_chapter_pdf_translated(
 
         img_paths.sort()
         translated_paths = []
+        translated_count = 0  # تعداد تصاویری که واقعاً ترجمه شدن
+        failed_count = 0  # تعداد تصاویری که ترجمه نشدن
         editor_draw_panel_margin = translate.get("editorDrawPanelMargin", 0)
-        boxes = translate.get("html", [])
 
-        # Calculate y offset for each image (با استفاده از info["images"] که به ترتیب اصلی هست)
+        # Calculate y offset for each image
         y_offset = 0
         for i, img_path in enumerate(img_paths):
-            # Find image height from info (به ترتیب اصلی - نه sort شده)
+            # Find image height from info (به ترتیب اصلی)
             if i < len(info["images"]):
                 img_h = info["images"][i].get("height", 0) or 0
             else:
-                # Fallback: get image size from PIL
                 try:
                     from PIL import Image as _PILImage
                     with _PILImage.open(img_path) as im:
@@ -744,7 +793,6 @@ async def download_chapter_pdf_translated(
                     img_h = 0
 
             # Render translation on this image
-            # مسیر خروجی: همون نام + _translated.jpg
             base, _ = os.path.splitext(img_path)
             translated_path = base + "_translated.jpg"
 
@@ -759,13 +807,29 @@ async def download_chapter_pdf_translated(
 
             if success:
                 translated_paths.append(translated_path)
+                translated_count += 1
             else:
                 # Fallback to original image
                 translated_paths.append(img_path)
+                failed_count += 1
+                logger.warning("[Sarrast] Failed to render translation on image %d", i)
 
             y_offset += img_h
 
-        # Step 3: Build PDF from translated images
+        # ─── Step 5: بررسی نتیجه ترجمه ─────────────────────────
+        logger.info("[Sarrast] Translation render: %d/%d images translated, %d failed",
+                    translated_count, len(img_paths), failed_count)
+
+        # اگه هیچ تصویری ترجمه نشده بود، خطا بده
+        if translated_count == 0:
+            err_msg = (
+                "هیچ تصویری ترجمه نشد! این ممکنه به دلیل مشکل در فونت یا "
+                "وابستگی‌ها باشه. لطفاً لاگ‌ها رو چک کن."
+            )
+            logger.error("[Sarrast] %s", err_msg)
+            raise RuntimeError(err_msg)
+
+        # ─── Step 6: ساخت PDF ──────────────────────────────────
         if progress_cb:
             try:
                 await progress_cb(len(translated_paths), len(translated_paths), "Building PDF with translation...") \
@@ -788,6 +852,11 @@ async def download_chapter_pdf_translated(
         result_path = await loop.run_in_executor(
             None, _build_translated_pdf_sequential, translated_paths, out_path
         )
+
+        if result_path:
+            logger.info("[Sarrast] Translated PDF created: %s (translated=%d/%d)",
+                        result_path, translated_count, len(img_paths))
+
         return result_path
     finally:
         try:
