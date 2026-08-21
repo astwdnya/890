@@ -565,6 +565,9 @@ from otherwebsiteshandler.comics_handler import (
 )
 # sessions dict برای همه سایت‌های کمیک
 comic_sessions: dict = {}
+# OCR handler (extract text from image)
+from otherwebsiteshandler.image_ocr_handler import extract_text_from_image
+ocr_sessions: dict = {}
 from y2mate import Y2MateSession
 from youtube_extractor import extract_youtube_info
 from happyscribe_subtitle import hardcode_subtitle_online
@@ -5124,6 +5127,50 @@ async def generic_url_handler(event):
         pass
     elif event.sender_id not in AUTHORIZED_USERS or event.raw_text.startswith("/"):
         return
+
+    # ─── Image OCR: وقتی کاربر عکس می‌فرسته ───
+    if event.message and event.message.photo:
+        # Save the photo and show inline button
+        try:
+            photo = event.message.photo
+            # Save to temp file
+            temp_path = os.path.join(OUTPUT_FOLDER, f"ocr_img_{event.chat_id}_{event.id}.jpg")
+            await event.message.download_media(temp_path)
+            session_id = f"ocr_{event.chat_id}_{event.id}_{int(time.time())}"
+            ocr_sessions[session_id] = {
+                "image_path": temp_path,
+                "chat_id": event.chat_id,
+            }
+            await event.reply(
+                "📷 عکس دریافت شد!",
+                buttons=[Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
+            )
+        except Exception as e:
+            logger.error(f"[OCR] Image receive error: {e}", exc_info=True)
+        return
+
+    # ─── Document OCR: وقتی کاربر فایل عکس به‌عنوان document می‌فرسته ───
+    if event.message and event.message.document:
+        doc = event.message.document
+        # Check if it's an image document
+        mime = getattr(doc, "mime_type", "") or ""
+        if mime.startswith("image/"):
+            try:
+                temp_path = os.path.join(OUTPUT_FOLDER, f"ocr_doc_{event.chat_id}_{event.id}")
+                await event.message.download_media(temp_path)
+                session_id = f"ocr_{event.chat_id}_{event.id}_{int(time.time())}"
+                ocr_sessions[session_id] = {
+                    "image_path": temp_path,
+                    "chat_id": event.chat_id,
+                }
+                await event.reply(
+                    "📷 فایل تصویر دریافت شد!",
+                    buttons=[Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
+                )
+            except Exception as e:
+                logger.error(f"[OCR] Document receive error: {e}", exc_info=True)
+            return
+
     if (
         event.chat_id in user_state
         and user_state[event.chat_id].get("action") == "wait_for_compression_size"
@@ -14234,6 +14281,53 @@ async def comic_page_callback(event):
         pass
 
 
+async def ocr_extract_callback(event):
+    """استخراج متن از تصویر با کلیک روی دکمه شیشه‌ای."""
+    data = event.data.decode()
+    session_id = data.replace("ocrex_", "")
+    state = ocr_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    await event.answer("📖 استخراج متن شروع شد...", alert=False)
+
+    image_path = state["image_path"]
+    if not os.path.exists(image_path):
+        await event.edit("❌ فایل تصویر پیدا نشد. دوباره عکس رو بفرست.")
+        ocr_sessions.pop(session_id, None)
+        return
+
+    await event.edit("📖 در حال استخراج متن از تصویر... لطفاً صبر کن.", buttons=None)
+
+    try:
+        success, text = await extract_text_from_image(image_path)
+        if success:
+            # Clean up and send text
+            if len(text) > 4000:
+                # Split long text
+                for i in range(0, len(text), 4000):
+                    await event.reply(f"```\n{text[i:i+4000]}\n```", parse_mode="md")
+            else:
+                await event.edit(
+                    f"✅ متن استخراج‌شده:\n\n```\n{text}\n```",
+                    parse_mode="md",
+                    buttons=None,
+                )
+        else:
+            await event.edit(f"❌ {text}", buttons=None)
+    except Exception as e:
+        logger.error(f"[OCR] Callback error: {e}", exc_info=True)
+        await event.edit(f"❌ خطا: {e}", buttons=None)
+    finally:
+        # Cleanup
+        try:
+            if os.path.exists(image_path):
+                os.unlink(image_path)
+        except Exception:
+            pass
+        ocr_sessions.pop(session_id, None)
+
+
 async def comic_pdf_callback(event):
     """ساخت PDF از تصاویر کمیک."""
     data = event.data.decode()
@@ -19833,6 +19927,8 @@ async def main():
     client.add_event_handler(comic_video_callback, events.CallbackQuery(pattern=r"cmvid_"))
     client.add_event_handler(comic_select_callback, events.CallbackQuery(pattern=r"cmsel_"))
     client.add_event_handler(comic_page_callback, events.CallbackQuery(pattern=r"cmpage_"))
+    # OCR callback
+    client.add_event_handler(ocr_extract_callback, events.CallbackQuery(pattern=r"ocrex_"))
 
         # Iran server (doostihaa) callbacks
     client.add_event_handler(iran_cb_title, events.CallbackQuery(pattern=r"irn_sel_"))
