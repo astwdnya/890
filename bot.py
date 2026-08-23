@@ -568,6 +568,7 @@ comic_sessions: dict = {}
 # OCR handler (extract text from image)
 from otherwebsiteshandler.image_ocr_handler import extract_text_from_image
 from otherwebsiteshandler.face_swap_handler import face_swap
+from otherwebsiteshandler.ai.image_generator import generate_image, ART_STYLES, SHAPES as AI_SHAPES, MAX_IMAGES as AI_MAX_IMAGES
 ocr_sessions: dict = {}
 faceswap_sessions: dict = {}
 from y2mate import Y2MateSession
@@ -5136,6 +5137,80 @@ async def generic_url_handler(event):
         if handled:
             return
 
+    # ─── AI Image Generator: بررسی آیا کاربر prompt فرستاده ───
+    if event.chat_id in user_state and user_state[event.chat_id].get("action") == "wait_for_ai_prompt":
+        prompt_text = event.raw_text.strip()
+        if not prompt_text or prompt_text.startswith("/"):
+            return
+        state_info = user_state.pop(event.chat_id)
+        ai_session_id = state_info.get("ai_session_id")
+        ai_state = ai_sessions.get(ai_session_id)
+        if not ai_state:
+            await event.reply("⏰ نشست منقضی شده. /ai رو دوباره بزن.")
+            return
+
+        count = ai_state.get("count", 1)
+        style = ai_state.get("style", "none")
+        shape = ai_state.get("shape", "square")
+
+        status_msg = await event.reply(f"🎨 در حال تولید {count} تصویر... این ممکنه چند دقیقه طول بکشه.")
+
+        async def _ai_progress(text):
+            try:
+                await status_msg.edit(text, buttons=None)
+            except Exception:
+                pass
+
+        try:
+            success, error, image_paths = await generate_image(
+                prompt=prompt_text,
+                art_style=style,
+                shape=shape,
+                count=count,
+                progress_cb=_ai_progress,
+            )
+
+            if success and image_paths:
+                await status_msg.edit(f"✅ {len(image_paths)} تصویر تولید شد!\n📤 در حال ارسال...")
+                # Send images as photos
+                for i, img_path in enumerate(image_paths):
+                    try:
+                        caption = f"🎨 {prompt_text[:60]}" if i == 0 else ""
+                        await event.client.send_file(
+                            event.chat_id,
+                            img_path,
+                            caption=caption,
+                            parse_mode="md",
+                            force_document=False,
+                            silent=True,
+                        )
+                        # Cleanup
+                        try:
+                            os.unlink(img_path)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.error(f"[AI] Send error: {e}")
+                        # Try as document
+                        try:
+                            await event.client.send_file(
+                                event.chat_id, img_path,
+                                force_document=True, silent=True,
+                            )
+                            os.unlink(img_path)
+                        except Exception:
+                            pass
+
+                await status_msg.edit(f"✅ {len(image_paths)} تصویر ارسال شد!")
+            else:
+                await status_msg.edit(f"❌ {error}")
+        except Exception as e:
+            logger.error(f"[AI] Error: {e}", exc_info=True)
+            await status_msg.edit(f"❌ خطا: {e}")
+
+        ai_sessions.pop(ai_session_id, None)
+        return
+
     # ─── Image OCR: وقتی کاربر عکس می‌فرسته ───
     if event.message and event.message.photo:
         # Save the photo and show inline button
@@ -5154,6 +5229,7 @@ async def generic_url_handler(event):
                 buttons=[
                     [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
                     [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
+                    [Button.inline("🔞 Face Swap (+18)", f"fsnsfw_{session_id}")],
                 ],
             )
         except Exception as e:
@@ -5179,6 +5255,7 @@ async def generic_url_handler(event):
                     buttons=[
                         [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
                         [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
+                        [Button.inline("🔞 Face Swap (+18)", f"fsnsfw_{session_id}")],
                     ],
                 )
             except Exception as e:
@@ -14295,6 +14372,41 @@ async def comic_page_callback(event):
         pass
 
 
+async def faceswap_nsfw_init_callback(event):
+    """شروع Face Swap NSFW - درخواست عکس face از کاربر."""
+    data = event.data.decode()
+    session_id = data.replace("fsnsfw_", "")
+
+    ocr_state = ocr_sessions.get(session_id)
+    if not ocr_state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+
+    target_image_path = ocr_state["image_path"]
+
+    fs_session_id = f"fs_{event.chat_id}_{event.id}_{int(time.time())}"
+    faceswap_sessions[fs_session_id] = {
+        "target_image_path": target_image_path,
+        "chat_id": event.chat_id,
+        "waiting_for_face": True,
+        "nsfw": True,
+    }
+
+    user_state[event.chat_id] = {
+        "action": "wait_for_face_swap",
+        "fs_session_id": fs_session_id,
+    }
+
+    await event.answer()
+    await event.edit(
+        "🔞 **Face Swap (+18)**\n\n"
+        "عکس اصلی ذخیره شد!\n"
+        "حالا عکس **face** (چهره‌ای که می‌خوای جایگزین کنی) رو بفرست.",
+        buttons=None,
+        parse_mode="md",
+    )
+
+
 async def faceswap_init_callback(event):
     """شروع Face Swap - درخواست عکس face از کاربر."""
     data = event.data.decode()
@@ -14401,6 +14513,257 @@ async def faceswap_process_callback(event):
 
     faceswap_sessions.pop(fs_session_id, None)
     return True
+
+
+ai_sessions: dict = {}
+
+
+async def ai_command(event):
+    """نمایش لیست ابزارهای AI."""
+    await event.reply(
+        "🤖 **AI Tools**\n\nیکی از ابزارها رو انتخاب کن:",
+        buttons=[
+            [Button.inline("🎨 Image Generator", f"aisel_img_{event.chat_id}_{event.id}")],
+        ],
+        parse_mode="md",
+    )
+
+
+async def ai_select_callback(event):
+    """وقتی کاربر یه ابزار AI انتخاب می‌کنه."""
+    data = event.data.decode()
+    session_id = data.replace("aisel_", "")
+    # Create AI session with default settings
+    ai_sessions[session_id] = {
+        "count": 1,
+        "style": "none",
+        "shape": "square",
+        "chat_id": event.chat_id,
+    }
+    await event.answer()
+    await ai_show_settings(event, session_id)
+
+
+async def ai_show_settings(event, session_id):
+    """نمایش تنظیمات Image Generator با دکمه‌های قابل کلیک."""
+    state = ai_sessions.get(session_id)
+    if not state:
+        await event.edit("⏰ نشست منقضی شده. /ai رو دوباره بزن.")
+        return
+
+    count = state.get("count", 1)
+    style = state.get("style", "none")
+    shape = state.get("shape", "square")
+
+    # Build inline buttons
+    # Row 1: Count buttons
+    count_buttons = []
+    for c in range(1, AI_MAX_IMAGES + 1):
+        label = f"✅ {c}" if c == count else str(c)
+        count_buttons.append(Button.inline(label, f"aicount_{session_id}_{c}"))
+
+    # Row 2: Shape buttons
+    shape_labels = {"square": "⬜ Square", "portrait": "📱 Portrait", "landscape": "🖥 Landscape"}
+    shape_buttons = []
+    for s_key, s_label in shape_labels.items():
+        label = f"✅ {s_label}" if s_key == shape else s_label
+        shape_buttons.append(Button.inline(label, f"aishape_{session_id}_{s_key}"))
+
+    # Row 3: Style button
+    style_display = style if style != "none" else "None"
+    style_buttons = [Button.inline(f"🎨 Style: {style_display}", f"aistyle_{session_id}_0")]
+
+    # Row 4: Generate button
+    gen_buttons = [Button.inline("🚀 Generate", f"aigen_{session_id}")]
+
+    await event.edit(
+        f"🎨 **Image Generator**\n\n"
+        f"🖼 تعداد: {count}\n"
+        f"📐 شکل: {shape}\n"
+        f"🎨 استایل: {style_display}\n\n"
+        f"حالا prompt خودت رو بفرست، یا تنظیمات رو تغییر بده:",
+        buttons=[
+            count_buttons,
+            shape_buttons,
+            style_buttons,
+            gen_buttons,
+        ],
+        parse_mode="md",
+    )
+
+
+async def ai_count_callback(event):
+    """تغییر تعداد تصاویر."""
+    data = event.data.decode()
+    parts = data.split("_")
+    count = int(parts[-1])
+    session_id = "_".join(parts[1:-1])
+    state = ai_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    state["count"] = count
+    await event.answer()
+    await ai_show_settings(event, session_id)
+
+
+async def ai_shape_callback(event):
+    """تغییر شکل تصویر."""
+    data = event.data.decode()
+    parts = data.split("_")
+    shape = parts[-1]
+    session_id = "_".join(parts[1:-1])
+    state = ai_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    state["shape"] = shape
+    await event.answer()
+    await ai_show_settings(event, session_id)
+
+
+async def ai_style_callback(event):
+    """نمایش لیست استایل‌ها."""
+    data = event.data.decode()
+    parts = data.split("_")
+    page = int(parts[-1]) if len(parts) > 2 else 0
+    session_id = "_".join(parts[1:-1])
+    state = ai_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+
+    await event.answer()
+    current_style = state.get("style", "none")
+    per_page = 12
+    start = page * per_page
+    end = min(start + per_page, len(ART_STYLES))
+    total_pages = (len(ART_STYLES) - 1) // per_page + 1
+
+    buttons = []
+    row = []
+    for i in range(start, end):
+        style = ART_STYLES[i]
+        label = f"✅ {style}" if style == current_style else style
+        row.append(Button.inline(label[:20], f"aistyle_{session_id}_{i}_sel"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    # Navigation
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ قبل", f"aistyle_{session_id}_{page-1}"))
+    nav.append(Button.inline(f"📄 {page+1}/{total_pages}", "noop_"))
+    if end < len(ART_STYLES):
+        nav.append(Button.inline("بعد ➡️", f"aistyle_{session_id}_{page+1}"))
+    if nav:
+        buttons.append(nav)
+
+    await event.edit(
+        f"🎨 **استایل‌ها** (صفحه {page+1}/{total_pages})\n\n"
+        f"استایل فعلی: {current_style}\n\nیکی رو انتخاب کن:",
+        buttons=buttons,
+        parse_mode="md",
+    )
+
+    # Handle style selection via separate pattern
+    # We need to handle the _sel suffix
+
+
+async def ai_style_select_callback(event):
+    """انتخاب استایل یا تغییر صفحه استایل‌ها."""
+    data = event.data.decode()
+    # format: aistyle_{session_id}_{index}_sel  (style selection)
+    #     or: aistyle_{session_id}_{page}       (page navigation)
+    parts = data.split("_")
+
+    if parts[-1] == "sel":
+        # Style selection: aistyle_{session_id}_{index}_sel
+        index = int(parts[-2])
+        session_id = "_".join(parts[1:-2])
+        state = ai_sessions.get(session_id)
+        if not state:
+            await event.answer("⏰ نشست منقضی شده.", alert=True)
+            return
+        if 0 <= index < len(ART_STYLES):
+            state["style"] = ART_STYLES[index]
+            await event.answer()
+            await ai_show_settings(event, session_id)
+    else:
+        # Page navigation: aistyle_{session_id}_{page}
+        page = int(parts[-1])
+        session_id = "_".join(parts[1:-1])
+        state = ai_sessions.get(session_id)
+        if not state:
+            await event.answer("⏰ نشست منقضی شده.", alert=True)
+            return
+
+        await event.answer()
+        current_style = state.get("style", "none")
+        per_page = 12
+        start = page * per_page
+        end = min(start + per_page, len(ART_STYLES))
+        total_pages = (len(ART_STYLES) - 1) // per_page + 1
+
+        buttons = []
+        row = []
+        for i in range(start, end):
+            style_name = ART_STYLES[i]
+            label = f"✅ {style_name}" if style_name == current_style else style_name
+            row.append(Button.inline(label[:20], f"aistyle_{session_id}_{i}_sel"))
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("⬅️ قبل", f"aistyle_{session_id}_{page-1}"))
+        nav.append(Button.inline(f"📄 {page+1}/{total_pages}", "noop_"))
+        if end < len(ART_STYLES):
+            nav.append(Button.inline("بعد ➡️", f"aistyle_{session_id}_{page+1}"))
+        if nav:
+            buttons.append(nav)
+
+        await event.edit(
+            f"🎨 **استایل‌ها** (صفحه {page+1}/{total_pages})\n\n"
+            f"استایل فعلی: {current_style}\n\nیکی رو انتخاب کن:",
+            buttons=buttons,
+            parse_mode="md",
+        )
+
+
+async def ai_generate_callback(event):
+    """شروع تولید تصویر - درخواست prompt از کاربر."""
+    data = event.data.decode()
+    session_id = data.replace("aigen_", "")
+    state = ai_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+
+    # تنظیم user_state برای دریافت prompt
+    user_state[event.chat_id] = {
+        "action": "wait_for_ai_prompt",
+        "ai_session_id": session_id,
+    }
+
+    await event.answer()
+    await event.edit(
+        "🎨 **Image Generator**\n\n"
+        "تنظیمات ذخیره شد!\n"
+        f"🖼 تعداد: {state.get('count', 1)}\n"
+        f"📐 شکل: {state.get('shape', 'square')}\n"
+        f"🎨 استایل: {state.get('style', 'none')}\n\n"
+        "حالا **prompt** خودت رو بفرست:\n"
+        "مثال: `a beautiful sunset over mountains`",
+        buttons=None,
+        parse_mode="md",
+    )
 
 
 async def ocr_extract_callback(event):
@@ -20008,6 +20371,8 @@ async def main():
     client.add_event_handler(
         setsearch_cmd, events.NewMessage(pattern=r"^/setsearch(\s|$)", incoming=True)
     )
+    # AI command
+    client.add_event_handler(ai_command, events.NewMessage(pattern=r"^/ai(\s|$)", incoming=True))
 
     # ===== Message handlers (order matters - specific before generic) =====
     client.add_event_handler(admin_input_handler, events.NewMessage(incoming=True))
@@ -20051,8 +20416,15 @@ async def main():
     client.add_event_handler(comic_page_callback, events.CallbackQuery(pattern=r"cmpage_"))
     # OCR callback
     client.add_event_handler(ocr_extract_callback, events.CallbackQuery(pattern=r"ocrex_"))
+    # AI callbacks
+    client.add_event_handler(ai_select_callback, events.CallbackQuery(pattern=r"aisel_"))
+    client.add_event_handler(ai_count_callback, events.CallbackQuery(pattern=r"aicount_"))
+    client.add_event_handler(ai_style_select_callback, events.CallbackQuery(pattern=r"aistyle_"))
+    client.add_event_handler(ai_shape_callback, events.CallbackQuery(pattern=r"aishape_"))
+    client.add_event_handler(ai_generate_callback, events.CallbackQuery(pattern=r"aigen_"))
     # Face Swap callback
     client.add_event_handler(faceswap_init_callback, events.CallbackQuery(pattern=r"fsinit_"))
+    client.add_event_handler(faceswap_nsfw_init_callback, events.CallbackQuery(pattern=r"fsnsfw_"))
 
         # Iran server (doostihaa) callbacks
     client.add_event_handler(iran_cb_title, events.CallbackQuery(pattern=r"irn_sel_"))

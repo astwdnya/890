@@ -11,12 +11,13 @@ face_swap_handler.py
   5. ربات هر دو عکس رو به API remaker.ai می‌فرسته
   6. نتیجه face swap رو به کاربر می‌فرسته
 
-API: remaker.ai (completely free, no auth needed, just need random Product-Serial)
+API: remaker.ai (free, no auth, uses X-Forwarded-For for rate limit bypass)
 """
 
 import asyncio
 import logging
 import os
+import random
 import uuid
 from typing import Optional, Tuple
 
@@ -26,6 +27,11 @@ _API_BASE = "https://api.remaker.ai"
 _CREATE_JOB_URL = f"{_API_BASE}/api/pai/v3/ai-facevary/appapi/create-job"
 _GET_JOB_URL = f"{_API_BASE}/api/pai/v3/ai-facevary/appapi/get-job"
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+
+def _random_ip() -> str:
+    """تولید IP تصادفی برای دور زدن محدودیت."""
+    return f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}"
 
 
 async def face_swap(target_image_path: str, swap_image_path: str) -> Tuple[bool, str]:
@@ -59,8 +65,9 @@ async def face_swap(target_image_path: str, swap_image_path: str) -> Tuple[bool,
             if r.status_code != 200:
                 return False, f"Failed to fetch homepage (HTTP {r.status_code})"
 
-            # Step 2: Create job
-            logger.info("[FaceSwap] Creating job...")
+            # Step 2: Create job with fake IP for rate limit bypass
+            fake_ip = _random_ip()
+            logger.info("[FaceSwap] Creating job (IP: %s)...", fake_ip)
             product_serial = uuid.uuid4().hex
 
             with open(target_image_path, "rb") as f:
@@ -84,6 +91,8 @@ async def face_swap(target_image_path: str, swap_image_path: str) -> Tuple[bool,
                     "Product-Code": "067003",
                     "Product-Serial": product_serial,
                     "Origin": "https://remaker.ai",
+                    "X-Forwarded-For": fake_ip,
+                    "X-Real-IP": fake_ip,
                 },
                 multipart=multipart,
                 timeout=60,
@@ -101,7 +110,53 @@ async def face_swap(target_image_path: str, swap_image_path: str) -> Tuple[bool,
             if data.get("code") != 100000:
                 msg = data.get("message", {})
                 err_msg = msg.get("en", str(msg)) if isinstance(msg, dict) else str(msg)
-                return False, f"Create job error: {err_msg}"
+                
+                # اگه rate limit شد، با IP دیگه retry کن
+                if data.get("code") == 400101:
+                    logger.warning("[FaceSwap] Rate limited, retrying with new IP...")
+                    # یه IP دیگه امتحان کن
+                    for retry in range(3):
+                        fake_ip = _random_ip()
+                        product_serial = uuid.uuid4().hex
+                        
+                        multipart2 = CurlMime()
+                        multipart2.addpart(name="target_image", content_type="image/jpeg",
+                                         filename="target.jpg", data=target_data)
+                        multipart2.addpart(name="swap_image", content_type="image/jpeg",
+                                         filename="swap.jpg", data=swap_data)
+                        
+                        r_retry = await session.post(
+                            _CREATE_JOB_URL,
+                            impersonate="chrome",
+                            headers={
+                                "User-Agent": _UA,
+                                "Referer": "https://remaker.ai/face-swap-free/",
+                                "source": "ai_face_vary",
+                                "Product-Code": "067003",
+                                "Product-Serial": product_serial,
+                                "Origin": "https://remaker.ai",
+                                "X-Forwarded-For": fake_ip,
+                                "X-Real-IP": fake_ip,
+                            },
+                            multipart=multipart2,
+                            timeout=60,
+                            verify=False,
+                        )
+                        
+                        try:
+                            data_retry = r_retry.json()
+                            if data_retry.get("code") == 100000:
+                                data = data_retry
+                                break
+                            logger.warning("[FaceSwap] Retry %d: code=%s", retry+1, data_retry.get("code"))
+                        except:
+                            pass
+                        await asyncio.sleep(1)
+                    
+                    if data.get("code") != 100000:
+                        return False, "محدودیت روزانه remaker.ai رسید. سرور شما IP متفاوتی داره و محدودیت‌ها متفاوتن. ممکنه از سرور شما کار کنه."
+                else:
+                    return False, f"Create job error: {err_msg}"
 
             job_id = data["result"]["job_id"]
             logger.info("[FaceSwap] Job created: %s", job_id)
@@ -119,6 +174,8 @@ async def face_swap(target_image_path: str, swap_image_path: str) -> Tuple[bool,
                         "Referer": "https://remaker.ai/face-swap-free/",
                         "source": "ai_face_vary",
                         "Product-Code": "067003",
+                        "X-Forwarded-For": fake_ip,
+                        "X-Real-IP": fake_ip,
                     },
                     timeout=30,
                     verify=False,
@@ -165,7 +222,7 @@ async def face_swap(target_image_path: str, swap_image_path: str) -> Tuple[bool,
                         return False, f"Failed to download result (HTTP {r4.status_code})"
 
                 if attempt % 6 == 5:
-                    logger.info("[FaceSwap] Still processing... (attempt %d)", attempt + 1)
+                    logger.info("[FaceSwap] Still processing... (attempt %d, code=%s)", attempt + 1, code)
 
             return False, "Timeout waiting for face swap result"
 
