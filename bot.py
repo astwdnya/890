@@ -568,7 +568,7 @@ comic_sessions: dict = {}
 # OCR handler (extract text from image)
 from otherwebsiteshandler.image_ocr_handler import extract_text_from_image
 from otherwebsiteshandler.face_swap_handler import face_swap
-from otherwebsiteshandler.ai.image_generator import generate_image, ART_STYLES, SHAPES as AI_SHAPES, MAX_IMAGES as AI_MAX_IMAGES
+from otherwebsiteshandler.ai.image_generator import generate_image, ART_STYLES, SHAPES as AI_SHAPES, MAX_IMAGES as AI_MAX_IMAGES, QUALITY_LEVELS as AI_QUALITY
 ocr_sessions: dict = {}
 faceswap_sessions: dict = {}
 from y2mate import Y2MateSession
@@ -5152,8 +5152,9 @@ async def generic_url_handler(event):
         count = ai_state.get("count", 1)
         style = ai_state.get("style", "none")
         shape = ai_state.get("shape", "square")
+        quality = ai_state.get("quality", "hd")
 
-        status_msg = await event.reply(f"🎨 در حال تولید {count} تصویر... این ممکنه چند دقیقه طول بکشه.")
+        status_msg = await event.reply(f"🎨 در حال تولید {count} تصویر... این ممکنه چند ثانیه طول بکشه.")
 
         async def _ai_progress(text):
             try:
@@ -5167,6 +5168,7 @@ async def generic_url_handler(event):
                 art_style=style,
                 shape=shape,
                 count=count,
+                quality=quality,
                 progress_cb=_ai_progress,
             )
 
@@ -14554,6 +14556,7 @@ async def ai_show_settings(event, session_id):
     count = state.get("count", 1)
     style = state.get("style", "none")
     shape = state.get("shape", "square")
+    quality = state.get("quality", "hd")
 
     # Build inline buttons
     # Row 1: Count buttons
@@ -14569,9 +14572,13 @@ async def ai_show_settings(event, session_id):
         label = f"✅ {s_label}" if s_key == shape else s_label
         shape_buttons.append(Button.inline(label, f"aishape_{session_id}_{s_key}"))
 
-    # Row 3: Style button
+    # Row 3: Style + Quality buttons
     style_display = style if style != "none" else "None"
-    style_buttons = [Button.inline(f"🎨 Style: {style_display}", f"aistyle_{session_id}_0")]
+    quality_display = "✅ HD" if quality == "hd" else "Standard"
+    config_buttons = [
+        Button.inline(f"🎨 Style: {style_display}", f"aistyle_{session_id}_0"),
+        Button.inline(f"💎 {quality_display}", f"aiqual_{session_id}_{'standard' if quality == 'hd' else 'hd'}"),
+    ]
 
     # Row 4: Generate button
     gen_buttons = [Button.inline("🚀 Generate", f"aigen_{session_id}")]
@@ -14580,12 +14587,13 @@ async def ai_show_settings(event, session_id):
         f"🎨 **Image Generator**\n\n"
         f"🖼 تعداد: {count}\n"
         f"📐 شکل: {shape}\n"
-        f"🎨 استایل: {style_display}\n\n"
+        f"🎨 استایل: {style_display}\n"
+        f"💎 کیفیت: {quality.upper()}\n\n"
         f"حالا prompt خودت رو بفرست، یا تنظیمات رو تغییر بده:",
         buttons=[
             count_buttons,
             shape_buttons,
-            style_buttons,
+            config_buttons,
             gen_buttons,
         ],
         parse_mode="md",
@@ -14618,6 +14626,21 @@ async def ai_shape_callback(event):
         await event.answer("⏰ نشست منقضی شده.", alert=True)
         return
     state["shape"] = shape
+    await event.answer()
+    await ai_show_settings(event, session_id)
+
+
+async def ai_quality_callback(event):
+    """تغییر کیفیت تصویر (Standard/HD)."""
+    data = event.data.decode()
+    parts = data.split("_")
+    quality = parts[-1]  # "hd" or "standard"
+    session_id = "_".join(parts[1:-1])
+    state = ai_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    state["quality"] = quality
     await event.answer()
     await ai_show_settings(event, session_id)
 
@@ -20421,6 +20444,7 @@ async def main():
     client.add_event_handler(ai_count_callback, events.CallbackQuery(pattern=r"aicount_"))
     client.add_event_handler(ai_style_select_callback, events.CallbackQuery(pattern=r"aistyle_"))
     client.add_event_handler(ai_shape_callback, events.CallbackQuery(pattern=r"aishape_"))
+    client.add_event_handler(ai_quality_callback, events.CallbackQuery(pattern=r"aiqual_"))
     client.add_event_handler(ai_generate_callback, events.CallbackQuery(pattern=r"aigen_"))
     # Face Swap callback
     client.add_event_handler(faceswap_init_callback, events.CallbackQuery(pattern=r"fsinit_"))
