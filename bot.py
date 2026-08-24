@@ -5281,7 +5281,6 @@ async def generic_url_handler(event):
                 buttons=[
                     [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
                     [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
-                    [Button.inline("🔞 Face Swap (+18)", f"fsnsfw_{session_id}")],
                     [Button.inline("🗑 Remove Background", f"bgrm_{session_id}")],
                 ],
             )
@@ -5308,7 +5307,6 @@ async def generic_url_handler(event):
                     buttons=[
                         [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
                         [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
-                        [Button.inline("🔞 Face Swap (+18)", f"fsnsfw_{session_id}")],
                         [Button.inline("🗑 Remove Background", f"bgrm_{session_id}")],
                     ],
                 )
@@ -15143,14 +15141,13 @@ async def bgrm_back_callback(event):
         buttons=[
             [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
             [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
-            [Button.inline("🔞 Face Swap (+18)", f"fsnsfw_{session_id}")],
             [Button.inline("🗑 Remove Background", f"bgrm_{session_id}")],
         ],
     )
 
 
 async def bgrm_sticker_callback(event):
-    """حذف پس‌زمینه و ارسال به‌عنوان استیکر Telegram (512x512 PNG با شفافیت)."""
+    """حذف پس‌زمینه و ارسال به‌عنوان استیکر واقعی Telegram (WebP 512x512)."""
     data = event.data.decode()
     session_id = data.replace("bgrstk_", "")
 
@@ -15167,7 +15164,7 @@ async def bgrm_sticker_callback(event):
     await event.answer()
     status_msg = await event.edit(
         "🏷 در حال حذف پس‌زمینه و ساخت استیکر...\n"
-        "(اولین بار ممکنه ۵-۱۰ ثانیه برای لود مدل طول بکشه)"
+        "(چند ثانیه طول می‌کشه)"
     )
 
     try:
@@ -15179,15 +15176,22 @@ async def bgrm_sticker_callback(event):
                 buttons=None,
             )
 
-            # Send as sticker (force_document=False → Telegram به‌عنوان sticker می‌فرسته
-            # چون عکس PNG 512x512 با شفافیت هست)
+            # Send as a REAL Telegram sticker:
+            # استیکر تلگرام = سند WebP 512×512 + اتریبیوت DocumentAttributeSticker.
+            # (PNG به‌عنوان استیکر قبول نیست — Telethon فایل png/jpg رو به‌عنوان
+            # photo آپلود می‌کنه و کلاینت‌ها اون رو عکس معمولی نشون می‌دن؛
+            # webp از مسیر document می‌ره و با این اتریبیوت رندر استیکری می‌گیره)
             try:
                 await event.client.send_file(
                     event.chat_id,
                     result,
-                    caption="🗑 استیکر بدون پس‌زمینه",
-                    parse_mode="md",
-                    force_document=False,  # ← Telegram خودش sticker تشخیص می‌ده
+                    attributes=[
+                        tl_types.DocumentAttributeSticker(
+                            alt="🗑",
+                            stickerset=tl_types.InputStickerSetEmpty(),
+                        )
+                    ],
+                    force_document=False,  # باید False بمونه تا پرچم force_file ست نشه
                     silent=True,
                 )
             except Exception as send_err:

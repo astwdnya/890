@@ -15,7 +15,9 @@ photoroom_handler.py
     remove_background(image_path, output_path=None) → (bool, path_or_err)
         فایل PNG با شفافیت به همان ابعاد از slazzer (۵۰۰×۵۰۰)
     remove_background_to_sticker(image_path, output_path=None) → (bool, path_or_err)
-        همون PNG بعد از ریسایز به ۵۱۲×۵۱۲ (مناسب استیکر تلگرام)
+        فایل **WebP** ۵۱۲×۵۱۲ با شفافیت — فرمت رسمی استیکر استاتیک
+        تلگرام (PNG به‌عنوان استیکر پذیرفته نمی‌شه و به‌عنوان عکس معمولی
+        نمایش داده می‌شه)
 
 نکته:
     - اندازه‌ی رایگان slazzer ۵۰۰×۵۰۰ پیکسله. برای استیکر تلگرام به ۵۱۲×۵۱۲
@@ -246,9 +248,15 @@ def _do_remove_background_sync(image_path: str) -> Tuple[bool, bytes, str]:
     return True, r2.content, "ok"
 
 
-def _resize_to_512(png_bytes: bytes) -> bytes:
-    """Resize the PNG to 512×512 (Telegram sticker spec) preserving aspect
-    ratio and transparency. Uses Pillow, which is already in requirements.
+def _resize_to_512_sticker_webp(png_bytes: bytes) -> bytes:
+    """Convert the slazzer PNG to a Telegram static sticker:
+
+    - WebP format (استاندارد استیکر استاتیک تلگرام؛ PNG به‌عنوان استیکر
+      قبول نیست و کلاینت‌ها اون رو مثل عکس/سند معمولی نشون می‌دن)
+    - longest side = 512 (سایز اجباری استیکر)
+    - شفافیت (RGBA) حفظ می‌شه
+    - اگر lossless از ۴۰۰KB بزرگ‌تر شد، به lossy با کیفیت ۸۵ برمی‌گرده
+      (سقف تلگرام برای استیکر استاتیک ۵۱۲KB است)
     """
     from PIL import Image
 
@@ -263,9 +271,22 @@ def _resize_to_512(png_bytes: bytes) -> bytes:
         else:
             new_h, new_w = 512, max(1, round(512 * w / h))
         src = src.resize((new_w, new_h), Image.LANCZOS)
+
+    # WebP canvas must be exactly 512×512 for perfect sticker rendering;
+    # paste the (possibly non-square) image centered on a transparent canvas.
+    if src.size != (512, 512):
+        canvas = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+        canvas.paste(src, ((512 - src.size[0]) // 2, (512 - src.size[1]) // 2))
+        src = canvas
+
     buf = io.BytesIO()
-    src.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+    src.save(buf, format="WEBP", lossless=True)
+    data = buf.getvalue()
+    if len(data) > 400 * 1024:  # keep well under Telegram's 512 KB sticker cap
+        buf = io.BytesIO()
+        src.save(buf, format="WEBP", quality=85, method=6)
+        data = buf.getvalue()
+    return data
 
 
 async def remove_background(image_path: str, output_path: Optional[str] = None) -> Tuple[bool, str]:
@@ -292,10 +313,10 @@ async def remove_background(image_path: str, output_path: Optional[str] = None) 
 
 
 async def remove_background_to_sticker(image_path: str, output_path: Optional[str] = None) -> Tuple[bool, str]:
-    """حذف پس‌زمینه و ریسایز به ۵۱۲×۵۱۲ برای استیکر تلگرام."""
+    """حذف پس‌زمینه و ساخت WebP ۵۱۲×۵۱۲ برای استیکر تلگرام."""
     if output_path is None:
         base, _ = os.path.splitext(image_path)
-        output_path = base + "_sticker.png"
+        output_path = base + "_sticker.webp"
 
     loop = asyncio.get_event_loop()
     try:
@@ -310,10 +331,10 @@ async def remove_background_to_sticker(image_path: str, output_path: Optional[st
         return False, msg
 
     try:
-        sticker_bytes = await loop.run_in_executor(None, _resize_to_512, png_bytes)
+        sticker_bytes = await loop.run_in_executor(None, _resize_to_512_sticker_webp, png_bytes)
     except Exception as e:
         # Fallback: keep the original PNG
-        logger.warning("[Photoroom] resize to 512 failed (%s); using raw slazzer PNG", e)
+        logger.warning("[Photoroom] webp sticker conversion failed (%s); using raw slazzer PNG", e)
         sticker_bytes = png_bytes
 
     with open(output_path, "wb") as f:
