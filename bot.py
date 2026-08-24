@@ -658,6 +658,11 @@ CLEANUP_DELAY_SECONDS: int = int(os.getenv("CLEANUP_DELAY_SECONDS", "20"))
 SPONSOR_REPO: str = os.getenv("SPONSOR_REPO", "astwdnya/data")
 SPONSOR_BRANCH: str = os.getenv("SPONSOR_BRANCH", "main")
 SPONSOR_FILE: str = os.getenv("SPONSOR_FILE", "data.txt")
+# GitHub admin-ID persistence — فایل جدا از اسپانسرها، همون ریپو
+# (فقط GITHUB_TOKEN تو env لازمه؛ اگه ADMINS_* جدا ست نشده باشن از SPONSOR_* یا پیش‌فرض میاد)
+ADMINS_REPO: str = os.getenv("ADMINS_REPO", os.getenv("SPONSOR_REPO", "astwdnya/data"))
+ADMINS_BRANCH: str = os.getenv("ADMINS_BRANCH", os.getenv("SPONSOR_BRANCH", "main"))
+ADMINS_FILE: str = os.getenv("ADMINS_FILE", "admins.txt")
 BOT_USERNAME: str = ""
 sponsors: list = []  # هر آیتم: {"name": str, "chat_id": str, "link": str}
 pending_sponsor_name: Dict[int, str] = {}  # مرحله اول اضافه کردن اسپانسر
@@ -3886,8 +3891,12 @@ async def admin_input_handler(event):
             )
         else:
             AUTHORIZED_USERS.add(uid)
+            # ذخیره‌ی دائمی توی فایل admins.txt گیتهاب تا بعد از ری‌استارت هم بمونه
+            asyncio.ensure_future(_save_admins())
             await event.reply(
-                f"✅ User `{uid}` added!\nTotal: **{len(AUTHORIZED_USERS)}**",
+                f"✅ User `{uid}` added!\n"
+                f"☁️ Saved to GitHub (`{ADMINS_FILE}`)\n"
+                f"Total: **{len(AUTHORIZED_USERS)}**",
                 parse_mode="markdown",
             )
     elif action == "remove":
@@ -3897,8 +3906,12 @@ async def admin_input_handler(event):
             await event.reply(f"⚠️ User `{uid}` not found.", parse_mode="markdown")
         else:
             AUTHORIZED_USERS.discard(uid)
+            # فایل گیتهاب رو هم آپدیت کن (اگه آیدی هاردکد باشه بعد از ری‌استارت از baseline برمی‌گرده)
+            asyncio.ensure_future(_save_admins())
             await event.reply(
-                f"✅ User `{uid}` removed!\nTotal: **{len(AUTHORIZED_USERS)}**",
+                f"✅ User `{uid}` removed!\n"
+                f"☁️ GitHub `{ADMINS_FILE}` updated\n"
+                f"Total: **{len(AUTHORIZED_USERS)}**",
                 parse_mode="markdown",
             )
     raise events.StopPropagation
@@ -4452,6 +4465,86 @@ async def _load_sponsors(client=None):
     except Exception as e:
         sponsors = []
         logger.error(f"[BOOT] GitHub sponsor load failed: {e}")
+
+
+# ====================== ADMIN-ID PERSIST (GitHub) ======================
+
+
+async def _save_admins(client=None):
+    """AUTHORIZED_USERS رو به فایل ADMINS_FILE (admins.txt) توی ریپو گیتهاب ذخیره می‌کنه.
+
+    فرمت فایل: JSON آرایه از numeric ID ها (مثل data.txt اسپانسرها) —
+    snapshot کامل از همه‌ی کاربران مجاز فعلی.
+    """
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        return
+    text = json.dumps(sorted(AUTHORIZED_USERS), ensure_ascii=False)
+    content_b64 = base64.b64encode(text.encode()).decode()
+    try:
+        async with aiohttp.ClientSession() as session:
+            api_url = f"https://api.github.com/repos/{ADMINS_REPO}/contents/{ADMINS_FILE}"
+            sha = None
+            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+            async with session.get(api_url, headers=headers) as check:
+                if check.status == 200:
+                    data = await check.json()
+                    sha = data.get("sha")
+            payload = {"message": "update admin ids", "content": content_b64, "branch": ADMINS_BRANCH}
+            if sha:
+                payload["sha"] = sha
+            async with session.put(api_url, json=payload, headers=headers) as resp:
+                if resp.status not in (200, 201):
+                    body = await resp.text()
+                    logger.error(f"[ADMINS] GitHub save failed: {resp.status} {body[:200]}")
+                else:
+                    logger.info(f"[ADMINS] Saved {len(AUTHORIZED_USERS)} authorized IDs → {ADMINS_REPO}/{ADMINS_FILE}")
+    except Exception as e:
+        logger.error(f"[ADMINS] GitHub save error: {e}")
+
+
+async def _load_admins(client=None):
+    """آیدی‌های مجاز رو از فایل admins.txt گیتهاب می‌خونه و با
+    AUTHORIZED_USERS (env + هاردکد) ادغام می‌کنه (union).
+
+    - اگه فایل هنوز وجود نداشته باشه (404) فقط لاگ می‌زنه؛ با اولین add ساخته می‌شه.
+    - آیتم‌های غیرعددی به‌صورت امن skip می‌شن.
+    - آیدی‌های env/هاردکد همیشه می‌مونن چون baseline تو _parse_authorized_users ساخته می‌شه.
+    """
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        logger.info("[BOOT] No GITHUB_TOKEN, skipping admin-ids load")
+        return
+    try:
+        url = f"https://raw.githubusercontent.com/{ADMINS_REPO}/{ADMINS_BRANCH}/{ADMINS_FILE}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    ids = json.loads(text)
+                    added = 0
+                    for uid in ids:
+                        if isinstance(uid, bool):
+                            continue
+                        if isinstance(uid, int):
+                            uid_i = uid
+                        elif isinstance(uid, str) and uid.strip().lstrip("-").isdigit():
+                            uid_i = int(uid.strip())
+                        else:
+                            continue
+                        if uid_i not in AUTHORIZED_USERS:
+                            AUTHORIZED_USERS.add(uid_i)
+                            added += 1
+                    logger.info(
+                        f"[BOOT] admin-ids: {len(ids)} entries in {ADMINS_FILE}, "
+                        f"{added} new → total {len(AUTHORIZED_USERS)} authorized users"
+                    )
+                elif resp.status == 404:
+                    logger.info(f"[BOOT] {ADMINS_FILE} not found on GitHub yet — will be created on first add")
+                else:
+                    logger.warning(f"[BOOT] admin-ids load HTTP {resp.status}")
+    except Exception as e:
+        logger.error(f"[BOOT] GitHub admin-ids load failed: {e}")
 
 
 # ====================== SPONSOR HANDLERS ======================
@@ -21247,10 +21340,14 @@ async def main():
     BOT_USERNAME = me.username
 
     await _load_sponsors()
+    await _load_admins()
     _load_user_settings()
 
     logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
     logger.info(f"[BOOT] Authorized users: {AUTHORIZED_USERS}")
+    logger.info(
+        f"[BOOT] admin-ids persist: {ADMINS_REPO}/{ADMINS_FILE} (branch {ADMINS_BRANCH})"
+    )
     logger.info(
         f"[BOOT] GitHub enabled: {GITHUB_ENABLED} | repo: {GITHUB_REPO if github_configured() else 'not configured'}"
     )
