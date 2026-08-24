@@ -54,6 +54,7 @@ COPY savep_handler.py .
 COPY snapwc_handler.py .
 COPY y2mate.py .
 COPY youtube_extractor.py .
+COPY yt_direct_handler.py .
 COPY happyscribe_subtitle.py .
 COPY xnxx_handler.py .
 COPY ytdlp_handler.py .

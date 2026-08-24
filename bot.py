@@ -49,6 +49,14 @@ from github import (
     GITHUB_BASE_DIR,
 )
 from savep_handler import process_savep_request, trigger_savep_cancel
+# YouTube direct download (InnerTube ANDROID_VR + cobalt fallback — RE'd)
+from yt_direct_handler import (
+    is_youtube_url as is_ytdirect_url,
+    extract_video_id as ytdirect_video_id,
+    get_video_info as ytdirect_get_info,
+    download_video as ytdirect_download_video,
+    download_audio as ytdirect_download_audio,
+)
 from xnxx_handler import (
     is_xnxx_url,
     extract_xnxx_qualities,
@@ -638,6 +646,9 @@ pdfimg_sessions: Dict[str, Dict] = {}  # نگه‌داری مسیر عکس‌ه�
 comictr_sessions: Dict[str, Dict] = {}  # ترجمه کامیک PDF (مسیر فایل + chat_id)
 snapwc_sessions: Dict[str, SnapWCSession] = {}  # SnapWC session references
 y2mate_sessions: Dict[str, dict] = {}  # Y2Mate session cache
+ytdirect_sessions: Dict[str, dict] = {}  # YouTube direct (InnerTube+cobalt) sessions
+# حالت دانلود یوتیوب: direct (پیش‌فرض — InnerTube/cobalt بدون مرورگر) یا snapwc
+YT_DOWNLOAD_MODES: Dict[int, str] = {}  # user_id → 'direct' | 'snapwc'
 
 # آپلود گیتهاب — با /startgithub فعال، با /stopgithub غیرفعال میشه
 GITHUB_ENABLED: bool = False
@@ -4980,6 +4991,7 @@ async def start_cmd(event):
     await event.reply(
         "🚀 **Ultimate Bot v5**\n\n"
         "• `/dirpy <url>` → Download video\n"
+        "• `/yt` → Toggle YouTube handler (Direct ⚡ / SnapWC)\n"
         "• `/snapwc <url>` → Download via SnapWC\n"
         "• `/savep <url>` → Download via SaveTheVideo\n"
         "• `/pdf <url>` → Webpage to PDF\n"
@@ -5837,9 +5849,18 @@ async def generic_url_handler(event):
         or "youtu.be" in target_url
     ):
         logger.info(f"[URL] YouTube detected | url={target_url[:120]}")
+        # مسیر جدید: direct (InnerTube+cobalt) یا snapwc — با /yt عوض می‌شه
+        yt_mode = YT_DOWNLOAD_MODES.get(event.sender_id, "direct")
+        if yt_mode == "snapwc":
+            status_msg = await event.reply("⏬ Processing via SnapWC...")
+            try:
+                await _run_snapwc_flow(event, target_url, status_msg)
+            finally:
+                processing_messages.discard(msg_id)
+            return
         status_msg = await event.reply("⏬ Processing...")
         try:
-            await process_y2mate_request(event, target_url, status_msg)
+            await process_ytdirect_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -7059,6 +7080,296 @@ async def process_y2mate_request(event, url: str, status_msg):
             await session.close_browser()
         except Exception:
             pass
+
+
+# ====================== YOUTUBE DIRECT (InnerTube + cobalt) ======================
+
+
+def _ytdirect_fmt_duration(sec) -> str:
+    try:
+        sec = int(sec)
+    except (TypeError, ValueError):
+        sec = 0
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _ytdirect_size_label(size: int) -> str:
+    if not size:
+        return ""
+    if size >= 1024 * 1024 * 1024:
+        return f" · {size / 1024 / 1024 / 1024:.2f}GB"
+    return f" · {size / 1024 / 1024:.1f}MB"
+
+
+async def process_ytdirect_request(event, url: str, status_msg):
+    """یوتیوب → اطلاعات + دکمه‌های کیفیت (InnerTube سریع یا cobalt)."""
+    logger.info(f"[YtDirect] START | chat={event.chat_id} | url={url[:120]}")
+    await safe_edit(status_msg, "🔍 در حال دریافت اطلاعات ویدیو...")
+
+    try:
+        info = await asyncio.wait_for(ytdirect_get_info(url), timeout=90)
+    except asyncio.TimeoutError:
+        await safe_edit(status_msg, "❌_timeout — دوباره امتحان کن.")
+        return
+    except Exception as e:
+        logger.error(f"[YtDirect] info error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: {str(e)[:120]}")
+        return
+
+    if not info or not info.get("video_qualities"):
+        await safe_edit(status_msg, "❌ اطلاعاتی برای این ویدیو پیدا نشد.")
+        return
+
+    source_tag = "⚡ مستقیم" if info.get("source") == "innertube" else "🔗 سرور واسط"
+
+    # کپشن اطلاعات
+    lines = [f"🎬 **{info['title'] or 'YouTube Video'}**"]
+    if info.get("author"):
+        lines.append(f"👤 {info['author']}")
+    stats = []
+    if info.get("duration"):
+        stats.append(f"⏱ {_ytdirect_fmt_duration(info['duration'])}")
+    if info.get("views"):
+        stats.append(f"👁 {info['views']:,}")
+    if info.get("likes"):
+        stats.append(f"👍 {info['likes']:,}")
+    if info.get("dislikes"):
+        stats.append(f"👎 {info['dislikes']:,}")
+    if stats:
+        lines.append(" • ".join(stats))
+    lines.append(f"📡 {source_tag}")
+    caption = "\n".join(lines)
+
+    session_id = f"ytd_{event.chat_id}_{event.id}_{int(time.time())}"
+    ytdirect_sessions[session_id] = {
+        "url": url,
+        "info": info,
+        "chat_id": event.chat_id,
+        "caption": caption,
+    }
+
+    # دکمه‌های کیفیت ویدیو
+    buttons = []
+    row = []
+    for i, q in enumerate(info["video_qualities"]):
+        label = q.get("label", "?")
+        sz = _ytdirect_size_label(q.get("size", 0))
+        badge = " 🎵+" if q.get("muxed") else ""
+        row.append(Button.inline(f"{label}{sz}{badge}", f"ytdv_{session_id}_{i}"))
+        if len(row) >= 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    # دکمه‌های آدیو
+    audio_row = []
+    for j, a in enumerate(info.get("audio_qualities", [])):
+        sz = _ytdirect_size_label(a.get("size", 0))
+        audio_row.append(
+            Button.inline(f"🎵 {a['label']}{sz}", f"ytda_{session_id}_{j}")
+        )
+    if audio_row:
+        buttons.append(audio_row)
+    buttons.append([Button.inline("❌ Cancel", f"ytdc_{session_id}")])
+
+    await safe_edit(
+        status_msg,
+        f"📋 **کیفیت رو انتخاب کن:**\n\n{caption}",
+        buttons=buttons,
+        parse_mode="markdown",
+    )
+
+
+async def ytdirect_video_callback(event):
+    """دانلود ویدیو با کیفیت انتخابی."""
+    data = event.data.decode()
+    # ytdv_<session>_<idx>
+    body = data[len("ytdv_"):]
+    session_id, idx_str = body.rsplit("_", 1)
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        await event.answer("❌ invalid", alert=True)
+        return
+
+    sess = ytdirect_sessions.get(session_id)
+    if not sess:
+        await event.answer("⏰ نشست منقضی شده. لینک رو دوباره بفرست.", alert=True)
+        return
+    if not (0 <= idx < len(sess["info"]["video_qualities"])):
+        await event.answer("❌ کیفیت نامعتبر", alert=True)
+        return
+
+    quality = sess["info"]["video_qualities"][idx]
+    await event.answer()
+    status_msg = await event.edit(
+        f"📥 در حال دانلود {quality.get('label','?')}...\n(ممکنه چند دقیقه طول بکشه)"
+    )
+
+    async def _prog(msg, done, total):
+        try:
+            await safe_edit(status_msg, f"📥 {msg}")
+        except Exception:
+            pass
+
+    try:
+        ok, res = await asyncio.wait_for(
+            ytdirect_download_video(sess["url"], quality, OUTPUT_FOLDER, _prog),
+            timeout=1800,
+        )
+        if not ok or not os.path.exists(res):
+            await safe_edit(status_msg, f"❌ خطا در دانلود: {res}")
+            return
+
+        size_mb = os.path.getsize(res) / 1024 / 1024
+        await safe_edit(status_msg, f"✅ دانلود شد ({size_mb:.1f}MB)\n📤 در حال آپلود...")
+
+        # اسم فایل تمیز
+        safe_title = re.sub(r'[^\w.\-() ]', '_', sess["info"].get("title") or "video")[:80]
+        pretty = os.path.join(OUTPUT_FOLDER, f"{safe_title}_{quality.get('label','yt')}.mp4")
+        try:
+            os.replace(res, pretty)
+            res = pretty
+        except Exception:
+            pass
+
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=res,
+            caption=sess["caption"],
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+        )
+        await safe_edit(status_msg, "✅ ارسال شد!")
+        try:
+            os.unlink(res)
+        except Exception:
+            pass
+        ytdirect_sessions.pop(session_id, None)
+    except asyncio.TimeoutError:
+        await safe_edit(status_msg, "❌ دانلود خیلی طول کشید — لغو شد.")
+    except Exception as e:
+        logger.error(f"[YtDirect] video dl error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: {str(e)[:150]}")
+
+
+async def ytdirect_audio_callback(event):
+    """دانلود آدیو (با تامبنیل embed + متادیتا)."""
+    data = event.data.decode()
+    body = data[len("ytda_"):]
+    session_id, idx_str = body.rsplit("_", 1)
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        await event.answer("❌ invalid", alert=True)
+        return
+
+    sess = ytdirect_sessions.get(session_id)
+    if not sess:
+        await event.answer("⏰ نشست منقضی شده. لینک رو دوباره بفرست.", alert=True)
+        return
+    aqs = sess["info"].get("audio_qualities", [])
+    if not (0 <= idx < len(aqs)):
+        await event.answer("❌ کیفیت نامعتبر", alert=True)
+        return
+
+    aq = aqs[idx]
+    await event.answer()
+    status_msg = await event.edit(
+        f"🎵 در حال دانلود آدیو ({aq['label']}) + افزودن کاور و متادیتا..."
+    )
+
+    async def _prog(msg, done, total):
+        try:
+            await safe_edit(status_msg, f"📥 {msg}")
+        except Exception:
+            pass
+
+    try:
+        ok, res = await asyncio.wait_for(
+            ytdirect_download_audio(
+                sess["url"], aq, OUTPUT_FOLDER, sess["info"], _prog
+            ),
+            timeout=1200,
+        )
+        if not ok or not os.path.exists(res):
+            await safe_edit(status_msg, f"❌ خطا در دانلود آدیو: {res}")
+            return
+
+        size_mb = os.path.getsize(res) / 1024 / 1024
+        await safe_edit(status_msg, f"✅ آدیو آماده شد ({size_mb:.1f}MB)\n📤 در حال آپلود...")
+
+        safe_title = re.sub(r'[^\w.\-() ]', '_', sess["info"].get("title") or "audio")[:80]
+        ext = os.path.splitext(res)[1]
+        pretty = os.path.join(OUTPUT_FOLDER, f"{safe_title}{ext}")
+        try:
+            os.replace(res, pretty)
+            res = pretty
+        except Exception:
+            pass
+
+        # کپشن آدیو با متادیتا
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=res,
+            caption=sess["caption"],
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=False,
+        )
+        await safe_edit(status_msg, "✅ آدیو ارسال شد!")
+        try:
+            os.unlink(res)
+        except Exception:
+            pass
+        ytdirect_sessions.pop(session_id, None)
+    except asyncio.TimeoutError:
+        await safe_edit(status_msg, "❌ دانلود خیلی طول کشید — لغو شد.")
+    except Exception as e:
+        logger.error(f"[YtDirect] audio dl error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: {str(e)[:150]}")
+
+
+async def ytdirect_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data[len("ytdc_"):]
+    ytdirect_sessions.pop(session_id, None)
+    await event.answer("Cancelled", alert=False)
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+
+async def yt_command(event):
+    """تبادل هندلر دانلود یوتیوب: direct (سریع/خالص) ↔ snapwc (مرورگری)."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    current = YT_DOWNLOAD_MODES.get(event.sender_id, "direct")
+    new_mode = "snapwc" if current == "direct" else "direct"
+    YT_DOWNLOAD_MODES[event.sender_id] = new_mode
+    if new_mode == "direct":
+        desc = (
+            "⚡ **حالت: Direct**\n\n"
+            "دانلود یوتیوب بدون مرورگر:\n"
+            "• InnerTube API (مستقیم از یوتیوب — سریع‌ترین)\n"
+            "• fallback: سرور واسط cobalt\n"
+            "• همه‌ی کیفیت‌ها تا 4K + آدیو با کاور و متادیتا\n\n"
+            "دوباره /yt بزنی برمی‌گرده به SnapWC."
+        )
+    else:
+        desc = (
+            "🎭 **حالت: SnapWC**\n\n"
+            "دانلود یوتیوب از طریق SnapWC (مرورگری).\n\n"
+            "دوباره /yt بزنی برمی‌گرده به Direct."
+        )
+    await event.reply(desc, parse_mode="markdown")
 
 
 # ====================== VIDEO RECEIVE -> GITHUB OFFER ======================
@@ -20814,6 +21125,15 @@ async def main():
         y2mate_quality_callback, events.CallbackQuery(pattern=r"y2mq_.+")
     )
     client.add_event_handler(
+        ytdirect_video_callback, events.CallbackQuery(pattern=r"ytdv_.+")
+    )
+    client.add_event_handler(
+        ytdirect_audio_callback, events.CallbackQuery(pattern=r"ytda_.+")
+    )
+    client.add_event_handler(
+        ytdirect_cancel_callback, events.CallbackQuery(pattern=r"ytdc_.+")
+    )
+    client.add_event_handler(
         y2mate_cancel_callback, events.CallbackQuery(pattern=r"y2mc_.+")
     )
     client.add_event_handler(
@@ -21340,6 +21660,9 @@ async def main():
     )
     client.add_event_handler(
         snapwc_command, events.NewMessage(pattern=r"^/snapwc(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        yt_command, events.NewMessage(pattern=r"^/yt(\s|$)", incoming=True)
     )
     client.add_event_handler(
         savep_command, events.NewMessage(pattern=r"^/savep(\s|$)", incoming=True)
