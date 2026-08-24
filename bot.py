@@ -7179,7 +7179,6 @@ async def process_ytdirect_request(event, url: str, status_msg):
         status_msg,
         f"📋 **کیفیت رو انتخاب کن:**\n\n{caption}",
         buttons=buttons,
-        parse_mode="markdown",
     )
 
 
