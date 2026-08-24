@@ -76,12 +76,25 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
 from otherwebsiteshandler.sarrast_handler import is_sarrast_url
+# itch.io handler (games & downloadable files)
+from otherwebsiteshandler.itchio_handler import (
+    is_itchio_url,
+    extract_game_info as extract_itchio_info,
+    download_itchio_file,
+    suggest_filename as itchio_suggest_filename,
+    ERR_PAID as ITCHIO_ERR_PAID,
+    ERR_CLAIM as ITCHIO_ERR_CLAIM,
+    ERR_NO_DOWNLOADS as ITCHIO_ERR_NO_DL,
+    ERR_NOT_FOUND as ITCHIO_ERR_NOT_FOUND,
+)
 
 # Iran server (doostihaa + farsiland)
 IRAN_SERVER = os.getenv('IRAN_SERVER', 'doostihaa')  # doostihaa or farsiland
 dc_states = {}  # diycraft states
 iran_states = {}
 sr_states = {}  # sarrast states (key: "{chat_id}_{msg_id}")
+itchio_states = {}  # itch.io states (key: "{chat_id}_{msg_id}")
+itchio_watchers = {}  # itch.io price watchers (key: url → {chat_id, title, last_price})
 user_iran_server = {}  # user_id -> 'doostihaa' or 'farsiland'
 from searcher.imdb.videotext_burn import burn_subtitles
 from ytdlp_handler import (
@@ -569,6 +582,7 @@ comic_sessions: dict = {}
 from otherwebsiteshandler.image_ocr_handler import extract_text_from_image
 from otherwebsiteshandler.face_swap_handler import face_swap
 from otherwebsiteshandler.ai.image_generator import generate_image, ART_STYLES, SHAPES as AI_SHAPES, MAX_IMAGES as AI_MAX_IMAGES, QUALITY_LEVELS as AI_QUALITY
+from otherwebsiteshandler.photoroom_handler import remove_background, remove_background_to_sticker
 ocr_sessions: dict = {}
 faceswap_sessions: dict = {}
 from y2mate import Y2MateSession
@@ -5137,6 +5151,42 @@ async def generic_url_handler(event):
         if handled:
             return
 
+    # ─── itch.io: دریافت کوکی اکانت ───
+    if event.chat_id in user_state and user_state[event.chat_id].get("action") == "wait_for_itchio_cookie":
+        cookie_text = event.raw_text.strip()
+        if cookie_text.startswith("/"):
+            user_state.pop(event.chat_id, None)
+            return
+        status_msg = await event.reply("🔄 در حال بررسی کوکی...")
+        try:
+            from otherwebsiteshandler.itchio_handler import (
+                set_session_cookie,
+                verify_session,
+            )
+            set_session_cookie(cookie_text)
+            user = await verify_session(force=True)
+            if user is None:
+                await status_msg.edit(
+                    "❌ کوکی نامعتبره — itch.io رو ناشناس نشونت میده.\n\n"
+                    "مطمئن شو از DevTools مقدار Cookie کامل رو کپی کردی و توی مرورگرت لاگینی.\n"
+                    "دوباره /itchio set بزن و کوکی تازه بفرست.",
+                )
+                return
+            if user.get("error"):
+                await status_msg.edit(f"⚠️ خطا در بررسی کوکی: {user['error']}")
+                return
+            user_state.pop(event.chat_id, None)
+            await status_msg.edit(
+                f"✅ اکانت itch.io وصل شد: **{user.get('display_name') or user.get('username', '?')}**\n\n"
+                f"حالا بازی‌های پولی/claim-required اکانتت هم قابل دانلودن. 🎮"
+                "\n(پیام کوکی رو برای امنیت پاک کن)",
+                parse_mode="md",
+            )
+        except Exception as e:
+            logger.error(f"[Itchio] cookie set error: {e}", exc_info=True)
+            await status_msg.edit(f"❌ خطا: {e}")
+        return
+
     # ─── AI Image Generator: بررسی آیا کاربر prompt فرستاده ───
     if event.chat_id in user_state and user_state[event.chat_id].get("action") == "wait_for_ai_prompt":
         prompt_text = event.raw_text.strip()
@@ -5232,6 +5282,7 @@ async def generic_url_handler(event):
                     [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
                     [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
                     [Button.inline("🔞 Face Swap (+18)", f"fsnsfw_{session_id}")],
+                    [Button.inline("🗑 Remove Background", f"bgrm_{session_id}")],
                 ],
             )
         except Exception as e:
@@ -5258,6 +5309,7 @@ async def generic_url_handler(event):
                         [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
                         [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
                         [Button.inline("🔞 Face Swap (+18)", f"fsnsfw_{session_id}")],
+                        [Button.inline("🗑 Remove Background", f"bgrm_{session_id}")],
                     ],
                 )
             except Exception as e:
@@ -5383,6 +5435,177 @@ async def generic_url_handler(event):
         except Exception as dc_err:
             logger.error(f"[URL] diycraft error: {dc_err}", exc_info=True)
             await status_msg.edit(f"❌ خطا: {dc_err}")
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    # ─── itch.io handler (games & downloadable files) ─────────────
+    if is_itchio_url(target_url):
+        logger.info(f"[URL] itch.io detected | url={target_url[:120]}")
+        status_msg = await event.reply("🎮 در حال دریافت اطلاعات بازی از itch.io...")
+        try:
+            info = await extract_itchio_info(target_url)
+            if not info:
+                await status_msg.edit("❌ اطلاعات بازی دریافت نشد.")
+                processing_messages.discard(msg_id)
+                return
+
+            # ─── مدیریت خطاها ───
+            err = info.get("error")
+            if err == ITCHIO_ERR_PAID:
+                from otherwebsiteshandler.itchio_handler import get_creator_free_games
+                price_cents = info.get("min_price") or 0
+                actual = info.get("actual_price") or price_cents
+                price_str = f"${actual / 100:.2f}"
+                title = info.get("title") or "این بازی"
+
+                # دنبال بازی‌های رایگان همون سازنده بگرد
+                await status_msg.edit(
+                    f"💰 **{title}** یه بازی پولیه (قیمت: **{price_str}**).\n"
+                    f"⏳ دنبال بازی‌های رایگان همین سازنده می‌گردم...",
+                    parse_mode="md",
+                )
+                creator_slug = target_url.rstrip("/").split("/")[-1]
+                free_games = []
+                try:
+                    free_games = await get_creator_free_games(target_url, exclude_slug=creator_slug)
+                except Exception as fg_err:
+                    logger.warning(f"[Itchio] free games lookup failed: {fg_err}")
+
+                # دکمه‌ی دنبال کردن قیمت (این بازی ۴-۸ آگوست رایگان بود!)
+                watch_button = [Button.inline(
+                    f"👀 دنبال کن تا رایگان شه (الان {price_str})",
+                    f"itwatch_{event.id}",
+                )]
+                if free_games:
+                    # دکمه‌های بازی‌های رایگان سازنده + دکمه‌ی watch
+                    buttons = []
+                    row = []
+                    for fg in free_games[:6]:
+                        short = fg["title"][:28]
+                        row.append(Button.url(f"🎮 {short}", fg["url"]))
+                        if len(row) == 2:
+                            buttons.append(row)
+                            row = []
+                    if row:
+                        buttons.append(row)
+                    buttons.append(watch_button)
+
+                    await status_msg.edit(
+                        f"💰 **{title}** یه بازی پولیه (قیمت: **{price_str}**) — بدون خرید قابل دانلود نیست.\n\n"
+                        f"🎁 ولی سازنده‌ش (**{info.get('author', '')}**) این بازی‌های **رایگان** رو داره:\n"
+                        f"روی هر کدوم کلیک کن و لینکش رو برام بفرست تا دانلودش کنم:",
+                        buttons=buttons,
+                        parse_mode="md",
+                    )
+                else:
+                    await status_msg.edit(
+                        f"💰 **{title}** یه بازی پولیه.\n\n"
+                        f"🏷 قیمت: **{price_str}**\n"
+                        f"❌ بدون خرید از itch.io قابل دانلود نیست.\n\n"
+                        f"💡 می‌تونم دنبالش کنم — به محض رایگان شدن، خودکار دانلودش می‌کنم:",
+                        buttons=[watch_button],
+                        parse_mode="md",
+                    )
+                processing_messages.discard(msg_id)
+                return
+            if err == ITCHIO_ERR_CLAIM:
+                title = info.get("title") or "این بازی"
+                await status_msg.edit(
+                    f"🔐 **{title}** باید با اکانت itch.io رایگان claim بشه.\n\n"
+                    f"سازنده گفته برای دانلود باید بازی رو به یه اکانت itch.io اضافه کنی.\n"
+                    f"🔗 {target_url}",
+                    parse_mode="md",
+                )
+                processing_messages.discard(msg_id)
+                return
+            if err == ITCHIO_ERR_NO_DL:
+                title = info.get("title") or "این بازی"
+                await status_msg.edit(
+                    f"🌐 **{title}** فایل قابل دانلود نداره.\n\n"
+                    f"این احتمالاً یه بازی browser-only هست که فقط توی مرورگر اجرا میشه.\n"
+                    f"🔗 {target_url}",
+                    parse_mode="md",
+                )
+                processing_messages.discard(msg_id)
+                return
+            if err:
+                detail = info.get("error_detail") or "خطای نامشخص"
+                await status_msg.edit(f"❌ خطا در دریافت بازی: `{detail[:150]}`", parse_mode="md")
+                processing_messages.discard(msg_id)
+                return
+
+            # ─── اطلاعات بازی ───
+            title = info.get("title", "Untitled")
+            author = info.get("author", "")
+            uploads = info.get("uploads", [])
+
+            if not uploads:
+                await status_msg.edit("❌ هیچ فایلی برای دانلود پیدا نشد.")
+                processing_messages.discard(msg_id)
+                return
+
+            # ساخت اطلاعات نمایشی
+            author_line = f"\n👤 سازنده: **{author}**" if author else ""
+            files_line = "\n".join(
+                f"  • `{u['name']}` ({u.get('size_str') or '?'})"
+                for u in uploads[:10]
+            )
+
+            if len(uploads) == 1:
+                # فقط یه فایل → دانلود مستقیم بدون دکمه
+                await status_msg.edit(
+                    f"🎮 **{title}**{author_line}\n"
+                    f"📦 فایل: `{uploads[0]['name']}` ({uploads[0].get('size_str') or '?'})\n\n"
+                    f"⏳ در حال دانلود...",
+                    parse_mode="md",
+                )
+                await _itchio_perform_download(
+                    event.client, event.chat_id, status_msg, target_url, uploads[0], info
+                )
+            else:
+                # چند فایل → دکمه‌ی انتخاب
+                from otherwebsiteshandler.itchio_handler import _platform_icon
+                buttons = []
+                row = []
+                for idx, u in enumerate(uploads):
+                    icon = _platform_icon(u.get("platforms", []))
+                    label = f"{icon} {u.get('size_str') or '?'}"
+                    # اگه پلتفرم مشخص بود از اسم پلتفرم استفاده کن
+                    plats = u.get("platforms") or []
+                    if plats:
+                        label = f"{icon} {plats[0]} · {u.get('size_str') or '?'}"
+                    else:
+                        # بدون پلتفرم → نام فایل کوتاه
+                        short_name = u["name"]
+                        if len(short_name) > 25:
+                            short_name = short_name[:22] + "..."
+                        label = f"{icon} {short_name} · {u.get('size_str') or '?'}"
+                    row.append(Button.inline(label, f"itdl_{event.id}_{idx}"))
+                    if len(row) == 2:
+                        buttons.append(row)
+                        row = []
+                if row:
+                    buttons.append(row)
+
+                await status_msg.edit(
+                    f"🎮 **{title}**{author_line}\n"
+                    f"📦 {len(uploads)} فایل قابل دانلود:\n{files_line}\n\n"
+                    f"یکی رو انتخاب کن:",
+                    buttons=buttons,
+                    parse_mode="md",
+                )
+                itchio_states[f"{event.chat_id}_{event.id}"] = {
+                    "url": target_url,
+                    "info": info,
+                    "chat_id": event.chat_id,
+                }
+        except Exception as itch_err:
+            logger.error(f"[URL] itch.io error: {itch_err}", exc_info=True)
+            try:
+                await status_msg.edit(f"❌ خطا: {itch_err}")
+            except Exception:
+                pass
         finally:
             processing_messages.discard(msg_id)
         return
@@ -14022,6 +14245,352 @@ async def sarrast_pdf_translated_callback(event):
         sr_states.pop(state_key, None)
 
 
+async def itchio_watch_callback(event):
+    """شروع دنبال کردن قیمت یه بازی itch.io (دکمه‌ی 👀)."""
+    data = event.data.decode()
+    # فرمت: itwatch_<msg_id>
+    msg_id = data.replace("itwatch_", "")
+    state_key = f"{event.chat_id}_{msg_id}"
+    state = itchio_states.get(state_key)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده. لینک بازی رو دوباره بفرست.", alert=True)
+        return
+
+    url = state.get("url", "")
+    info = state.get("info", {})
+    title = info.get("title", "بازی")
+    actual_price = info.get("actual_price") or 0
+
+    if not url:
+        await event.answer("❌ خطا در پیدا کردن بازی.", alert=True)
+        return
+
+    itchio_watchers[url] = {
+        "chat_id": event.chat_id,
+        "title": title,
+        "last_price": actual_price,
+        "added_at": time.time(),
+    }
+    await event.answer(f"👀 دنبال کردن «{title[:30]}» فعال شد!", alert=False)
+    try:
+        await event.edit(
+            f"👀 **{title}** دنبال میشه.\n\n"
+            f"💰 قیمت فعلی: **${actual_price / 100:.2f}**\n"
+            f"🔄 هر ساعت چک می‌کنم و به محض رایگان شدن، خودکار دانلودش می‌کنم و برات می‌فرستم.\n\n"
+            f"⏹ برای لغو: /itchwatch off",
+            buttons=None,
+            parse_mode="md",
+        )
+    except Exception:
+        pass
+
+
+async def itchio_watch_off_command(event):
+    """لغو همه‌ی دنبال‌کردن‌های itch.io."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return
+    # فقط watcher های همین chat رو پاک کن
+    removed = [u for u, w in itchio_watchers.items() if w.get("chat_id") == event.chat_id]
+    for u in removed:
+        itchio_watchers.pop(u, None)
+    if removed:
+        await event.reply(f"✅ {len(removed)} دنبال‌کردن لغو شد.")
+    else:
+        await event.reply("👀 چیزی در حال دنبال شدن نیست.")
+
+
+async def _itchio_watcher_loop():
+    """
+    Background loop: هر ساعت بازی‌های دنبال‌شده رو چک می‌کنه.
+    اگه بازی رایگان شده باشه → خودکار دانلود و ارسال به کاربر.
+    """
+    from otherwebsiteshandler.itchio_handler import (
+        check_price_status,
+        extract_game_info as extract_itchio_info_v2,
+    )
+    logger.info("[ItchioWatcher] started (checks every 3600s)")
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            if not itchio_watchers:
+                continue
+            for url in list(itchio_watchers.keys()):
+                watch = itchio_watchers.get(url)
+                if not watch:
+                    continue
+                chat_id = watch.get("chat_id")
+                status = await check_price_status(url)
+                if not status:
+                    continue
+                # آپدیت قیمت
+                watch["last_price"] = status["actual_price"]
+                if not status.get("is_free"):
+                    continue
+
+                # 🎉 بازی رایگان شد!
+                title = status.get("title", watch.get("title", "بازی"))
+                logger.info(f"[ItchioWatcher] {title} became FREE! downloading...")
+                try:
+                    await client.send_message(
+                        chat_id,
+                        f"🎉 **{title}** رایگان شد!\n⏳ خودکار دانلودش می‌کنم...",
+                        parse_mode="md",
+                    )
+                except Exception:
+                    pass
+
+                # دانلود با هندلر
+                info = await extract_itchio_info_v2(url)
+                if info.get("error"):
+                    continue
+                uploads = info.get("uploads", [])
+                if not uploads:
+                    continue
+
+                status_msg = await client.send_message(
+                    chat_id, f"📥 در حال دانلود **{title}**...", parse_mode="md"
+                )
+                # تک‌فایل → خودش؛ چندفایل → اولین (بزرگ‌ترین رو خودکار نمی‌گیریم)
+                upload = uploads[0]
+                await _itchio_perform_download(
+                    client, chat_id, status_msg, url, upload, info
+                )
+                # بعد از دانلود موفق، از لیست watcher حذفش کن
+                itchio_watchers.pop(url, None)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[ItchioWatcher] loop error: {e}", exc_info=True)
+
+
+async def itchio_command(event):
+    """
+    مدیریت اکانت itch.io برای دانلود بازی‌های پولی/claim-required.
+
+    /itchio          → نمایش وضعیت اکانت
+    /itchio set      → منتظر ارسال کوکی میمونه
+    /itchio off      → حذف کوکی (حالت ناشناس)
+    """
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+
+    from otherwebsiteshandler.itchio_handler import (
+        has_session_cookie,
+        set_session_cookie,
+        clear_session_cookie,
+        verify_session,
+    )
+
+    parts = event.raw_text.split(maxsplit=1)
+    arg = (parts[1].strip().lower() if len(parts) > 1 else "")
+
+    if arg == "off":
+        clear_session_cookie()
+        # پاک کردن state انتظار کوکی اگه فعال بود
+        if event.chat_id in user_state and user_state[event.chat_id].get("action") == "wait_for_itchio_cookie":
+            user_state.pop(event.chat_id, None)
+        return await event.reply("✅ کوکی اکانت itch.io حذف شد. (حالت ناشناس)")
+
+    if arg == "set":
+        user_state[event.chat_id] = {"action": "wait_for_itchio_cookie"}
+        return await event.reply(
+            "🍪 حالا کوکی اکانت itch.io رو بفرست.\n\n"
+            "📖 راهنما (Chrome):\n"
+            "  1. به itch.io بری و مطمئن بشی لاگینی\n"
+            "  2. F12 بزن → تب Network → صفحه رو رفرش کن\n"
+            "  3. روی اولین درخواست کلیک کن → Headers → Request Headers\n"
+            "  4. مقدار Cookie رو کامل کپی کن و همینجا بفرست\n\n"
+            "یا از تب Application → Cookies → itch.io مقدار کوکی itchio رو کپی کن.\n"
+            "❌ برای لغو /itchio off بزن.",
+        )
+
+    # ─── وضعیت فعلی ───
+    lines = ["🎮 **وضعیت اکانت itch.io**\n"]
+    if not has_session_cookie():
+        lines.append("🔸 کوکی تنظیم نشده — حالت ناشناس")
+        lines.append("   فقط بازی‌های رایگان قابل دانلودن.")
+    else:
+        lines.append("🔹 کوکی تنظیم شده — در حال بررسی...")
+        user = await verify_session(force=True)
+        if user is None:
+            lines.append("❌ کوکی نامعتبره یا منقضی شده.")
+            lines.append("   با /itchio set کوکی تازه بذار.")
+        elif user.get("error"):
+            lines.append(f"⚠️ خطا در بررسی: {user['error']}")
+        else:
+            lines.append(f"✅ لاگین شده: **{user.get('display_name') or user.get('username', '?')}**")
+            lines.append("   بازی‌های اکانت + رایگان‌ها قابل دانلودن.")
+
+    lines.append("\n📦 دستورات:")
+    lines.append("  `/itchio set` — تنظیم کوکی اکانت")
+    lines.append("  `/itchio off` — حذف کوکی")
+    await event.reply("\n".join(lines), parse_mode="md")
+
+
+async def _itchio_perform_download(client, chat_id, status_msg, game_url, upload, info):
+    """
+    دانلود و ارسال یه فایل itch.io به کاربر.
+    (هم برای دانلود مستقیم تک‌فایلی و هم برای callback دکمه‌ها استفاده میشه)
+    """
+    title = info.get("title", "itch.io")
+    author = info.get("author", "")
+    upload_name = upload.get("name") or f"file_{upload.get('id')}"
+    upload_id = upload.get("id")
+
+    # بررسی اولیه‌ی حجم از اطلاعات صفحه (قبل از دانلود)
+    # (صرفه‌جویی در پهنای باند — حجم واقعی بعد از دانلود هم دوباره چک میشه)
+    pre_size = upload.get("size_bytes") or 0
+    if pre_size > 1900 * 1024 * 1024:
+        try:
+            await status_msg.edit(
+                f"⚠️ فایل `{upload_name}` حجمش {upload.get('size_str') or '?'} هست.\n\n"
+                f"از محدودیت سند تلگرام (2GB) بزرگتره و نمیتونم بفرستمش.\n"
+                f"🔗 {game_url}",
+                parse_mode="md",
+            )
+        except Exception:
+            pass
+        return
+
+    # ساخت نام فایل امن
+    safe_name = itchio_suggest_filename(upload, title)
+    out_path = os.path.join(OUTPUT_FOLDER, f"itchio_{chat_id}_{int(time.time())}_{safe_name}")
+
+    dl_id = f"itchio_{chat_id}_{upload_id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+
+    # progress callback
+    last_edit = [0.0]
+
+    async def _itch_progress(text):
+        now = time.time()
+        if now - last_edit[0] < 2.0:
+            return
+        last_edit[0] = now
+        try:
+            await status_msg.edit(text, buttons=None, parse_mode="md")
+        except Exception:
+            pass
+
+    try:
+        success, error, size = await download_itchio_file(
+            game_url, upload_id, out_path, _itch_progress
+        )
+        if not success:
+            err_str = str(error)[:300]
+            await status_msg.edit(
+                f"❌ دانلود از itch.io ناموفق بود:\n`{err_str}`",
+                parse_mode="md",
+            )
+            try:
+                if os.path.exists(out_path):
+                    os.unlink(out_path)
+            except Exception:
+                pass
+            return
+
+        size_mb = size / 1024 / 1024
+
+        # بررسی محدودیت حجم سند تلگرام (~2GB)
+        if size > 1900 * 1024 * 1024:
+            await status_msg.edit(
+                f"⚠️ فایل `{upload_name}` دانلود شد ({size_mb:.1f} MB)\n\n"
+                f"ولی از محدودیت حجم سند تلگرام (2GB) بزرگتره و نمیتونم بفرستمش.\n"
+                f"🔗 {game_url}",
+                parse_mode="md",
+            )
+            try:
+                if os.path.exists(out_path):
+                    os.unlink(out_path)
+            except Exception:
+                pass
+            return
+
+        await status_msg.edit(
+            f"✅ دانلود شد ({size_mb:.1f} MB)\n📤 در حال آپلود...",
+        )
+
+        caption = f"🎮 **{title}**"
+        if author:
+            caption += f"\n👤 {author}"
+        caption += f"\n💾 {size_mb:.1f} MB"
+        caption += f"\n📦 itch.io"
+
+        await send_file_with_progress(
+            client=client,
+            chat_id=chat_id,
+            filepath=out_path,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=False,
+            force_document=True,
+            ul_id=dl_id,
+        )
+    except Exception as e:
+        logger.error(f"[Itchio] download/send error: {e}", exc_info=True)
+        try:
+            await status_msg.edit(f"❌ خطا: {e}")
+        except Exception:
+            pass
+    finally:
+        active_downloads.pop(dl_id, None)
+        # فایل موقت رو بعد از ارسال پاک کن
+        try:
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+        except Exception:
+            pass
+
+
+async def itchio_dl_callback(event):
+    """دانلود فایل انتخاب‌شده از itch.io (دکمه‌های انتخاب فایل)."""
+    data = event.data.decode()
+    # فرمت: itdl_<msg_id>_<upload_idx>
+    parts = data.replace("itdl_", "").rsplit("_", 1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        await event.answer("❌ درخواست نامعتبر.", alert=True)
+        return
+    msg_id, idx_str = parts
+    idx = int(idx_str)
+    state_key = f"{event.chat_id}_{msg_id}"
+    state = itchio_states.get(state_key)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده. لینک بازی رو دوباره بفرست.", alert=True)
+        return
+
+    info = state.get("info", {})
+    uploads = info.get("uploads", [])
+    if idx >= len(uploads):
+        await event.answer("❌ فایل پیدا نشد. لینک بازی رو دوباره بفرست.", alert=True)
+        return
+
+    upload = uploads[idx]
+    await event.answer("📥 شروع دانلود...", alert=False)
+
+    game_url = state.get("url", "")
+    title = info.get("title", "itch.io")
+    upload_name = upload.get("name") or "file"
+
+    try:
+        await event.edit(
+            f"🎮 **{title}**\n"
+            f"📦 فایل: `{upload_name}` ({upload.get('size_str') or '?'})\n\n"
+            f"⏳ در حال دانلود...",
+            buttons=None,
+            parse_mode="md",
+        )
+    except Exception:
+        pass
+
+    await _itchio_perform_download(
+        event.client, event.chat_id, event, game_url, upload, info
+    )
+    # نشست رو پاک نکن — کاربر ممکنه فایل دیگه‌ای هم بخواد
+    # (state بعد از ۲۴ ساعت با ری‌استارت ربات پاک میشه)
+
+
 async def sarrast_zip_callback(event):
     """دانلود همه‌ی تصاویر به‌صورت ZIP."""
     data = event.data.decode()
@@ -14515,6 +15084,190 @@ async def faceswap_process_callback(event):
 
     faceswap_sessions.pop(fs_session_id, None)
     return True
+
+
+# ─── Remove Background (PhotoRoom reverse-engineered) ───
+# Stores the session_id and target image path so the sticker/PNG callbacks can find it.
+bgrm_sessions: dict = {}
+
+
+async def bgrm_init_callback(event):
+    """وقتی کاربر دکمه "🗑 Remove Background" رو کلیک می‌کنه،
+    ازش می‌پرسه: استیکر بفرستم یا فایل PNG؟"""
+    data = event.data.decode()
+    session_id = data.replace("bgrm_", "")
+
+    ocr_state = ocr_sessions.get(session_id)
+    if not ocr_state:
+        await event.answer("⏰ نشست منقضی شده. عکس رو دوباره بفرست.", alert=True)
+        return
+
+    # Image path is stored in OCR session — reuse it
+    image_path = ocr_state["image_path"]
+    if not image_path or not os.path.exists(image_path):
+        await event.answer("❌ عکس پیدا نشد. دوباره بفرست.", alert=True)
+        return
+
+    # Store the path keyed by session_id so the sticker/PNG callbacks can find it
+    bgrm_sessions[session_id] = {
+        "image_path": image_path,
+        "chat_id": event.chat_id,
+    }
+
+    await event.answer()
+    await event.edit(
+        "🗑 **Remove Background**\n\n"
+        "عکس آماده‌ست!\n"
+        "به چه فرمتی بفرستم؟",
+        buttons=[
+            [Button.inline("🏷 به‌عنوان استیکر", f"bgrstk_{session_id}")],
+            [Button.inline("🖼 فایل PNG", f"bgrpng_{session_id}")],
+            [Button.inline("🔙 برگشت", f"bgrback_{session_id}")],
+        ],
+        parse_mode="md",
+    )
+
+
+async def bgrm_back_callback(event):
+    """برگشت به منوی اصلی عکس."""
+    data = event.data.decode()
+    session_id = data.replace("bgrback_", "")
+
+    ocr_state = ocr_sessions.get(session_id)
+    if not ocr_state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+
+    await event.edit(
+        "📷 عکس دریافت شد!",
+        buttons=[
+            [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
+            [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
+            [Button.inline("🔞 Face Swap (+18)", f"fsnsfw_{session_id}")],
+            [Button.inline("🗑 Remove Background", f"bgrm_{session_id}")],
+        ],
+    )
+
+
+async def bgrm_sticker_callback(event):
+    """حذف پس‌زمینه و ارسال به‌عنوان استیکر Telegram (512x512 PNG با شفافیت)."""
+    data = event.data.decode()
+    session_id = data.replace("bgrstk_", "")
+
+    bgrm_state = bgrm_sessions.get(session_id)
+    if not bgrm_state:
+        await event.answer("⏰ نشست منقضی شده. عکس رو دوباره بفرست.", alert=True)
+        return
+
+    image_path = bgrm_state["image_path"]
+    if not os.path.exists(image_path):
+        await event.answer("❌ عکس پیدا نشد. دوباره بفرست.", alert=True)
+        return
+
+    await event.answer()
+    status_msg = await event.edit(
+        "🏷 در حال حذف پس‌زمینه و ساخت استیکر...\n"
+        "(اولین بار ممکنه ۵-۱۰ ثانیه برای لود مدل طول بکشه)"
+    )
+
+    try:
+        success, result = await remove_background_to_sticker(image_path)
+        if success and os.path.exists(result):
+            file_size_kb = os.path.getsize(result) / 1024
+            await status_msg.edit(
+                f"✅ پس‌زمینه حذف شد!\n📤 در حال ارسال استیکر... ({file_size_kb:.1f} KB)",
+                buttons=None,
+            )
+
+            # Send as sticker (force_document=False → Telegram به‌عنوان sticker می‌فرسته
+            # چون عکس PNG 512x512 با شفافیت هست)
+            try:
+                await event.client.send_file(
+                    event.chat_id,
+                    result,
+                    caption="🗑 استیکر بدون پس‌زمینه",
+                    parse_mode="md",
+                    force_document=False,  # ← Telegram خودش sticker تشخیص می‌ده
+                    silent=True,
+                )
+            except Exception as send_err:
+                logger.warning("[BGRM] Sticker send failed (%s); trying as document", send_err)
+                # Fallback: send as document
+                await event.client.send_file(
+                    event.chat_id,
+                    result,
+                    force_document=True,
+                    silent=True,
+                )
+
+            await status_msg.edit("✅ استیکر ارسال شد!")
+            # Cleanup temp file
+            try:
+                os.unlink(result)
+            except Exception:
+                pass
+        else:
+            await status_msg.edit(f"❌ خطا در حذف پس‌زمینه: {result}")
+    except Exception as e:
+        logger.error(f"[BGRM] Sticker error: {e}", exc_info=True)
+        await status_msg.edit(f"❌ خطا: {e}")
+
+    bgrm_sessions.pop(session_id, None)
+
+
+async def bgrm_png_callback(event):
+    """حذف پس‌زمینه و ارسال به‌عنوان فایل PNG (تصویر شفاف با کیفیت بالا)."""
+    data = event.data.decode()
+    session_id = data.replace("bgrpng_", "")
+
+    bgrm_state = bgrm_sessions.get(session_id)
+    if not bgrm_state:
+        await event.answer("⏰ نشست منقضی شده. عکس رو دوباره بفرست.", alert=True)
+        return
+
+    image_path = bgrm_state["image_path"]
+    if not os.path.exists(image_path):
+        await event.answer("❌ عکس پیدا نشد. دوباره بفرست.", alert=True)
+        return
+
+    await event.answer()
+    status_msg = await event.edit(
+        "🖼 در حال حذف پس‌زمینه و ساخت فایل PNG...\n"
+        "(اولین بار ممکنه ۵-۱۰ ثانیه برای لود مدل طول بکشه)"
+    )
+
+    try:
+        success, result = await remove_background(image_path)
+        if success and os.path.exists(result):
+            file_size_kb = os.path.getsize(result) / 1024
+            await status_msg.edit(
+                f"✅ پس‌زمینه حذف شد!\n📤 در حال آپلود PNG... ({file_size_kb:.1f} KB)",
+                buttons=None,
+            )
+            # Send as PNG file (force_document=True → فایل با حفظ ابعاد اصلی)
+            await send_file_with_progress(
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=result,
+                caption="🗑 PNG بدون پس‌زمینه",
+                status_msg=status_msg,
+                buttons=None,
+                supports_streaming=False,
+                force_document=True,  # ← فایل بدون فشرده‌سازی Telegram
+            )
+            await status_msg.edit("✅ فایل PNG ارسال شد!")
+            # Cleanup
+            try:
+                os.unlink(result)
+            except Exception:
+                pass
+        else:
+            await status_msg.edit(f"❌ خطا در حذف پس‌زمینه: {result}")
+    except Exception as e:
+        logger.error(f"[BGRM] PNG error: {e}", exc_info=True)
+        await status_msg.edit(f"❌ خطا: {e}")
+
+    bgrm_sessions.pop(session_id, None)
 
 
 ai_sessions: dict = {}
@@ -20380,6 +21133,12 @@ async def main():
         savep_command, events.NewMessage(pattern=r"^/savep(\s|$)", incoming=True)
     )
     client.add_event_handler(
+        itchio_command, events.NewMessage(pattern=r"^/itchio(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
+        itchio_watch_off_command, events.NewMessage(pattern=r"^/itchwatch(\s|$)", incoming=True)
+    )
+    client.add_event_handler(
         debug_hentaihaven, events.NewMessage(pattern=r"^/debughh(\s|$)", incoming=True)
     )
     client.add_event_handler(
@@ -20430,6 +21189,9 @@ async def main():
     client.add_event_handler(sarrast_pdf_translated_callback, events.CallbackQuery(pattern=r"sr_pdftr_"))
     client.add_event_handler(sarrast_pdf_callback, events.CallbackQuery(pattern=r"sr_pdf_"))
     client.add_event_handler(sarrast_zip_callback, events.CallbackQuery(pattern=r"sr_zip_"))
+    # itch.io callbacks
+    client.add_event_handler(itchio_dl_callback, events.CallbackQuery(pattern=r"itdl_"))
+    client.add_event_handler(itchio_watch_callback, events.CallbackQuery(pattern=r"itwatch_"))
     client.add_event_handler(sarrast_imgs_callback, events.CallbackQuery(pattern=r"sr_imgs_"))
     # comic sites callbacks
     client.add_event_handler(comic_pdf_callback, events.CallbackQuery(pattern=r"cmpdf_"))
@@ -20449,6 +21211,11 @@ async def main():
     # Face Swap callback
     client.add_event_handler(faceswap_init_callback, events.CallbackQuery(pattern=r"fsinit_"))
     client.add_event_handler(faceswap_nsfw_init_callback, events.CallbackQuery(pattern=r"fsnsfw_"))
+    # Remove Background (PhotoRoom reverse-engineered) callbacks
+    client.add_event_handler(bgrm_init_callback, events.CallbackQuery(pattern=r"bgrm_"))
+    client.add_event_handler(bgrm_back_callback, events.CallbackQuery(pattern=r"bgrback_"))
+    client.add_event_handler(bgrm_sticker_callback, events.CallbackQuery(pattern=r"bgrstk_"))
+    client.add_event_handler(bgrm_png_callback, events.CallbackQuery(pattern=r"bgrpng_"))
 
         # Iran server (doostihaa) callbacks
     client.add_event_handler(iran_cb_title, events.CallbackQuery(pattern=r"irn_sel_"))
@@ -20484,6 +21251,9 @@ async def main():
         f"[BOOT] GitHub enabled: {GITHUB_ENABLED} | repo: {GITHUB_REPO if github_configured() else 'not configured'}"
     )
     print(f"✅ Bot is online → @{me.username}")
+    # شروع حلقه‌ی مراقبت قیمت itch.io
+    asyncio.create_task(_itchio_watcher_loop())
+
     await client.run_until_disconnected()
 
 

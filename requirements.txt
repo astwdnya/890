@@ -16,3 +16,6 @@ curl_cffi>=0.7.0
 # ─── وابستگی‌های سarrast PDF با ترجمه فارسی ───
 fonttools>=4.50.0
 # note: arabic-reshaper و python-bidi لازم نیستن - PIL با direction='rtl' خودش فارسی رو درست رندر می‌کنه
+# ─── وابستگی‌های Remove Background (PhotoRoom handler با مدل U2Net محلی) ───
+rembg[cpu]>=2.0.50
+onnxruntime>=1.16.0
