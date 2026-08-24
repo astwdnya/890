@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram Ultimate Bot - v5
 # Fixes: 403 auto-dirpy + FFmpeg scale/rotation fix + size_input chat_id fix + pause/resume split
-
+#help
 import asyncio
 import glob
 import math
