@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Telegram Ultimate Bot - v5
 # Fixes: 403 auto-dirpy + FFmpeg scale/rotation fix + size_input chat_id fix + pause/resume split
-#help
+
 import asyncio
 import glob
 import math
@@ -583,6 +583,8 @@ from otherwebsiteshandler.image_ocr_handler import extract_text_from_image
 from otherwebsiteshandler.face_swap_handler import face_swap
 from otherwebsiteshandler.ai.image_generator import generate_image, ART_STYLES, SHAPES as AI_SHAPES, MAX_IMAGES as AI_MAX_IMAGES, QUALITY_LEVELS as AI_QUALITY
 from otherwebsiteshandler.photoroom_handler import remove_background, remove_background_to_sticker
+# Comic translation (PDF → Persian) — OCR.space + Google + rewrite
+from otherwebsiteshandler.comic_translate_handler import translate_comic_pdf
 ocr_sessions: dict = {}
 faceswap_sessions: dict = {}
 from y2mate import Y2MateSession
@@ -633,6 +635,7 @@ admin_pending_add: Dict[int, bool] = {}
 active_downloads: Dict[str, Dict] = {}
 active_uploads: Dict[str, Dict] = {}
 pdfimg_sessions: Dict[str, Dict] = {}  # نگه‌داری مسیر عکس‌ها برای send all
+comictr_sessions: Dict[str, Dict] = {}  # ترجمه کامیک PDF (مسیر فایل + chat_id)
 snapwc_sessions: Dict[str, SnapWCSession] = {}  # SnapWC session references
 y2mate_sessions: Dict[str, dict] = {}  # Y2Mate session cache
 
@@ -5405,6 +5408,30 @@ async def generic_url_handler(event):
                 )
             except Exception as e:
                 logger.error(f"[OCR] Document receive error: {e}", exc_info=True)
+            return
+
+        # ─── PDF دریافت شد → دکمه‌ی ترجمه کامیک ───
+        if mime == "application/pdf" or (event.message.file and (event.message.file.name or "").lower().endswith(".pdf")):
+            try:
+                pdf_name = (event.message.file.name if event.message.file else None) or f"comic_{event.chat_id}_{event.id}.pdf"
+                # اسم امن برای ذخیره (بدون کاراکتر مشکل‌دار)
+                safe_name = re.sub(r'[^\w.()-]', '_', pdf_name)[:120] or "comic.pdf"
+                pdf_path = os.path.join(OUTPUT_FOLDER, f"comictr_{event.chat_id}_{event.id}_{safe_name}")
+                await event.message.download_media(pdf_path)
+                session_id = f"comictr_{event.chat_id}_{event.id}_{int(time.time())}"
+                comictr_sessions[session_id] = {
+                    "pdf_path": pdf_path,
+                    "chat_id": event.chat_id,
+                    "orig_name": safe_name,
+                }
+                await event.reply(
+                    "📚 فایل PDF دریافت شد!",
+                    buttons=[
+                        [Button.inline("🌍 ترجمه کامیک به فارسی", f"comictrgo_{session_id}")],
+                    ],
+                )
+            except Exception as e:
+                logger.error(f"[ComicTr] PDF receive error: {e}", exc_info=True)
             return
 
     if (
@@ -15367,6 +15394,94 @@ async def bgrm_png_callback(event):
     bgrm_sessions.pop(session_id, None)
 
 
+async def comictr_go_callback(event):
+    """ترجمه‌ی کامل PDF کامیک به فارسی و ارسال فایل نهایی."""
+    data = event.data.decode()
+    session_id = data.replace("comictrgo_", "")
+
+    comictr_state = comictr_sessions.get(session_id)
+    if not comictr_state:
+        await event.answer("⏰ نشست منقضی شده. PDF رو دوباره بفرست.", alert=True)
+        return
+
+    pdf_path = comictr_state["pdf_path"]
+    if not os.path.exists(pdf_path):
+        await event.answer("❌ فایل PDF پیدا نشد. دوباره بفرست.", alert=True)
+        return
+
+    await event.answer()
+    status_msg = await event.edit(
+        "🌍 در حال ترجمه‌ی کامیک به فارسی...\n"
+        "🔍 OCR → 🌐 ترجمه → ✍️ بازنویسی\n"
+        "(بسته به تعداد صفحات، چند دقیقه طول می‌کشه)"
+    )
+
+    # جلوگیری از ویرایش‌های بیش از حد Telegram (flood)
+    last_edit = {"t": 0.0}
+
+    async def _progress(msg: str):
+        now = time.time()
+        if now - last_edit["t"] < 3.0:
+            return
+        last_edit["t"] = now
+        try:
+            await status_msg.edit(f"🌍 {msg}")
+        except Exception:
+            pass
+
+    try:
+        success, result = await translate_comic_pdf(
+            pdf_path,
+            output_path=pdf_path.replace(".pdf", "_fa.pdf"),
+            progress_cb=_progress,
+        )
+        if success and os.path.exists(result):
+            size_mb = os.path.getsize(result) / 1024 / 1024
+            await status_msg.edit(
+                f"✅ ترجمه کامل شد! ({size_mb:.1f} MB)\n📤 در حال آپلود PDF فارسی...",
+                buttons=None,
+            )
+            # اسم خروجی بر اساس اسم فایل ورودی
+            try:
+                orig_name = comictr_state.get("orig_name") or "comic.pdf"
+                pretty_out = os.path.join(
+                    OUTPUT_FOLDER,
+                    re.sub(r'[^\w.()-]', '_', os.path.splitext(orig_name)[0])[:100] + "_fa.pdf",
+                )
+                os.replace(result, pretty_out)
+                result = pretty_out
+            except Exception:
+                pass
+            await send_file_with_progress(
+                client=event.client,
+                chat_id=event.chat_id,
+                filepath=result,
+                caption="🌍 کامیک ترجمه‌شده به فارسی",
+                status_msg=status_msg,
+                buttons=None,
+                supports_streaming=False,
+                force_document=True,
+            )
+            await status_msg.edit("✅ PDF فارسی ارسال شد!")
+            # Cleanup فایل‌های موقت
+            try:
+                os.unlink(result)
+                os.unlink(pdf_path)
+            except Exception:
+                pass
+        else:
+            await status_msg.edit(
+                f"❌ خطا در ترجمه: {result}\n\n"
+                "اگه محدودیت OCR رخ داده، چند دقیقه بعد دوباره امتحان کن.",
+                buttons=None,
+            )
+    except Exception as e:
+        logger.error(f"[ComicTr] error: {e}", exc_info=True)
+        await status_msg.edit(f"❌ خطا: {e}", buttons=None)
+
+    comictr_sessions.pop(session_id, None)
+
+
 ai_sessions: dict = {}
 
 
@@ -21313,6 +21428,8 @@ async def main():
     client.add_event_handler(bgrm_back_callback, events.CallbackQuery(pattern=r"bgrback_"))
     client.add_event_handler(bgrm_sticker_callback, events.CallbackQuery(pattern=r"bgrstk_"))
     client.add_event_handler(bgrm_png_callback, events.CallbackQuery(pattern=r"bgrpng_"))
+    # Comic translate (PDF → Persian) callback
+    client.add_event_handler(comictr_go_callback, events.CallbackQuery(pattern=r"comictrgo_"))
 
         # Iran server (doostihaa) callbacks
     client.add_event_handler(iran_cb_title, events.CallbackQuery(pattern=r"irn_sel_"))
