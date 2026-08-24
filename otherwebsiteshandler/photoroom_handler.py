@@ -1,269 +1,321 @@
 """
 photoroom_handler.py
 ────────────────────
-هندلر برای حذف پس‌زمینه عکس با کیفیت بالا (PNG با شفافیت).
+هندلر حذف پس‌زمینه عکس — برعکس نام فایل، این حالا از API پابلیک
+سایت slazzer.com استفاده می‌کنه (نه از API خود PhotoRoom، که اون یکی
+پشت Cloudflare Turnstile قفل شده و بدون حل کپچای پولی کار نمی‌کنه).
 
-بررسی مهندسی معکوس سایت photoroom.com/tools/background-remover
-────────────────────────────────────────────────────────────
-سایت PhotoRoom از endpoint زیر برای حذف پس‌زمینه استفاده می‌کنه:
+جریان کاری (کاملاً HTTP، بدون Playwright، بدون مرورگر):
+    1. GET https://www.slazzer.com/         → کوکی session_slazzer + CSRF token
+    2. POST /generate_trust_token            → JWT با اعتبار ۵ دقیقه
+    3. POST /upload_image (multipart)        → JSON شامل آدرس نتیجه PNG
+    4. GET  /downloads/.../image_prev_ui.png  → PNG با شفافیت (۵۰۰×۵۰۰ RGBA)
 
-    POST https://sdk.photoroom.com/v1/segment
+خروجی:
+    remove_background(image_path, output_path=None) → (bool, path_or_err)
+        فایل PNG با شفافیت به همان ابعاد از slazzer (۵۰۰×۵۰۰)
+    remove_background_to_sticker(image_path, output_path=None) → (bool, path_or_err)
+        همون PNG بعد از ریسایز به ۵۱۲×۵۱۲ (مناسب استیکر تلگرام)
 
-    Headers:
-        x-api-key: 10148f33e3f8d09a9b9aa6b775372a4ebf18b938   (هاردکد شده توی JS کلاینت)
-        x-captcha: CLOUDFLARE_<Turnstile_token>               (توکن Cloudflare Turnstile)
-
-    Body (multipart/form-data):
-        image_file: <binary image data, image/png|jpeg|webp>
-
-    Response:
-        Body: PNG با شفافیت (image/png)
-        Headers:
-            x-foreground-top, x-foreground-left,
-            x-foreground-width, x-foreground-height  (مختصات کراپ foreground)
-
-    Cloudflare Turnstile sitekey استفاده‌شده:
-        0x4AAAAAAAApeO5gC2AwBbrW
-        (ویجت با appearance: "interaction-only" رندر می‌شه)
-
-به دلیل محدودیت Turnstile:
-    -   توکن Turnstile برای هر request لازمه و فقط با اجرای JS توی مرورگر تولید می‌شه.
-    -   سرور دیتاسنتر ما همیشه توسط Cloudflare در مرحله PoW (PAT) رد می‌شه
-        (همان /cdn-cgi/challenge-platform/h/b/pat/ که 401 برمی‌گردونه).
-    -   بنابراین API مستقیم PhotoRoom از این سرور قابل استفاده نیست.
-
-راه‌حل جایگزین (pure-Python، بدون Playwright، بدون کپچا):
-    از rembg با مدل U2Net استفاده می‌کنیم. این روش:
-        ✅ کاملاً pure-Python (هیچ Playwright لازم نیست)
-        ✅ بدون کپچا، بدون rate limit، بدون API key
-        ✅ مدل دفعه اول دانلود می‌شه (u2net.onnx ~176MB) و کش می‌شه
-        ✅ خروجی PNG با شفافیت
-        ✅ کیفیت خوب برای اکثر عکس‌ها
-
-روند کار:
-    1. کاربر عکس می‌فرسته
-    2. ربات دکمه شیشه‌ای "🗑 Remove Background" رو نشون می‌ده
-    3. وقتی کلیک کنه، ربات می‌پرسه: «استیکر بفرستم یا فایل PNG؟»
-    4. کاربر یکی رو انتخاب می‌کنه
-    5. ربات عکس رو با rembg پردازش می‌کنه و به همون فرمت می‌فرسته
+نکته:
+    - اندازه‌ی رایگان slazzer ۵۰۰×۵۰۰ پیکسله. برای استیکر تلگرام به ۵۱۲×۵۱۲
+      ریسایز می‌کنیم (Pillow از قبل توی requirements هست).
+    - کوکی و CSRF رو یه‌بار می‌گیریم و توی ماژول کش می‌کنیم؛ اگه توکن
+      منقضی بشه یا کوکی منقضی بشه، خودکار renewal می‌شه.
+    - محدودیت slazzer: ۱۰ عکس در دقیقه. اگه بیشتر بفرستیم، ۴۲۹ می‌گیریم.
 """
 
+from __future__ import annotations
+
 import asyncio
+import io
 import logging
 import os
-import threading
+import re
+import time
+import uuid
 from typing import Optional, Tuple
 
 logger = logging.getLogger("Photoroom")
 
-# ─── مدل U2Net کش می‌شه تا هر بار لود نشه ───
-_rembg_session = None
-_rembg_session_lock = threading.Lock()
-_rembg_initializing = False
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+HOME = "https://www.slazzer.com/"
+ORIGIN = "https://www.slazzer.com"
+UA_HEADERS = {
+    "User-Agent": UA,
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "*/*",
+    "Origin": ORIGIN,
+    "Referer": HOME,
+}
+
+# ─── module-level cached session ──────────────────────────────────────────
+# We do the network IO in run_in_executor so this stays sync I/O under the
+# asyncio event loop.
+_cached_csrf: Optional[str] = None
+_cached_session_cookie: Optional[str] = None
+_cached_trust_token: Optional[str] = None
+_cached_token_exp: float = 0.0  # unix seconds when trust_token expires
 
 
-def _get_rembg_session():
-    """Get or initialize the cached U2Net session."""
-    global _rembg_session, _rembg_initializing
-    if _rembg_session is not None:
-        return _rembg_session
+def _reset_cache() -> None:
+    """Drop the entire cached session/csrf/token state."""
+    global _cached_csrf, _cached_session_cookie, _cached_trust_token, _cached_token_exp
+    _cached_csrf = None
+    _cached_session_cookie = None
+    _cached_trust_token = None
+    _cached_token_exp = 0.0
 
-    with _rembg_session_lock:
-        if _rembg_session is not None:
-            return _rembg_session
-        if _rembg_initializing:
-            # Wait for another thread to finish
-            while _rembg_initializing:
-                pass
-            return _rembg_session
 
-        _rembg_initializing = True
+def _reset_token_cache() -> None:
+    """Drop only the trust_token (keep csrf + cookie)."""
+    global _cached_trust_token, _cached_token_exp
+    _cached_trust_token = None
+    _cached_token_exp = 0.0
+
+
+def _new_session():
+    """Create a fresh requests.Session and fetch the homepage to seed cookies
+    and the CSRF token. Returns (session, csrf_token).
+    """
+    import requests
+
+    s = requests.Session()
+    s.headers.update(UA_HEADERS)
+    r = s.get(HOME, timeout=30)
+    r.raise_for_status()
+    m = re.search(
+        r'<meta\s+name="csrf-token"\s+content="([^"]+)"', r.text
+    )
+    if not m:
+        raise RuntimeError("slazzer: csrf-token meta not found on homepage")
+    return s, m.group(1)
+
+
+def _get_or_refresh_token() -> Tuple["requests.Session", str, str]:
+    """Return (session, csrf_token, trust_token).
+
+    Reuses the cached session/csrf as long as the trust_token is still valid
+    (we refresh ~30s before it expires). On any error we throw the cache away
+    and start fresh.
+    """
+    global _cached_csrf, _cached_trust_token, _cached_token_exp, _cached_session_cookie
+    import requests
+
+    now = time.time()
+    # Still fresh? reuse.
+    if (
+        _cached_csrf
+        and _cached_trust_token
+        and now < _cached_token_exp - 30
+    ):
+        # Build a fresh session (don't keep a global Session object across
+        # invocations — it can leak file handles and accumulate cookies)
+        s = requests.Session()
+        s.headers.update(UA_HEADERS)
+        if _cached_session_cookie:
+            s.headers["Cookie"] = _cached_session_cookie
+        return s, _cached_csrf, _cached_trust_token
+
+    # Need to refresh. If we have a valid csrf cookie already, try a quick
+    # token refresh first (avoids the homepage fetch).
+    if _cached_csrf and _cached_session_cookie:
         try:
-            logger.info("[Photoroom] Initializing U2Net model (first-time download ~176MB)...")
-            from rembg import new_session
-            _rembg_session = new_session(model_name="u2net")
-            logger.info("[Photoroom] U2Net model loaded successfully.")
-            return _rembg_session
-        except Exception as e:
-            logger.error(f"[Photoroom] Failed to load U2Net model: {e}", exc_info=True)
-            return None
-        finally:
-            _rembg_initializing = False
+            s = requests.Session()
+            s.headers.update(UA_HEADERS)
+            s.headers["Cookie"] = _cached_session_cookie
+            r = s.post(
+                f"{ORIGIN}/generate_trust_token",
+                headers={"X-CSRFToken": _cached_csrf},
+                timeout=30,
+            )
+            if r.status_code == 200:
+                j = r.json()
+                tok = j.get("trust_token")
+                if tok:
+                    _cached_trust_token = tok
+                    _cached_token_exp = now + 280  # JWT is 300s, refresh at 280
+                    return s, _cached_csrf, tok
+            # 429 means rate-limited; fall through to full refresh
+        except Exception:
+            # fall through to full refresh
+            pass
+
+    # Full refresh — get a fresh csrf + cookie from homepage
+    s, csrf = _new_session()
+    # Capture cookies as a Cookie header so future calls reuse them
+    cookie_str = "; ".join(f"{k}={v}" for k, v in s.cookies.items())
+    _cached_session_cookie = cookie_str
+    _cached_csrf = csrf
+
+    r = s.post(
+        f"{ORIGIN}/generate_trust_token",
+        headers={"X-CSRFToken": csrf},
+        timeout=30,
+    )
+    r.raise_for_status()
+    j = r.json()
+    tok = j.get("trust_token")
+    if not tok:
+        raise RuntimeError("slazzer: trust_token not in response")
+    _cached_trust_token = tok
+    _cached_token_exp = now + 280
+    return s, csrf, tok
+
+
+def _do_remove_background_sync(image_path: str) -> Tuple[bool, bytes, str]:
+    """Run the full slazzer flow synchronously. Returns (success, png_bytes, msg)."""
+    import requests
+
+    if not os.path.exists(image_path):
+        return False, b"", f"input file not found: {image_path}"
+
+    try:
+        s, csrf, token = _get_or_refresh_token()
+    except Exception as e:
+        # On any token-flow failure, force a full refresh next time
+        _reset_cache()
+        return False, b"", f"slazzer token error: {e}"
+
+    ag_id = "tg_" + uuid.uuid4().hex[:14]
+    file_size = os.path.getsize(image_path)
+    logger.info(
+        "[Photoroom] slazzer upload_image  img=%s  size=%d  ag_id=%s",
+        image_path, file_size, ag_id,
+    )
+
+    # ── Step 3: upload the image ──
+    with open(image_path, "rb") as fh:
+        files = {"source_image_file": ("image.jpg", fh, "image/jpeg")}
+        data = {"autogenerate_id": ag_id}
+        headers = {
+            "X-CSRFToken": csrf,
+            "X-Trust-Token": token,
+        }
+        try:
+            r = s.post(
+                f"{ORIGIN}/upload_image",
+                files=files,
+                data=data,
+                headers=headers,
+                timeout=180,
+            )
+        except requests.RequestException as e:
+            return False, b"", f"slazzer upload_image network error: {e}"
+
+    if r.status_code == 429:
+        return False, b"", "slazzer rate-limited (10 images/minute). please retry in 60 seconds."
+    if r.status_code != 200:
+        # Discard cached token; likely expired
+        _reset_token_cache()
+        return False, b"", f"slazzer upload_image HTTP {r.status_code}: {r.text[:200]}"
+
+    try:
+        j = r.json()
+    except Exception:
+        return False, b"", f"slazzer: non-JSON response: {r.text[:200]}"
+
+    if not j.get("status"):
+        return False, b"", f"slazzer: status=false — {j.get('message', j)}"
+
+    preview_url = j.get("preview_size_output_image") or j.get("original_image")
+    if not preview_url:
+        return False, b"", f"slazzer: no preview URL in response: {j}"
+    if not preview_url.startswith("http"):
+        preview_url = ORIGIN + preview_url
+
+    # ── Step 4: download the result PNG ──
+    try:
+        r2 = s.get(preview_url, timeout=120)
+    except requests.RequestException as e:
+        return False, b"", f"slazzer download PNG network error: {e}"
+    if r2.status_code != 200:
+        return False, b"", f"slazzer download PNG HTTP {r2.status_code}"
+
+    if r2.content[:8] != b"\x89PNG\r\n\x1a\n":
+        return False, b"", f"slazzer: response is not a PNG (magic={r2.content[:8]!r})"
+
+    logger.info(
+        "[Photoroom] slazzer OK  png_bytes=%d  preview=%s",
+        len(r2.content), preview_url,
+    )
+    return True, r2.content, "ok"
+
+
+def _resize_to_512(png_bytes: bytes) -> bytes:
+    """Resize the PNG to 512×512 (Telegram sticker spec) preserving aspect
+    ratio and transparency. Uses Pillow, which is already in requirements.
+    """
+    from PIL import Image
+
+    src = Image.open(io.BytesIO(png_bytes))
+    if src.mode != "RGBA":
+        src = src.convert("RGBA")
+    # Telegram stickers: longest side must be 512, the other ≤ 512.
+    w, h = src.size
+    if max(w, h) != 512:
+        if w >= h:
+            new_w, new_h = 512, max(1, round(512 * h / w))
+        else:
+            new_h, new_w = 512, max(1, round(512 * w / h))
+        src = src.resize((new_w, new_h), Image.LANCZOS)
+    buf = io.BytesIO()
+    src.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 async def remove_background(image_path: str, output_path: Optional[str] = None) -> Tuple[bool, str]:
-    """
-    حذف پس‌زمینه عکس و بازگرداندن فایل PNG با شفافیت.
-
-    Args:
-        image_path: مسیر عکس ورودی (jpg, png, webp, ...)
-        output_path: مسیر خروجی (اختیاری؛ اگه None باشه،
-                     از نام فایل ورودی + "_nobg.png" استفاده می‌شه)
-
-    Returns:
-        Tuple (success, output_path_or_error_message)
-    """
-    if not os.path.exists(image_path):
-        return False, f"Input file not found: {image_path}"
-
+    """حذف پس‌زمینه و خروجی PNG با شفافیت (ابعاد از slazzer، ۵۰۰×۵۰۰)."""
     if output_path is None:
         base, _ = os.path.splitext(image_path)
         output_path = base + "_nobg.png"
 
+    loop = asyncio.get_event_loop()
     try:
-        # Get the cached session (this will block on first call ~5-10 sec after model download)
-        session = await asyncio.get_event_loop().run_in_executor(None, _get_rembg_session)
-        if session is None:
-            return False, "U2Net model failed to load. Check the logs."
-
-        from rembg import remove as _remove
-
-        # Read input image bytes
-        with open(image_path, "rb") as f:
-            input_bytes = f.read()
-
-        logger.info("[Photoroom] Removing background (input: %d bytes)...", len(input_bytes))
-
-        # Run the (CPU-bound) removal in a thread pool so we don't block the event loop
-        def _do_remove():
-            return _remove(input_bytes, session=session)
-
-        output_bytes = await asyncio.get_event_loop().run_in_executor(None, _do_remove)
-
-        if not output_bytes or len(output_bytes) < 100:
-            return False, "Background removal produced an empty result."
-
-        # Verify it's a valid PNG (starts with PNG magic)
-        if output_bytes[:8] != b"\x89PNG\r\n\x1a\n":
-            logger.warning("[Photoroom] Output doesn't start with PNG magic; got: %r", output_bytes[:16])
-            # Still save it but warn
-
-        with open(output_path, "wb") as f:
-            f.write(output_bytes)
-
-        logger.info("[Photoroom] Background removed successfully: %s (%d bytes)", output_path, len(output_bytes))
-        return True, output_path
-
-    except ImportError as e:
-        logger.error("[Photoroom] rembg not installed: %s", e)
-        return False, "rembg library not available. Install with: pip install 'rembg[cpu]'"
+        ok, png_bytes, msg = await loop.run_in_executor(
+            None, _do_remove_background_sync, image_path
+        )
     except Exception as e:
-        logger.error("[Photoroom] Error removing background: %s", e, exc_info=True)
-        return False, f"Error: {str(e)[:200]}"
+        logger.exception("[Photoroom] remove_background failure")
+        return False, f"unexpected error: {e}"
+
+    if not ok:
+        return False, msg
+
+    with open(output_path, "wb") as f:
+        f.write(png_bytes)
+    return True, output_path
 
 
 async def remove_background_to_sticker(image_path: str, output_path: Optional[str] = None) -> Tuple[bool, str]:
-    """
-    حذف پس‌زمینه و آماده‌سازی به‌عنوان استیکر Telegram.
+    """حذف پس‌زمینه و ریسایز به ۵۱۲×۵۱۲ برای استیکر تلگرام."""
+    if output_path is None:
+        base, _ = os.path.splitext(image_path)
+        output_path = base + "_sticker.png"
 
-    Telegram stickers باید 512x512 (با حفظ aspect ratio) و فرمت PNG یا WebP باشن.
-    ربات از ماکسیمم 512x512 (یک ضلع 512، ضلع دیگه متناسب) استفاده می‌کنه.
-
-    Returns:
-        Tuple (success, sticker_path)
-    """
-    success, result = await remove_background(image_path, output_path)
-    if not success:
-        return False, result
-
+    loop = asyncio.get_event_loop()
     try:
-        from PIL import Image
-        img = Image.open(result)
-        if img.mode != "RGBA":
-            img = img.convert("RGBA")
-
-        # Telegram sticker rule: max 512 on one side, the other side ≤ 512
-        # We make the LONGER side = 512, the shorter side proportionally smaller
-        w, h = img.size
-        if w >= h:
-            new_w = 512
-            new_h = max(1, int(round(h * 512 / w)))
-        else:
-            new_h = 512
-            new_w = max(1, int(round(w * 512 / h)))
-
-        img_resized = img.resize((new_w, new_h), Image.LANCZOS)
-
-        sticker_path = os.path.splitext(result)[0] + "_sticker.png"
-        img_resized.save(sticker_path, format="PNG", optimize=True)
-        logger.info("[Photoroom] Sticker saved: %s (%dx%d)", sticker_path, new_w, new_h)
-        return True, sticker_path
-    except Exception as e:
-        logger.error("[Photoroom] Sticker conversion error: %s", e, exc_info=True)
-        return False, f"Sticker conversion error: {str(e)[:200]}"
-
-
-# ─── تابع کمکی برای کوکی/توکن PhotoRoom (در صورت نیاز در آینده) ───
-PHOTOROOM_API_URL = "https://sdk.photoroom.com/v1/segment"
-PHOTOROOM_API_KEY = "10148f33e3f8d09a9b9aa6b775372a4ebf18b938"
-PHOTOROOM_TURNSTILE_SITEKEY = "0x4AAAAAAAApeO5gC2AwBbrW"
-
-
-async def remove_background_photoroom_api(image_path: str, captcha_token: str) -> Tuple[bool, str]:
-    """
-    (در صورت داشتن توکن Turnstile معتبر) فراخوانی مستقیم API واقعی PhotoRoom.
-
-    این تابع در حال حاضر به دلیل عدم دسترسی به توکن Turnstile از سرور ما
-    استفاده نمی‌شه ولی برای پشتیبانی آینده (اگه سرویس حل کپچا اضافه بشه)
-    باقی موند. برای استفاده:
-
-        success, path = await remove_background_photoroom_api(img_path, token)
-
-    Args:
-        image_path: مسیر عکس ورودی
-        captcha_token: توکن Cloudflare Turnstile (بدون پیشوند CLOUDFLARE_)
-
-    Returns:
-        Tuple (success, output_path_or_error)
-    """
-    try:
-        from curl_cffi import CurlMime
-        from curl_cffi.requests import AsyncSession
-    except ImportError:
-        return False, "curl_cffi not available"
-
-    UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-
-    try:
-        with open(image_path, "rb") as f:
-            img = f.read()
-
-        mp = CurlMime()
-        mp.addpart(
-            name="image_file",
-            content_type="image/png",
-            filename="image.png",
-            data=img,
+        ok, png_bytes, msg = await loop.run_in_executor(
+            None, _do_remove_background_sync, image_path
         )
-
-        async with AsyncSession() as s:
-            r = await s.post(
-                PHOTOROOM_API_URL,
-                headers={
-                    "User-Agent": UA,
-                    "Origin": "https://www.photoroom.com",
-                    "Referer": "https://www.photoroom.com/",
-                    "x-api-key": PHOTOROOM_API_KEY,
-                    "x-captcha": f"CLOUDFLARE_{captcha_token}",
-                },
-                multipart=mp,
-                impersonate="chrome",
-                timeout=60,
-                verify=False,
-            )
-
-            if r.status_code == 200 and r.content:
-                output_path = os.path.splitext(image_path)[0] + "_photoroom_nobg.png"
-                with open(output_path, "wb") as f:
-                    f.write(r.content)
-                logger.info("[Photoroom-API] Real PhotoRoom API success: %s (%d bytes)",
-                            output_path, len(r.content))
-                return True, output_path
-
-            err = r.content[:300].decode("utf-8", "replace")
-            logger.error("[Photoroom-API] API error: HTTP %s | %s", r.status_code, err)
-            return False, f"PhotoRoom API HTTP {r.status_code}: {err[:200]}"
-
     except Exception as e:
-        logger.error("[Photoroom-API] Error: %s", e, exc_info=True)
-        return False, f"Error: {str(e)[:200]}"
+        logger.exception("[Photoroom] remove_background_to_sticker failure")
+        return False, f"unexpected error: {e}"
+
+    if not ok:
+        return False, msg
+
+    try:
+        sticker_bytes = await loop.run_in_executor(None, _resize_to_512, png_bytes)
+    except Exception as e:
+        # Fallback: keep the original PNG
+        logger.warning("[Photoroom] resize to 512 failed (%s); using raw slazzer PNG", e)
+        sticker_bytes = png_bytes
+
+    with open(output_path, "wb") as f:
+        f.write(sticker_bytes)
+    return True, output_path
