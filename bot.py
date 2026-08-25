@@ -57,6 +57,20 @@ from yt_direct_handler import (
     download_video as ytdirect_download_video,
     download_audio as ytdirect_download_audio,
 )
+# Noodlemagazine direct download (CDN RE'd — no browser)
+from otherwebsiteshandler.noodle_handler import (
+    is_noodle_url,
+    extract_video_id as noodle_video_id,
+    get_video_info as noodle_get_info,
+    download_video as noodle_download_video,
+)
+# Faphouse direct download (signed trailer CDN — no browser, premium-only site)
+from otherwebsiteshandler.faphouse_handler import (
+    is_faphouse_url,
+    extract_video_id as faphouse_video_id,
+    get_video_info as faphouse_get_info,
+    download_video as faphouse_download_video,
+)
 from xnxx_handler import (
     is_xnxx_url,
     extract_xnxx_qualities,
@@ -118,7 +132,6 @@ from ytdlp_handler import (
     is_pornhat_url,
     get_site_name,
 )
-from snapwc_handler import SnapWCSession
 from otherwebsiteshandler.xvideos_handler import (
     is_xvideos_url,
     extract_xvideos_qualities,
@@ -644,11 +657,12 @@ active_downloads: Dict[str, Dict] = {}
 active_uploads: Dict[str, Dict] = {}
 pdfimg_sessions: Dict[str, Dict] = {}  # نگه‌داری مسیر عکس‌ها برای send all
 comictr_sessions: Dict[str, Dict] = {}  # ترجمه کامیک PDF (مسیر فایل + chat_id)
-snapwc_sessions: Dict[str, SnapWCSession] = {}  # SnapWC session references
 y2mate_sessions: Dict[str, dict] = {}  # Y2Mate session cache
 ytdirect_sessions: Dict[str, dict] = {}  # YouTube direct (InnerTube+cobalt) sessions
-# حالت دانلود یوتیوب: direct (پیش‌فرض — InnerTube/cobalt بدون مرورگر) یا snapwc
-YT_DOWNLOAD_MODES: Dict[int, str] = {}  # user_id → 'direct' | 'snapwc'
+noodle_sessions: Dict[str, dict] = {}  # Noodlemagazine download sessions
+faphouse_sessions: Dict[str, dict] = {}  # Faphouse download sessions
+# حالت دانلود یوتیوب: y2mate (پیش‌فرض پایدار — Playwright) یا direct (InnerTube/cobalt بدون مرورگر)
+YT_DOWNLOAD_MODES: Dict[int, str] = {}  # user_id → 'y2mate' | 'direct'
 
 # آپلود گیتهاب — با /startgithub فعال، با /stopgithub غیرفعال میشه
 GITHUB_ENABLED: bool = False
@@ -4991,8 +5005,7 @@ async def start_cmd(event):
     await event.reply(
         "🚀 **Ultimate Bot v5**\n\n"
         "• `/dirpy <url>` → Download video\n"
-        "• `/yt` → Toggle YouTube handler (Direct ⚡ / SnapWC)\n"
-        "• `/snapwc <url>` → Download via SnapWC\n"
+        "• `/yt` → Toggle YouTube handler (Y2Mate 🎬 / Direct ⚡)\n"
         "• `/savep <url>` → Download via SaveTheVideo\n"
         "• `/pdf <url>` → Webpage to PDF\n"
         "• `/html <url>` → Save as MHTML\n"
@@ -5849,18 +5862,36 @@ async def generic_url_handler(event):
         or "youtu.be" in target_url
     ):
         logger.info(f"[URL] YouTube detected | url={target_url[:120]}")
-        # مسیر جدید: direct (InnerTube+cobalt) یا snapwc — با /yt عوض می‌شه
-        yt_mode = YT_DOWNLOAD_MODES.get(event.sender_id, "direct")
-        if yt_mode == "snapwc":
-            status_msg = await event.reply("⏬ Processing via SnapWC...")
+        # مسیر: y2mate (پیش‌فرض پایدار) یا direct — با /yt عوض می‌شه
+        yt_mode = YT_DOWNLOAD_MODES.get(event.sender_id, "y2mate")
+        if yt_mode == "direct":
+            status_msg = await event.reply("⏬ Processing...")
             try:
-                await _run_snapwc_flow(event, target_url, status_msg)
+                await process_ytdirect_request(event, target_url, status_msg)
             finally:
                 processing_messages.discard(msg_id)
             return
-        status_msg = await event.reply("⏬ Processing...")
+        status_msg = await event.reply("⏬ Processing via Y2Mate...")
         try:
-            await process_ytdirect_request(event, target_url, status_msg)
+            await process_y2mate_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_noodle_url(target_url):
+        logger.info(f"[URL] Noodlemagazine detected | url={target_url[:120]}")
+        status_msg = await event.reply("🍜 Processing...")
+        try:
+            await process_noodle_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
+    if is_faphouse_url(target_url):
+        logger.info(f"[URL] Faphouse detected | url={target_url[:120]}")
+        status_msg = await event.reply("🍿 Processing...")
+        try:
+            await process_faphouse_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -6517,11 +6548,10 @@ async def generic_url_handler(event):
         return
 
     if is_pornhub_url(target_url):
-        logger.info(
-            f"[URL] PornHub detected, routing via SnapWC | url={target_url[:120]}"
-        )
+        logger.info(f"[URL] PornHub detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
         try:
-            await _run_snapwc_flow(event, target_url, None)
+            await process_pornhub_request(event, target_url, status_msg)
         finally:
             processing_messages.discard(msg_id)
         return
@@ -7220,7 +7250,8 @@ async def ytdirect_video_callback(event):
             timeout=1800,
         )
         if not ok or not os.path.exists(res):
-            await safe_edit(status_msg, f"❌ خطا در دانلود: {res}")
+            await safe_edit(status_msg, f"❌ خطا در دانلود: {str(res)[:150]}")
+            ytdirect_sessions.pop(session_id, None)
             return
 
         size_mb = os.path.getsize(res) / 1024 / 1024
@@ -7297,7 +7328,8 @@ async def ytdirect_audio_callback(event):
             timeout=1200,
         )
         if not ok or not os.path.exists(res):
-            await safe_edit(status_msg, f"❌ خطا در دانلود آدیو: {res}")
+            await safe_edit(status_msg, f"❌ خطا در دانلود آدیو: {str(res)[:150]}")
+            ytdirect_sessions.pop(session_id, None)
             return
 
         size_mb = os.path.getsize(res) / 1024 / 1024
@@ -7347,28 +7379,357 @@ async def ytdirect_cancel_callback(event):
 
 
 async def yt_command(event):
-    """تبادل هندلر دانلود یوتیوب: direct (سریع/خالص) ↔ snapwc (مرورگری)."""
+    """تبادل هندلر دانلود یوتیوب: y2mate (پیش‌فرض پایدار) ↔ direct (خالص/سریع)."""
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
-    current = YT_DOWNLOAD_MODES.get(event.sender_id, "direct")
-    new_mode = "snapwc" if current == "direct" else "direct"
+    current = YT_DOWNLOAD_MODES.get(event.sender_id, "y2mate")
+    new_mode = "direct" if current == "y2mate" else "y2mate"
     YT_DOWNLOAD_MODES[event.sender_id] = new_mode
     if new_mode == "direct":
         desc = (
             "⚡ **حالت: Direct**\n\n"
             "دانلود یوتیوب بدون مرورگر:\n"
-            "• InnerTube API (مستقیم از یوتیوب — سریع‌ترین)\n"
-            "• fallback: سرور واسط cobalt\n"
+            "• InnerTube API (مستقیم — سریع‌ترین)\n"
+            "• fallback: cobalt (سرور واسط)\n"
             "• همه‌ی کیفیت‌ها تا 4K + آدیو با کاور و متادیتا\n\n"
-            "دوباره /yt بزنی برمی‌گرده به SnapWC."
+            "⚠️ اگه یه ویدیو باز نشد، با /yt برگرد به Y2Mate.\n"
+            "دوباره /yt بزنی برمی‌گرده به Y2Mate."
         )
     else:
         desc = (
-            "🎭 **حالت: SnapWC**\n\n"
-            "دانلود یوتیوب از طریق SnapWC (مرورگری).\n\n"
-            "دوباره /yt بزنی برمی‌گرده به Direct."
+            "🎬 **حالت: Y2Mate**\n\n"
+            "دانلود یوتیوب از طریق Y2Mate (مرورگری پایدار) — پیش‌فرض.\n\n"
+            "برای مسیر مستقیم/سریع‌تر: /yt"
         )
     await event.reply(desc, parse_mode="markdown")
+
+
+# ====================== NOODELMAGAZINE HANDLER ======================
+
+
+async def process_noodle_request(event, url: str, status_msg):
+    """noodlemagazine.com → اطلاعات + دکمه‌های کیفیت (مستقیم از CDN)."""
+    logger.info(f"[Noodle] START | chat={event.chat_id} | url={url[:120]}")
+    await safe_edit(status_msg, "🍜 در حال دریافت اطلاعات ویدیو...")
+
+    try:
+        info = await asyncio.wait_for(noodle_get_info(url), timeout=30)
+    except asyncio.TimeoutError:
+        await safe_edit(status_msg, "❌ timeout — دوباره امتحان کن.")
+        return
+    except Exception as e:
+        logger.error(f"[Noodle] info error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: {str(e)[:120]}")
+        return
+
+    if not info or not info.get("qualities"):
+        await safe_edit(status_msg, "❌ اطلاعاتی برای این ویدیو پیدا نشد.")
+        return
+
+    # کپشن اطلاعات
+    lines = [f"🍜 **{info['title'] or 'Noodlemagazine Video'}**"]
+    stats = []
+    if info.get("duration"):
+        m, s = divmod(int(info["duration"]), 60)
+        stats.append(f"⏱ {m}:{s:02d}")
+    if info.get("upload_date"):
+        stats.append(f"📅 {info['upload_date']}")
+    if stats:
+        lines.append(" • ".join(stats))
+    caption = "\n".join(lines)
+
+    session_id = f"noodle_{event.chat_id}_{event.id}_{int(time.time())}"
+    noodle_sessions[session_id] = {
+        "url": url,
+        "info": info,
+        "chat_id": event.chat_id,
+        "caption": caption,
+    }
+
+    # دکمه‌های کیفیت (شیشه‌ای)
+    buttons = []
+    row = []
+    for i, q in enumerate(info["qualities"]):
+        badge = " ⭐" if q.get("default") else ""
+        row.append(Button.inline(f"{q['label']}{badge}", f"noodlev_{session_id}_{i}"))
+        if len(row) >= 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([Button.inline("❌ Cancel", f"noodlc_{session_id}")])
+
+    await safe_edit(
+        status_msg,
+        f"📋 **کیفیت رو انتخاب کن:**\n\n{caption}",
+        buttons=buttons,
+    )
+
+
+async def noodle_video_callback(event):
+    """دانلود ویدیوی noodlemagazine با کیفیت انتخابی."""
+    data = event.data.decode()
+    body = data[len("noodlev_"):]
+    session_id, idx_str = body.rsplit("_", 1)
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        await event.answer("❌ invalid", alert=True)
+        return
+
+    sess = noodle_sessions.get(session_id)
+    if not sess:
+        await event.answer("⏰ نشست منقضی شده. لینک رو دوباره بفرست.", alert=True)
+        return
+    qs = sess["info"].get("qualities", [])
+    if not (0 <= idx < len(qs)):
+        await event.answer("❌ کیفیت نامعتبر", alert=True)
+        return
+
+    quality = qs[idx]
+    await event.answer()
+    status_msg = await event.edit(
+        f"📥 در حال دانلود {quality['label']}...\n(ممکنه چند دقیقه طول بکشه)"
+    )
+
+    async def _prog(msg, done, total):
+        try:
+            await safe_edit(status_msg, f"📥 {msg}")
+        except Exception:
+            pass
+
+    try:
+        ok, res = await asyncio.wait_for(
+            noodle_download_video(sess["url"], quality, OUTPUT_FOLDER, _prog),
+            timeout=1800,
+        )
+        if not ok or not os.path.exists(res):
+            await safe_edit(status_msg, f"❌ خطا در دانلود: {str(res)[:150]}")
+            noodle_sessions.pop(session_id, None)
+            return
+
+        size_mb = os.path.getsize(res) / 1024 / 1024
+        await safe_edit(status_msg, f"✅ دانلود شد ({size_mb:.1f}MB)\n📤 در حال آپلود...")
+
+        safe_title = re.sub(r'[^\w.\-() ]', '_', sess["info"].get("title") or "video")[:80]
+        pretty = os.path.join(OUTPUT_FOLDER, f"{safe_title}_{quality['label']}.mp4")
+        try:
+            os.replace(res, pretty)
+            res = pretty
+        except Exception:
+            pass
+
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=res,
+            caption=sess["caption"],
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+        )
+        await safe_edit(status_msg, "✅ ارسال شد!")
+        try:
+            os.unlink(res)
+        except Exception:
+            pass
+        noodle_sessions.pop(session_id, None)
+    except asyncio.TimeoutError:
+        await safe_edit(status_msg, "❌ دانلود خیلی طول کشید — لغو شد.")
+    except Exception as e:
+        logger.error(f"[Noodle] video dl error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: {str(e)[:150]}")
+
+
+async def noodle_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data[len("noodlc_"):]
+    noodle_sessions.pop(session_id, None)
+    await event.answer("Cancelled", alert=False)
+    try:
+        await event.delete()
+    except Exception:
+        pass
+
+
+# ====================== FAPHOUSE HANDLER ======================
+
+
+async def process_faphouse_request(event, url: str, status_msg):
+    """faphouse.com → اطلاعات ویدیو + دکمه‌های کیفیت trailer (مستقیم از CDN)."""
+    logger.info(f"[Faphouse] START | chat={event.chat_id} | url={url[:120]}")
+    await safe_edit(status_msg, "🍿 در حال دریافت اطلاعات ویدیو...")
+
+    try:
+        info = await asyncio.wait_for(faphouse_get_info(url), timeout=45)
+    except asyncio.TimeoutError:
+        await safe_edit(status_msg, "❌ timeout — دوباره امتحان کن.")
+        return
+    except Exception as e:
+        logger.error(f"[Faphouse] info error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: {str(e)[:120]}")
+        return
+
+    if not info:
+        await safe_edit(status_msg, "❌ اطلاعاتی برای این ویدیو پیدا نشد.")
+        return
+
+    if not info.get("qualities"):
+        # ویدیو premium بدون trailer
+        title = info.get("title", "ویدیو")[:80]
+        studio = info.get("studio", "")
+        studio_line = f"\n🎬 استودیو: {studio}" if studio else ""
+        await safe_edit(
+            status_msg,
+            f"🔒 **{title}**\n"
+            f"این ویدیو premium است و trailer پابلیک نداره.\n"
+            f"فقط اعضای پولی فaphouse می‌تونن ببیننش."
+            f"{studio_line}"
+        )
+        return
+
+    # کپشن اطلاعات
+    lines = [f"🍿 **{info['title'] or 'Faphouse Video'}**"]
+    stats = []
+    if info.get("duration"):
+        m, s = divmod(int(info["duration"]), 60)
+        if m >= 60:
+            h, m = divmod(m, 60)
+            stats.append(f"⏱ {h}:{m:02d}:{s:02d}")
+        else:
+            stats.append(f"⏱ {m}:{s:02d}")
+    if info.get("studio"):
+        stats.append(f"🎬 {info['studio']}")
+    if info.get("price"):
+        stats.append(f"💎 {info['price']}")
+    if info.get("access_type") == "premium":
+        stats.append("🔒 premium")
+    if stats:
+        lines.append(" • ".join(stats))
+    lines.append("⚠️ تریلر (~30-60 ثانیه)")
+    caption = "\n".join(lines)
+
+    session_id = f"faphouse_{event.chat_id}_{event.id}_{int(time.time())}"
+    faphouse_sessions[session_id] = {
+        "url": url,
+        "info": info,
+        "chat_id": event.chat_id,
+        "caption": caption,
+    }
+
+    # دکمه‌های کیفیت (شیشه‌ای)
+    buttons = []
+    row = []
+    for i, q in enumerate(info["qualities"]):
+        badge = " ⭐" if q.get("default") else ""
+        sz = q.get("size", 0)
+        if sz:
+            sz_mb = sz / 1024 / 1024
+            if sz_mb < 1:
+                sz_str = f" ({int(sz/1024)}KB)"
+            else:
+                sz_str = f" ({sz_mb:.1f}MB)"
+        else:
+            sz_str = ""
+        row.append(Button.inline(f"{q['label']}{badge}{sz_str}", f"fhdlv_{session_id}_{i}"))
+        if len(row) >= 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([Button.inline("❌ Cancel", f"fhdlc_{session_id}")])
+
+    await safe_edit(
+        status_msg,
+        f"📋 **کیفیت رو انتخاب کن:**\n\n{caption}",
+        buttons=buttons,
+    )
+
+
+async def faphouse_video_callback(event):
+    """دانلود ویدیوی faphouse با کیفیت انتخابی."""
+    data = event.data.decode()
+    body = data[len("fhdlv_"):]
+    session_id, idx_str = body.rsplit("_", 1)
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        await event.answer("❌ invalid", alert=True)
+        return
+
+    sess = faphouse_sessions.get(session_id)
+    if not sess:
+        await event.answer("⏰ نشست منقضی شده. لینک رو دوباره بفرست.", alert=True)
+        return
+    qs = sess["info"].get("qualities", [])
+    if not (0 <= idx < len(qs)):
+        await event.answer("❌ کیفیت نامعتبر", alert=True)
+        return
+
+    quality = qs[idx]
+    await event.answer()
+    status_msg = await event.edit(
+        f"📥 در حال دانلود {quality['label']}...\n(ممکنه چند ثانیه طول بکشه)"
+    )
+
+    async def _prog(msg, done, total):
+        try:
+            await safe_edit(status_msg, f"📥 {msg}")
+        except Exception:
+            pass
+
+    try:
+        ok, res = await asyncio.wait_for(
+            faphouse_download_video(sess["url"], quality, OUTPUT_FOLDER, _prog),
+            timeout=600,
+        )
+        if not ok or not os.path.exists(res):
+            await safe_edit(status_msg, f"❌ خطا در دانلود: {str(res)[:150]}")
+            faphouse_sessions.pop(session_id, None)
+            return
+
+        size_mb = os.path.getsize(res) / 1024 / 1024
+        await safe_edit(status_msg, f"✅ دانلود شد ({size_mb:.1f}MB)\n📤 در حال آپلود...")
+
+        safe_title = re.sub(r'[^\w.\-() ]', '_', sess["info"].get("title") or "video")[:80]
+        pretty = os.path.join(OUTPUT_FOLDER, f"{safe_title}_{quality['label']}.mp4")
+        try:
+            os.replace(res, pretty)
+            res = pretty
+        except Exception:
+            pass
+
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=res,
+            caption=sess["caption"],
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+        )
+        await safe_edit(status_msg, "✅ ارسال شد!")
+        try:
+            os.unlink(res)
+        except Exception:
+            pass
+        faphouse_sessions.pop(session_id, None)
+    except asyncio.TimeoutError:
+        await safe_edit(status_msg, "❌ دانلود خیلی طول کشید — لغو شد.")
+    except Exception as e:
+        logger.error(f"[Faphouse] video dl error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: {str(e)[:150]}")
+
+
+async def faphouse_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data[len("fhdlc_"):]
+    faphouse_sessions.pop(session_id, None)
+    await event.answer("Cancelled", alert=False)
+    try:
+        await event.delete()
+    except Exception:
+        pass
 
 
 # ====================== VIDEO RECEIVE -> GITHUB OFFER ======================
@@ -8944,448 +9305,6 @@ async def subtitle_cancel_callback(event):
         pass
 
 
-# ====================== SNAPWC HANDLERS ======================
-
-
-async def snapwc_command(event):
-    if event.sender_id not in AUTHORIZED_USERS:
-        return await event.reply("⛔ Unauthorized")
-    parts = event.raw_text.split(maxsplit=1)
-    if len(parts) < 2:
-        return await event.reply("❌ Usage: `/snapwc <url>`", parse_mode="markdown")
-
-    url = parts[1].strip()
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-
-    status_msg = await event.reply("🔄 Starting SnapWC session...")
-    logger.info(f"[SNAPWC] START | chat={event.chat_id} | url={url[:120]}")
-
-    await _run_snapwc_flow(event, url, status_msg)
-
-
-async def _run_snapwc_flow(event, url, status_msg):
-
-    if status_msg is None:
-        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
-
-    session = SnapWCSession()
-    try:
-        result = await asyncio.wait_for(session.run_full_flow(url), timeout=180)
-
-        if not result["success"]:
-            steps = result.get("steps", [])
-            err = result.get("error", "Unknown")
-            log = "\n".join(f"  • {s}" for s in steps)
-            logger.error(f"[SNAPWC] run_full_flow failed: {err} | steps: {log}")
-            await safe_edit(status_msg, f"❌ SnapWC error: {err}")
-            ss = result.get("screenshot_b64", "")
-            if ss:
-                try:
-                    await event.client.send_file(
-                        event.chat_id,
-                        base64.b64decode(ss),
-                        caption=f"📸 SnapWC screenshot: {err[:80]}",
-                    )
-                except Exception:
-                    pass
-            await session.close_browser()
-            return
-
-        qualities = result.get("qualities", [])
-        if not qualities:
-            await safe_edit(status_msg, "❌ No quality options found.")
-            await session.close_browser()
-            return
-
-        session_id = f"snapwc_{event.chat_id}_{event.id}_{int(time.time())}"
-        snapwc_sessions[session_id] = session
-        user_state[event.chat_id] = {
-            "action": "snapwc_quality",
-            "session_id": session_id,
-            "video_url": url,
-        }
-
-        grouped = {"Video": [], "No Sound": [], "Audio": []}
-        for q in qualities:
-            cat = q["category"]
-            if cat in grouped:
-                grouped[cat].append(q)
-
-        msg_lines = [f"🎬 **SnapWC — {len(qualities)} options found:**\n"]
-        cat_icons = {"Video": "🎬", "No Sound": "🔇", "Audio": "🎵"}
-        idx = 1
-        buttons = []
-        for cat in ["Video", "No Sound", "Audio"]:
-            items = grouped.get(cat, [])
-            if not items:
-                continue
-            msg_lines.append(f"\n{cat_icons[cat]} **{cat}**")
-            for q in items:
-                sz = f" ({q['size']})" if q.get("size") else ""
-                msg_lines.append(f"  {idx}. {q['label']}{sz}")
-                btn_emoji = cat_icons.get(q["category"], "📁")
-                buttons.append(
-                    [
-                        Button.inline(
-                            f"{btn_emoji} {q['label']}{sz}",
-                            f"snapwc_q_{session_id}_{q['index']}",
-                        )
-                    ]
-                )
-                idx += 1
-
-        buttons.append([Button.inline("❌ Cancel", f"snapwc_cancel_{session_id}")])
-
-        await safe_edit(
-            status_msg,
-            "\n".join(msg_lines),
-            buttons=buttons,
-        )
-
-    except Exception as e:
-        logger.error(f"[SNAPWC] Command error: {e}", exc_info=True)
-        await safe_edit(status_msg, f"❌ SnapWC error: {str(e)[:120]}")
-        try:
-            ss = await session.take_screenshot()
-            if ss:
-                await event.client.send_file(
-                    event.chat_id,
-                    base64.b64decode(ss),
-                    caption=f"📸 SnapWC error screenshot",
-                )
-        except Exception:
-            pass
-        try:
-            await session.close_browser()
-        except Exception:
-            pass
-
-
-async def snapwc_select_callback(event):
-    data = event.data.decode()
-    prefix_removed = data.replace("snapwc_q_", "")
-    session_id = prefix_removed.rsplit("_", 1)[0]
-    index = int(prefix_removed.rsplit("_", 1)[1])
-
-    if session_id not in snapwc_sessions:
-        return await event.answer("❌ Session expired. Run /snapwc again.", alert=True)
-
-    session = snapwc_sessions.pop(session_id, None)
-    if not session:
-        return await event.answer("❌ Session expired. Run /snapwc again.", alert=True)
-
-    await event.answer("⏳ Processing...", alert=False)
-
-    try:
-        result = await session.continue_with_quality(index)
-
-        if result.get("captcha"):
-            captcha_b64 = result["captcha_image"]
-            if "," in captcha_b64:
-                raw_b64 = captcha_b64.split(",", 1)[1]
-            else:
-                raw_b64 = captcha_b64
-            captcha_data = base64.b64decode(raw_b64)
-
-            captcha_path = os.path.join(OUTPUT_FOLDER, f"captcha_{session_id}.png")
-            async with aiofiles.open(captcha_path, "wb") as f:
-                await f.write(captcha_data)
-
-            await event.client.send_file(
-                event.chat_id,
-                captcha_path,
-                caption="🔐 **Captcha detected!**\nPlease enter the code from the image.",
-                buttons=[Button.inline("❌ Cancel", f"snapwc_cancel_{session_id}")],
-            )
-
-            try:
-                os.remove(captcha_path)
-            except Exception:
-                pass
-
-            user_state[event.chat_id] = {
-                "action": "snapwc_captcha",
-                "session_id": session_id,
-                "selected_index": index,
-                "video_url": user_state.get(event.chat_id, {}).get("video_url", ""),
-            }
-
-            await safe_edit(event, "🔐 Captcha required — check the image sent above.")
-            return
-
-        if result["success"]:
-            download_url = result["download_url"]
-            download_headers = result.get("download_headers", {})
-            title = result.get("title", "")
-            download_data = result.get("download_data", {})
-
-            steps = result.get("steps", [])
-            logger.info(f"[SNAPWC] Quality selected OK | steps: {' → '.join(steps)}")
-
-            # If browser already downloaded the file, send directly
-            if download_data.get("browser_download") and download_data.get("filepath"):
-                filepath = download_data["filepath"]
-                file_size = download_data.get("file_size", 0)
-                status_msg = await event.client.send_message(
-                    event.chat_id, "✅ File downloaded via browser! Uploading..."
-                )
-                caption_start = f"🎬 {title}" if title else "📄 **SnapWC Download**"
-                await send_file_with_progress(
-                    client=event.client,
-                    chat_id=event.chat_id,
-                    filepath=filepath,
-                    caption=(
-                        f"{caption_start}\n📦 Size: {human_readable_size(file_size)}"
-                    ),
-                    status_msg=status_msg,
-                )
-                try:
-                    os.remove(filepath)
-                except Exception:
-                    pass
-                user_state.pop(event.chat_id, None)
-                return
-
-            status_msg = await event.client.send_message(
-                event.chat_id, "✅ Got download link! Downloading..."
-            )
-
-            video_url = user_state.get(event.chat_id, {}).get("video_url", "")
-            dl_ok = await do_download_and_send(
-                event,
-                status_msg,
-                download_url,
-                video_url,
-                title=title,
-                extra_headers=download_headers if download_headers else None,
-            )
-
-            # Even if download failed, send the direct link to user
-            if not dl_ok and download_url:
-                try:
-                    await event.client.send_message(
-                        event.chat_id,
-                        f"⬇️ **Direct download link (try manually):**\n`{download_url}`\n_Links may expire quickly._",
-                        parse_mode="markdown",
-                        link_preview=False,
-                    )
-                except Exception:
-                    pass
-
-            # Retry once on failure: get fresh URL from SnapWC
-            if not dl_ok and video_url:
-                retry_msg = await event.client.send_message(
-                    event.chat_id,
-                    f"🔄 **Retrying SnapWC — fresh download link...**\nPrevious error logged.",
-                )
-                logger.info(
-                    f"[SNAPWC] Retry started | index={index} | url={video_url[:80]}"
-                )
-                new_session = None
-                try:
-                    new_session = SnapWCSession()
-                    await safe_edit(retry_msg, "🔄 Step 1/3: Loading SnapWC...")
-                    new_result = await new_session.run_full_flow(video_url)
-                    if new_result["success"]:
-                        await safe_edit(retry_msg, "🔄 Step 2/3: Selecting quality...")
-                        new_dl = await new_session.continue_with_quality(index)
-                        if new_dl.get("success") and not new_dl.get("captcha"):
-                            fresh_url = new_dl["download_url"]
-                            fresh_headers = new_dl.get("download_headers", {})
-                            fresh_title = new_dl.get("title", title)
-                            fresh_download_data = new_dl.get("download_data", {})
-
-                            # If browser already downloaded the file, send directly
-                            if fresh_download_data.get(
-                                "browser_download"
-                            ) and fresh_download_data.get("filepath"):
-                                filepath = fresh_download_data["filepath"]
-                                file_size = fresh_download_data.get("file_size", 0)
-                                await safe_edit(
-                                    retry_msg,
-                                    "✅ File downloaded via browser! Uploading...",
-                                )
-                                caption_start = (
-                                    f"🎬 {fresh_title}"
-                                    if fresh_title
-                                    else "📄 **SnapWC Download**"
-                                )
-                                await send_file_with_progress(
-                                    client=event.client,
-                                    chat_id=event.chat_id,
-                                    filepath=filepath,
-                                    caption=(
-                                        f"{caption_start}\n"
-                                        f"📦 Size: {human_readable_size(file_size)}"
-                                    ),
-                                    status_msg=retry_msg,
-                                )
-                                try:
-                                    os.remove(filepath)
-                                except Exception:
-                                    pass
-                            else:
-                                await safe_edit(
-                                    retry_msg, "🔄 Step 3/3: Retrying download..."
-                                )
-                                retry_ok = await do_download_and_send(
-                                    event,
-                                    retry_msg,
-                                    fresh_url,
-                                    video_url,
-                                    extra_headers=fresh_headers
-                                    if fresh_headers
-                                    else None,
-                                    title=fresh_title,
-                                )
-                                if not retry_ok:
-                                    await safe_edit(
-                                        retry_msg,
-                                        "❌ Retry also failed. SnapWC may be having issues.",
-                                    )
-                        elif new_dl.get("captcha"):
-                            await safe_edit(
-                                retry_msg, "🔐 Captcha on retry — run /snapwc again."
-                            )
-                        else:
-                            err = new_dl.get("error", "Unknown")
-                            steps = " → ".join(new_dl.get("steps", []))
-                            logger.error(
-                                f"[SNAPWC] Retry continue_with_quality failed: {err} | steps: {steps}"
-                            )
-                            await safe_edit(retry_msg, f"❌ Retry failed: {err}")
-                    else:
-                        err = new_result.get("error", "Unknown")
-                        steps = " → ".join(new_result.get("steps", []))
-                        logger.error(
-                            f"[SNAPWC] Retry run_full_flow failed: {err} | steps: {steps}"
-                        )
-                        await safe_edit(retry_msg, f"❌ SnapWC retry failed: {err}")
-                except Exception as retry_e:
-                    logger.error(f"[SNAPWC] Retry error: {retry_e}", exc_info=True)
-                    await safe_edit(retry_msg, f"❌ Retry error: {str(retry_e)[:120]}")
-                finally:
-                    if new_session:
-                        try:
-                            await new_session.close_browser()
-                        except Exception:
-                            pass
-
-            user_state.pop(event.chat_id, None)
-        else:
-            err = result.get("error", "Unknown")
-            steps = result.get("steps", [])
-            log = "\n".join(f"  • {s}" for s in steps)
-            logger.error(f"[SNAPWC] continue_with_quality failed: {err}\n{log}")
-            await safe_edit(event, f"❌ Error: {err}")
-            ss = result.get("screenshot_b64", "")
-            if ss:
-                try:
-                    await event.client.send_file(
-                        event.chat_id,
-                        base64.b64decode(ss),
-                        caption=f"📸 SnapWC screenshot: {err[:80]}",
-                    )
-                except Exception:
-                    pass
-            user_state.pop(event.chat_id, None)
-
-    except Exception as e:
-        logger.error(f"[SNAPWC] Select callback error: {e}", exc_info=True)
-        await safe_edit(event, f"❌ Error: {str(e)[:120]}")
-        snapwc_sessions.pop(session_id, None)
-        user_state.pop(event.chat_id, None)
-
-
-async def snapwc_captcha_handler(event):
-    if event.sender_id not in AUTHORIZED_USERS:
-        return
-    state = user_state.get(event.chat_id)
-    if not state or state.get("action") != "snapwc_captcha":
-        return
-
-    session_id = state.get("session_id", "")
-    index = state.get("selected_index", 0)
-    code = event.raw_text.strip()
-
-    if session_id not in snapwc_sessions:
-        await event.reply("❌ Session expired. Please run /snapwc again.")
-        user_state.pop(event.chat_id, None)
-        raise events.StopPropagation
-
-    session = snapwc_sessions[session_id]
-    status_msg = await event.reply("⏳ Submitting captcha...")
-
-    try:
-        result = await session.continue_after_captcha(code, index)
-
-        if result["success"]:
-            download_url = result["download_url"]
-            download_headers = result.get("download_headers", {})
-            title = result.get("title", "")
-            download_data = result.get("download_data", {})
-
-            # If browser already downloaded the file, send directly
-            if download_data.get("browser_download") and download_data.get("filepath"):
-                filepath = download_data["filepath"]
-                file_size = download_data.get("file_size", 0)
-                await safe_edit(
-                    status_msg, "✅ File downloaded via browser! Uploading..."
-                )
-                caption_start = f"🎬 {title}" if title else "📄 **SnapWC Download**"
-                await send_file_with_progress(
-                    client=event.client,
-                    chat_id=event.chat_id,
-                    filepath=filepath,
-                    caption=(
-                        f"{caption_start}\n📦 Size: {human_readable_size(file_size)}"
-                    ),
-                    status_msg=status_msg,
-                )
-                try:
-                    os.remove(filepath)
-                except Exception:
-                    pass
-                return
-
-            await safe_edit(status_msg, "✅ Captcha solved! Starting download...")
-            video_url = state.get("video_url", "")
-            await do_download_and_send(
-                event,
-                status_msg,
-                download_url,
-                video_url,
-                extra_headers=download_headers if download_headers else None,
-                title=title,
-            )
-        else:
-            await safe_edit(status_msg, f"❌ {result.get('error', 'Captcha failed')}")
-    except Exception as e:
-        logger.error(f"[SNAPWC] Captcha error: {e}", exc_info=True)
-        await safe_edit(status_msg, f"❌ Error: {str(e)[:120]}")
-    finally:
-        snapwc_sessions.pop(session_id, None)
-        user_state.pop(event.chat_id, None)
-
-    raise events.StopPropagation
-
-
-async def snapwc_cancel_callback(event):
-    data = event.data.decode()
-    session_id = data.replace("snapwc_cancel_", "")
-    if session_id in snapwc_sessions:
-        session = snapwc_sessions.pop(session_id)
-        try:
-            await session.close_browser()
-        except Exception:
-            pass
-    user_state.pop(event.chat_id, None)
-    await event.answer("❌ Cancelled", alert=False)
-    try:
-        await event.edit("❌ SnapWC session cancelled.", buttons=None)
-    except Exception:
-        pass
 
 
 # ====================== Y2MATE CALLBACK HANDLERS ======================
@@ -21111,12 +21030,6 @@ async def main():
         subtitle_cancel_callback, events.CallbackQuery(pattern=r"subcancl_(.+)")
     )
     client.add_event_handler(
-        snapwc_select_callback, events.CallbackQuery(pattern=r"snapwc_q_(.+)")
-    )
-    client.add_event_handler(
-        snapwc_cancel_callback, events.CallbackQuery(pattern=r"snapwc_cancel_(.+)")
-    )
-    client.add_event_handler(
         y2mate_quality_callback,
         events.CallbackQuery(pattern=r"y2m_(?!cancel)(.+)_(\d+)"),
     )
@@ -21131,6 +21044,20 @@ async def main():
     )
     client.add_event_handler(
         ytdirect_cancel_callback, events.CallbackQuery(pattern=r"ytdc_.+")
+    )
+    # Noodlemagazine callbacks
+    client.add_event_handler(
+        noodle_video_callback, events.CallbackQuery(pattern=r"noodlev_.+")
+    )
+    client.add_event_handler(
+        noodle_cancel_callback, events.CallbackQuery(pattern=r"noodlc_.+")
+    )
+    # Faphouse callbacks
+    client.add_event_handler(
+        faphouse_video_callback, events.CallbackQuery(pattern=r"fhdlv_.+")
+    )
+    client.add_event_handler(
+        faphouse_cancel_callback, events.CallbackQuery(pattern=r"fhdlc_.+")
     )
     client.add_event_handler(
         y2mate_cancel_callback, events.CallbackQuery(pattern=r"y2mc_.+")
@@ -21658,9 +21585,6 @@ async def main():
         dirpy_command, events.NewMessage(pattern=r"^/dirpy(\s|$)", incoming=True)
     )
     client.add_event_handler(
-        snapwc_command, events.NewMessage(pattern=r"^/snapwc(\s|$)", incoming=True)
-    )
-    client.add_event_handler(
         yt_command, events.NewMessage(pattern=r"^/yt(\s|$)", incoming=True)
     )
     client.add_event_handler(
@@ -21701,7 +21625,6 @@ async def main():
         video_receive_handler,
         events.NewMessage(incoming=True, func=lambda e: bool(e.video or e.document)),
     )
-    client.add_event_handler(snapwc_captcha_handler, events.NewMessage(incoming=True))
     client.add_event_handler(generic_url_handler, events.NewMessage(incoming=True))
 
     # Inline search handler
