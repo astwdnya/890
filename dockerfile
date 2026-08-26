@@ -51,6 +51,7 @@ COPY bot.py .
 COPY FastTelethon.py .
 COPY github.py .
 COPY savep_handler.py .
+COPY snapwc_handler.py .
 COPY y2mate.py .
 COPY youtube_extractor.py .
 COPY yt_direct_handler.py .

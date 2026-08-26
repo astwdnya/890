@@ -593,14 +593,6 @@ from otherwebsiteshandler.ai.image_generator import generate_image, ART_STYLES, 
 from otherwebsiteshandler.photoroom_handler import remove_background, remove_background_to_sticker
 # Comic translation (PDF → Persian) — OCR.space + Google + rewrite
 from otherwebsiteshandler.comic_translate_handler import translate_comic_pdf
-# Hoes.tube handler (KVS-based with flashvars player)
-from otherwebsiteshandler.hoes_handler import (
-    is_hoes_url,
-    extract_hoes_qualities,
-    download_hoes_direct,
-    download_hoes_m3u8,
-    hoes_sessions,
-)
 ocr_sessions: dict = {}
 faceswap_sessions: dict = {}
 from y2mate import Y2MateSession
@@ -17539,11 +17531,6 @@ process_fux_request, fux_quality_callback, fux_cancel_callback = _make_site_hand
     "fux", extract_fux_qualities, download_fux_direct, download_fux_m3u8,
     fux_sessions, "Fux",
 )
-# Hoes.tube (KVS-based with flashvars player)
-process_hoes_request, hoes_quality_callback, hoes_cancel_callback = _make_site_handler(
-    "hoe", extract_hoes_qualities, download_hoes_direct, download_hoes_m3u8,
-    hoes_sessions, "Hoes.tube",
-)
 
 
 # Helper: list of (is_url_fn, process_fn, log_name) for fast URL dispatch
@@ -17575,7 +17562,6 @@ NEW_SITE_HANDLERS = [
     (is_porn365_url, process_porn365_request, "Porn365"),
     (is_fapcake_url, process_fapcake_request, "FapCup"),
     (is_fux_url, process_fux_request, "Fux"),
-    (is_hoes_url, process_hoes_request, "Hoes.tube"),
 ]
 
 # ─── XXXBP (custom handlers: needs page_url + video_url) ───

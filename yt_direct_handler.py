@@ -57,23 +57,7 @@ UA_WEB = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-# ─── InnerTube (ANDROID_VR) ────────────────────────────────────────────────
-IT_KEY = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w"
-IT_URL = f"https://www.youtube.com/youtubei/v1/player?key={IT_KEY}&prettyPrint=false"
-IT_UA = (
-    "com.google.android.apps.youtube.vr.oculus/1.60.19 "
-    "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
-)
-IT_CLIENT = {
-    "clientName": "ANDROID_VR",
-    "clientVersion": "1.60.19",
-    "deviceMake": "Oculus",
-    "deviceModel": "Quest 3",
-    "osName": "Android",
-    "osVersion": "12L",
-    "androidSdkVersion": 32,
-    "hl": "en",
-}
+# ─── InnerTube (cascade: ANDROID_VR → TVHTML5) ──────────────────────────────
 
 # ─── cobalt ────────────────────────────────────────────────────────────────
 COBALT_BASES = [
@@ -119,41 +103,79 @@ def is_youtube_url(url: str) -> bool:
 # ═════════════════════════════════════════════════════════════════════════
 
 
+# کلاینت‌های پشتیبان InnerTube — به ترتیب امتحان می‌شن.
+# ANDROID_VR تنها کلاینتیه که از IP های دیتاسنتر بدون PO token جواب می‌ده؛
+# بقیه شانس کمتری دارن ولی از IP های دیگه (مثل هاست دیپلوی) ممکنه باز بشن.
+IT_CLIENTS = [
+    {
+        "client": {
+            "clientName": "ANDROID_VR",
+            "clientVersion": "1.60.19",
+            "deviceMake": "Oculus",
+            "deviceModel": "Quest 3",
+            "osName": "Android",
+            "osVersion": "12L",
+            "androidSdkVersion": 32,
+            "hl": "en",
+        },
+        "ua": (
+            "com.google.android.apps.youtube.vr.oculus/1.60.19 "
+            "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+        ),
+        "key": "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
+        "cn": "28",
+    },
+    {
+        "client": {
+            "clientName": "TVHTML5",
+            "clientVersion": "7.20250101.10.00",
+            "hl": "en",
+        },
+        "ua": "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+        "key": "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+        "cn": "85",
+    },
+]
+
+
 async def _innertube_player(
     session: aiohttp.ClientSession, video_id: str
 ) -> Optional[dict]:
-    """POST player با کلاینت ANDROID_VR. None یعنی قفل/خطا."""
-    payload = {
-        "context": {"client": dict(IT_CLIENT)},
-        "videoId": video_id,
-        "contentCheckOk": True,
-        "racyCheckOk": True,
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": IT_UA,
-        "X-YouTube-Client-Name": "28",
-        "X-YouTube-Client-Version": "1.60.19",
-        "Origin": "https://www.youtube.com",
-    }
-    try:
-        async with session.post(
-            IT_URL, json=payload, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=25),
-        ) as r:
-            if r.status != 200:
-                return None
-            j = await r.json(content_type=None)
-    except Exception as e:
-        logger.debug("[YtDirect] innertube error: %s", e)
-        return None
-    if j.get("playabilityStatus", {}).get("status") != "OK":
-        return None
-    if not j.get("streamingData", {}).get("adaptiveFormats") and not j.get(
-        "streamingData", {}
-    ).get("formats"):
-        return None
-    return j
+    """POST player با cascade کلاینت‌ها (ANDROID_VR اول). None یعنی قفل/خطا."""
+    for cfg in IT_CLIENTS:
+        payload = {
+            "context": {"client": dict(cfg["client"])},
+            "videoId": video_id,
+            "contentCheckOk": True,
+            "racyCheckOk": True,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": cfg["ua"],
+            "X-YouTube-Client-Name": cfg["cn"],
+            "X-YouTube-Client-Version": cfg["client"]["clientVersion"],
+            "Origin": "https://www.youtube.com",
+        }
+        try:
+            async with session.post(
+                f"https://www.youtube.com/youtubei/v1/player?key={cfg['key']}&prettyPrint=false",
+                json=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=25),
+            ) as r:
+                if r.status != 200:
+                    continue
+                j = await r.json(content_type=None)
+        except Exception as e:
+            logger.debug("[YtDirect] innertube error: %s", e)
+            continue
+        if j.get("playabilityStatus", {}).get("status") != "OK":
+            continue
+        if not j.get("streamingData", {}).get("adaptiveFormats") and not j.get(
+            "streamingData", {}
+        ).get("formats"):
+            continue
+        return j
+    return None
 
 
 def _parse_innertube_formats(player: dict) -> Tuple[List[dict], List[dict]]:
@@ -649,6 +671,11 @@ async def _cobalt_request(
     return None
 
 
+# خطای «تونل خالی» — بعضی ویدیوها رو اینستنس نمی‌تونه بکشه (کش-محوره).
+# با این خطای خاص، caller باید به مسیر بعدی (مثلاً snapwc) fallback کنه.
+ERR_TUNNEL_EMPTY = "cobalt tunnel returned empty stream (video not available on relay)"
+
+
 def _fmt_duration(sec: int) -> str:
     h, rem = divmod(int(sec), 3600)
     m, s = divmod(rem, 60)
@@ -875,21 +902,35 @@ async def download_video(
 
         # ── مسیر ۲: cobalt tunnel ──
         tunnel_q = quality.get("tunnel") or "720"
-        tunnel = await _cobalt_request(
-            session,
-            {
-                "url": f"https://www.youtube.com/watch?v={vid}",
-                "videoQuality": tunnel_q,
-                "filenameStyle": "basic",
-            },
-        )
-        if not tunnel:
-            return False, "cobalt: no tunnel url"
-        out_path = os.path.join(out_dir, base_name + ".mp4")
-        ok, msg = await _stream_download(
-            session, tunnel, out_path, 0, progress_cb, "📥"
-        )
-        return ok, (out_path if ok else msg)
+        last_err = "cobalt: no tunnel url"
+        for attempt in range(3):  # تونل تازه بگیر و retry کن
+            tunnel = await _cobalt_request(
+                session,
+                {
+                    "url": f"https://www.youtube.com/watch?v={vid}",
+                    "videoQuality": tunnel_q,
+                    "filenameStyle": "basic",
+                },
+            )
+            if not tunnel:
+                return False, "cobalt: no tunnel url"
+            out_path = os.path.join(out_dir, base_name + ".mp4")
+            ok, msg = await _stream_download(
+                session, tunnel, out_path, 0, progress_cb, "📥"
+            )
+            if ok:
+                return True, out_path
+            last_err = msg
+            # تونل خالی = اینستنس این ویدیو رو نداره — retry فایده نداره
+            if "too small" in msg or "empty" in msg:
+                return False, ERR_TUNNEL_EMPTY
+            try:
+                if os.path.exists(out_path):
+                    os.unlink(out_path)
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+        return False, last_err
 
 
 async def download_audio(
@@ -956,22 +997,31 @@ async def download_audio(
 
         # ── مسیر ۲: cobalt audio ──
         audio_fmt = "opus" if container == "opus" else "mp3"
-        tunnel = await _cobalt_request(
-            session,
-            {
-                "url": f"https://www.youtube.com/watch?v={vid}",
-                "downloadMode": "audio",
-                "audioFormat": audio_fmt,
-                "filenameStyle": "basic",
-            },
-        )
-        if not tunnel:
-            return False, "cobalt: audio unavailable"
-        ok, msg = await _stream_download(
-            session, tunnel, raw_path, 0, progress_cb, "📥"
-        )
-        if not ok:
-            return False, msg
+        last_err = "cobalt: audio unavailable"
+        for attempt in range(3):
+            tunnel = await _cobalt_request(
+                session,
+                {
+                    "url": f"https://www.youtube.com/watch?v={vid}",
+                    "downloadMode": "audio",
+                    "audioFormat": audio_fmt,
+                    "filenameStyle": "basic",
+                },
+            )
+            if not tunnel:
+                return False, "cobalt: audio unavailable"
+            ok, msg = await _stream_download(
+                session, tunnel, raw_path, 0, progress_cb, "📥"
+            )
+            if not ok:
+                last_err = msg
+                if "too small" in msg or "empty" in msg:
+                    return False, ERR_TUNNEL_EMPTY
+                await asyncio.sleep(2)
+                continue
+            break
+        else:
+            return False, last_err
 
         final_path = os.path.join(out_dir, base_name + "." + container)
         ok2 = await _build_audio_with_metadata(
