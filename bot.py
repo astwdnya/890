@@ -21674,6 +21674,8 @@ async def main():
     client.add_event_handler(fapcake_cancel_callback, events.CallbackQuery(pattern=r"fpc_cancel_.+"))
     client.add_event_handler(fux_quality_callback, events.CallbackQuery(pattern=r"fux_q_.+"))
     client.add_event_handler(fux_cancel_callback, events.CallbackQuery(pattern=r"fux_cancel_.+"))
+    client.add_event_handler(hoes_quality_callback, events.CallbackQuery(pattern=r"hoe_q_.+"))
+    client.add_event_handler(hoes_cancel_callback, events.CallbackQuery(pattern=r"hoe_cancel_.+"))
 
     # ===== Command handlers =====
     client.add_event_handler(
