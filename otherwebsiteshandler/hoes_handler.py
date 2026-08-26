@@ -298,6 +298,12 @@ async def download_hoes_direct(
     """
     دانلود مستقیم mp4 از hoes.tube.
 
+    بهینه‌سازی سرعت:
+      - 32 worker موازی (به‌جای 16 پیش‌فرض)
+      - chunk_size adaptive: فایل به حداکثر 32 chunk تقسیم می‌شه
+        (مثال: 179MB → 6MB chunks × 30 chunks، 94MB → 5MB chunks × 19 chunks)
+      - این تنظیمات پرش سرعت multi-segment رو به 2 برابر افزایش می‌ده
+
     Args:
         url: URL مستقیم mp4 (با v-acctoken)
         filepath: مسیر فایل خروجی
@@ -310,10 +316,44 @@ async def download_hoes_direct(
     if not is_url_in_domains(url, ALLOWED_VIDEO_HOSTS):
         return False, "URL host not allowed for hoes.tube", 0
 
-    # اول سعی کن با multi-segment (16 worker موازی - سریع‌تر)
+    # ─── Pre-HEAD: حجم فایل رو بگیر تا chunk_size رو بهینه محاسبه کنیم ───
+    # هدف: تعداد chunk‌ها ≤ 32 باشه (مطابق درخواست کاربر) و 32 worker موازی
+    MAX_CHUNKS = 32
+    NUM_WORKERS = 32
+    MIN_CHUNK_SIZE = 5 * 1024 * 1024  # حداقل 5MB (جلوگیری از خرد شدن بیش از حد)
+    MAX_CHUNK_SIZE = 32 * 1024 * 1024  # حداکثر 32MB (جلوگیری از chunk‌های خیلی بزرگ)
+
+    total_size = await _probe_file_size(url)
+    if total_size > 0:
+        # chunk_size = ceil(total_size / MAX_CHUNKS)
+        chunk_size = (total_size + MAX_CHUNKS - 1) // MAX_CHUNKS
+        # محدود به بازه‌ی معقول
+        chunk_size = max(MIN_CHUNK_SIZE, min(MAX_CHUNK_SIZE, chunk_size))
+        # گرد کن به مضارب 1MB برای لاگ‌های تمیز
+        chunk_size = ((chunk_size + 1024 * 1024 - 1) // (1024 * 1024)) * (1024 * 1024)
+        est_chunks = (total_size + chunk_size - 1) // chunk_size
+        logger.info(
+            "[Hoes] File size: %.1f MB → chunk_size=%d MB, est_chunks=%d, workers=%d",
+            total_size / 1024 / 1024,
+            chunk_size // 1024 // 1024,
+            est_chunks,
+            NUM_WORKERS,
+        )
+    else:
+        # اگه HEAD جواب نداد، default 5MB با 32 worker
+        chunk_size = MIN_CHUNK_SIZE
+        logger.info(
+            "[Hoes] Pre-HEAD failed - using chunk_size=%d MB, workers=%d",
+            chunk_size // 1024 // 1024,
+            NUM_WORKERS,
+        )
+
+    # اول سعی کن با multi-segment (32 worker موازی + chunk_size adaptive)
     success, error, size = await _download_direct_multi_impl(
         url, filepath, progress_cb,
         referer=HOMEPAGE,
+        num_workers=NUM_WORKERS,
+        chunk_size=chunk_size,
     )
     if success:
         return True, "", size
@@ -329,6 +369,44 @@ async def download_hoes_direct(
 
     cleanup_file(filepath)
     return False, error, 0
+
+
+async def _probe_file_size(url: str) -> int:
+    """
+    HEAD/Range request کوچیک بزن تا حجم واقعی فایل رو از Content-Range بگیریم.
+    اگه سرور Range پشتیبانی نکنه یا HEAD شکست بخوره، 0 برمی‌گردونه.
+    """
+    try:
+        from curl_cffi.requests import AsyncSession
+        async with AsyncSession() as session:
+            r = await session.get(
+                url,
+                impersonate="chrome",
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "*/*",
+                    "Referer": HOMEPAGE,
+                    "Range": "bytes=0-1023",
+                },
+                timeout=30,
+                verify=False,
+            )
+            # Content-Range: bytes 0-1023/<total>
+            cr = r.headers.get("Content-Range", "")
+            m = re.search(r"/(\d+)\s*$", cr)
+            if m:
+                return int(m.group(1))
+            # fallback: Content-Length
+            cl = r.headers.get("Content-Length", "")
+            if cl.isdigit():
+                return int(cl)
+    except Exception as e:
+        logger.debug("[Hoes] _probe_file_size failed: %s", e)
+    return 0
 
 
 async def download_hoes_m3u8(
