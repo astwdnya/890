@@ -601,6 +601,15 @@ from otherwebsiteshandler.hoes_handler import (
     download_hoes_m3u8,
     hoes_sessions,
 )
+# FotonovelasXXX handler (photo-novela comics — origin-direct + DDoS-Guard bypass)
+from otherwebsiteshandler.fotonovelas_handler import (
+    is_fotonovelas_url,
+    extract_fotonovelas_info,
+    download_fotonovelas_images,
+    build_fotonovelas_pdf,
+    build_fotonovelas_zip,
+    fotonovelas_sessions,
+)
 ocr_sessions: dict = {}
 faceswap_sessions: dict = {}
 from y2mate import Y2MateSession
@@ -17546,6 +17555,161 @@ process_hoes_request, hoes_quality_callback, hoes_cancel_callback = _make_site_h
 )
 
 
+# ─── FotonovelasXXX (فوتونولا — کمیک عکسی) ─────────────────────
+
+async def process_fotonovelas_request(event, url: str, status_msg):
+    """پردازش URL فوتونولا: استخراج عکس‌ها + سوال «عکس جداگانه یا PDF؟» (الگوی کمیک‌ها)."""
+    await safe_edit(status_msg, "🔍 در حال استخراج اطلاعات فوتونولا... (عبور از محافظت سایت)")
+    info = await extract_fotonovelas_info(url)
+    if not info or not info.get("images"):
+        await safe_edit(status_msg, "❌ فوتونولا پیدا نشد یا عکسی نداره.\n(اگه مطمئنی لینک درسته، دوباره تلاش کن — محافظت سایت حساسه)")
+        return
+
+    title = info.get("title", "Fotonovela")
+    images = info["images"]
+    lang_fa = "🇬🇧 انگلیسی" if info.get("language") == "english" else "🇪🇸 اسپانیایی"
+
+    session_id = f"foto_{event.chat_id}_{event.id}_{int(time.time())}"
+    fotonovelas_sessions[session_id] = {
+        "url": url,
+        "info": info,
+        "chat_id": event.chat_id,
+    }
+
+    buttons = [
+        [Button.inline(f"📄 PDF ({len(images)} صفحه)", f"fnpdf_{session_id}")],
+        [Button.inline(f"🗂 عکس‌های جداگانه — ZIP ({len(images)})", f"fnimg_{session_id}")],
+    ]
+    await safe_edit(
+        status_msg,
+        f"📖 **{title[:80]}**\n"
+        f"🌐 FotonovelasXXX | {lang_fa}\n"
+        f"🖼 صفحات: {len(images)}\n\n"
+        f"عکس‌های جداگانه می‌خوای یا PDF؟",
+        buttons=buttons,
+    )
+
+
+async def fotonovelas_pdf_callback(event):
+    """ساخت PDF از فوتونولا."""
+    data = event.data.decode()
+    session_id = data.replace("fnpdf_", "")
+    state = fotonovelas_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    await event.answer("📄 شروع ساخت PDF...", alert=False)
+
+    info = state["info"]
+    images = info.get("images", [])
+    title = info.get("title", "fotonovela")
+    url = info.get("url", "")
+
+    safe_title = re.sub(r'[<>:"/\\|?*]', "_", title)[:60]
+    out_path = os.path.join(OUTPUT_FOLDER, f"{safe_title}.pdf")
+
+    await safe_edit(event, f"📄 در حال دانلود {len(images)} صفحه و ساخت PDF...")
+
+    async def _progress_cb(done, total):
+        if total and (done == 0 or done == total or done % max(1, total // 5) == 0):
+            try:
+                await safe_edit(event, f"📄 دانلود صفحات: {done}/{total}")
+            except Exception:
+                pass
+
+    try:
+        result = await build_fotonovelas_pdf(images, out_path, progress_cb=_progress_cb, page_url=url)
+        if not result or not os.path.exists(result):
+            await safe_edit(event, "❌ ساخت PDF ناموفق بود.")
+            fotonovelas_sessions.pop(session_id, None)
+            return
+
+        size_mb = os.path.getsize(result) / 1024 / 1024
+        await safe_edit(event, f"✅ PDF ساخته شد ({size_mb:.1f} MB)\n📤 در حال آپلود...")
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=result,
+            caption=f"📖 **{title[:80]}**\n🖼 {len(images)} صفحه | FotonovelasXXX\n💾 {size_mb:.1f} MB",
+            status_msg=event,
+            buttons=None,
+            supports_streaming=False,
+            force_document=True,
+        )
+        try:
+            os.unlink(result)
+        except Exception:
+            pass
+        fotonovelas_sessions.pop(session_id, None)
+    except Exception as e:
+        logger.error(f"[Foto] PDF error: {e}", exc_info=True)
+        try:
+            await safe_edit(event, f"❌ خطا: {e}")
+        except Exception:
+            pass
+        fotonovelas_sessions.pop(session_id, None)
+
+
+async def fotonovelas_images_callback(event):
+    """دانلود عکس‌های فوتونولا و ارسال به‌صورت ZIP."""
+    data = event.data.decode()
+    session_id = data.replace("fnimg_", "")
+    state = fotonovelas_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    await event.answer("🗂 شروع دانلود عکس‌ها...", alert=False)
+
+    info = state["info"]
+    images = info.get("images", [])
+    title = info.get("title", "fotonovela")
+    url = info.get("url", "")
+
+    safe_title = re.sub(r'[<>:"/\\|?*]', "_", title)[:60]
+    out_path = os.path.join(OUTPUT_FOLDER, f"{safe_title}.zip")
+
+    await safe_edit(event, f"🗂 در حال دانلود {len(images)} صفحه...")
+
+    async def _progress_cb(done, total):
+        if total and (done == 0 or done == total or done % max(1, total // 5) == 0):
+            try:
+                await safe_edit(event, f"🗂 دانلود صفحات: {done}/{total}")
+            except Exception:
+                pass
+
+    try:
+        result = await build_fotonovelas_zip(images, out_path, progress_cb=_progress_cb, page_url=url)
+        if not result or not os.path.exists(result):
+            await safe_edit(event, "❌ دانلود عکس‌ها ناموفق بود.")
+            fotonovelas_sessions.pop(session_id, None)
+            return
+
+        size_mb = os.path.getsize(result) / 1024 / 1024
+        await safe_edit(event, f"✅ ZIP آماده شد ({size_mb:.1f} MB)\n📤 در حال آپلود...")
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=result,
+            caption=f"📖 **{title[:80]}**\n🖼 {len(images)} صفحه | FotonovelasXXX\n💾 {size_mb:.1f} MB",
+            status_msg=event,
+            buttons=None,
+            supports_streaming=False,
+            force_document=True,
+        )
+        try:
+            os.unlink(result)
+        except Exception:
+            pass
+        fotonovelas_sessions.pop(session_id, None)
+    except Exception as e:
+        logger.error(f"[Foto] ZIP error: {e}", exc_info=True)
+        try:
+            await safe_edit(event, f"❌ خطا: {e}")
+        except Exception:
+            pass
+        fotonovelas_sessions.pop(session_id, None)
+
+
 # Helper: list of (is_url_fn, process_fn, log_name) for fast URL dispatch
 NEW_SITE_HANDLERS = [
     (is_hellporno_url, process_hellporno_request, "HellPorno"),
@@ -17576,6 +17740,7 @@ NEW_SITE_HANDLERS = [
     (is_fapcake_url, process_fapcake_request, "FapCup"),
     (is_fux_url, process_fux_request, "Fux"),
     (is_hoes_url, process_hoes_request, "Hoes.tube"),
+    (is_fotonovelas_url, process_fotonovelas_request, "FotonovelasXXX"),
 ]
 
 # ─── XXXBP (custom handlers: needs page_url + video_url) ───
@@ -21676,6 +21841,9 @@ async def main():
     client.add_event_handler(fux_cancel_callback, events.CallbackQuery(pattern=r"fux_cancel_.+"))
     client.add_event_handler(hoes_quality_callback, events.CallbackQuery(pattern=r"hoe_q_.+"))
     client.add_event_handler(hoes_cancel_callback, events.CallbackQuery(pattern=r"hoe_cancel_.+"))
+    # FotonovelasXXX (فوتونولا — PDF / ZIP)
+    client.add_event_handler(fotonovelas_pdf_callback, events.CallbackQuery(pattern=r"fnpdf_.+"))
+    client.add_event_handler(fotonovelas_images_callback, events.CallbackQuery(pattern=r"fnimg_.+"))
 
     # ===== Command handlers =====
     client.add_event_handler(
