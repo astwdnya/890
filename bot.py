@@ -17578,7 +17578,8 @@ async def process_fotonovelas_request(event, url: str, status_msg):
 
     buttons = [
         [Button.inline(f"📄 PDF ({len(images)} صفحه)", f"fnpdf_{session_id}")],
-        [Button.inline(f"🗂 عکس‌های جداگانه — ZIP ({len(images)})", f"fnimg_{session_id}")],
+        [Button.inline(f"🖼 عکس‌های جداگانه ({len(images)})", f"fnimg_{session_id}")],
+        [Button.inline(f"🗂 ZIP ({len(images)} عکس)", f"fnzip_{session_id}")],
     ]
     await safe_edit(
         status_msg,
@@ -17651,14 +17652,163 @@ async def fotonovelas_pdf_callback(event):
 
 
 async def fotonovelas_images_callback(event):
-    """دانلود عکس‌های فوتونولا و ارسال به‌صورت ZIP."""
+    """دانلود عکس‌های فوتونولا و ارسال مستقیم به‌صورت عکس (آلبوم‌های ۱۰ تایی — مثل هندلر کمیک‌ها)."""
     data = event.data.decode()
     session_id = data.replace("fnimg_", "")
     state = fotonovelas_sessions.get(session_id)
     if not state:
         await event.answer("⏰ نشست منقضی شده.", alert=True)
         return
-    await event.answer("🗂 شروع دانلود عکس‌ها...", alert=False)
+    await event.answer("🖼 شروع دانلود عکس‌ها...", alert=False)
+
+    info = state["info"]
+    images = info.get("images", [])
+    title = info.get("title", "fotonovela")
+    url = info.get("url", "")
+
+    await safe_edit(event, f"🖼 در حال دانلود {len(images)} صفحه...")
+
+    async def _progress_cb(done, total):
+        if total and (done == 0 or done == total or done % max(1, total // 5) == 0):
+            try:
+                await safe_edit(event, f"🖼 دانلود صفحات: {done}/{total}")
+            except Exception:
+                pass
+
+    import tempfile
+    out_dir = tempfile.mkdtemp(prefix="foto_imgs_")
+    try:
+        paths = await download_fotonovelas_images(
+            images, out_dir, progress_cb=_progress_cb, page_url=url
+        )
+        if not paths:
+            await safe_edit(event, "❌ دانلود عکس‌ها ناموفق بود.")
+            fotonovelas_sessions.pop(session_id, None)
+            return
+
+        # تبدیل webp → JPEG (فوتونولا‌های اسپانیایی webp هستن؛ تلگرام webp رو عکس نمایش نمی‌ده)
+        await safe_edit(event, f"🖼 {len(paths)} صفحه دانلود شد — در حال آماده‌سازی...")
+
+        def _ensure_photo_sync():
+            from PIL import Image
+
+            result = []
+            for p in paths:
+                try:
+                    ext = os.path.splitext(p)[1].lower()
+                    if ext in (".jpg", ".jpeg", ".png") and os.path.getsize(p) > 0:
+                        result.append(p)
+                        continue
+                    img = Image.open(p)
+                    if img.mode not in ("RGB", "L"):
+                        img = img.convert("RGB")
+                    new_p = os.path.splitext(p)[0] + ".jpg"
+                    img.save(new_p, "JPEG", quality=92)
+                    img.close()
+                    if os.path.exists(new_p) and os.path.getsize(new_p) > 0:
+                        result.append(new_p)
+                    else:
+                        result.append(p)
+                except Exception as e:
+                    logger.warning("[Foto] convert to jpg failed (%s): %s", p, e)
+                    result.append(p)
+            return result
+
+        loop = asyncio.get_event_loop()
+        photo_paths = await loop.run_in_executor(None, _ensure_photo_sync)
+        if not photo_paths:
+            await safe_edit(event, "❌ آماده‌سازی عکس‌ها ناموفق بود.")
+            fotonovelas_sessions.pop(session_id, None)
+            return
+
+        await safe_edit(event, f"📤 در حال ارسال {len(photo_paths)} عکس...")
+
+        # ارسال به‌صورت آلبوم‌های ۱۰ تایی
+        BATCH_SIZE = 10
+        sent_count = 0
+        for batch_start in range(0, len(photo_paths), BATCH_SIZE):
+            batch = photo_paths[batch_start:batch_start + BATCH_SIZE]
+            caption = (
+                f"📖 **{title[:60]}**\n"
+                f"🖼 {batch_start + 1}-{batch_start + len(batch)}/{len(photo_paths)}"
+                if batch_start == 0 else ""
+            )
+            ok = False
+            try:
+                await event.client.send_file(
+                    event.chat_id, batch,
+                    caption=caption, parse_mode="md",
+                    force_document=False, silent=True,
+                )
+                ok = True
+            except FloodWaitError as fw:
+                logger.warning(f"[Foto] FloodWait {fw.seconds}s — waiting before retry")
+                await asyncio.sleep(min(fw.seconds + 1, 90))
+                try:
+                    await event.client.send_file(
+                        event.chat_id, batch,
+                        caption=caption, parse_mode="md",
+                        force_document=False, silent=True,
+                    )
+                    ok = True
+                except Exception as e2:
+                    logger.error(f"[Foto] album retry failed: {e2}")
+            except Exception as e:
+                logger.error(f"[Foto] album send error: {e}")
+
+            if not ok:
+                # fallback: ارسال تکی
+                for p in batch:
+                    try:
+                        await event.client.send_file(
+                            event.chat_id, p,
+                            force_document=False, silent=True,
+                        )
+                        ok = True
+                    except FloodWaitError as fw:
+                        logger.warning(f"[Foto] FloodWait {fw.seconds}s (single)")
+                        await asyncio.sleep(min(fw.seconds + 1, 90))
+                        try:
+                            await event.client.send_file(
+                                event.chat_id, p,
+                                force_document=False, silent=True,
+                            )
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+            if ok:
+                sent_count += len(batch)
+
+            # فاصله بین آلبوم‌ها برای جلوگیری از FloodWait
+            if batch_start + BATCH_SIZE < len(photo_paths):
+                await asyncio.sleep(1.5)
+
+        await safe_edit(event, f"✅ {sent_count}/{len(photo_paths)} عکس ارسال شد.")
+        fotonovelas_sessions.pop(session_id, None)
+    except Exception as e:
+        logger.error(f"[Foto] images send error: {e}", exc_info=True)
+        try:
+            await safe_edit(event, f"❌ خطا: {e}")
+        except Exception:
+            pass
+        fotonovelas_sessions.pop(session_id, None)
+    finally:
+        try:
+            shutil.rmtree(out_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+async def fotonovelas_zip_callback(event):
+    """دانلود عکس‌های فوتونولا و ارسال به‌صورت ZIP."""
+    data = event.data.decode()
+    session_id = data.replace("fnzip_", "")
+    state = fotonovelas_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    await event.answer("🗂 شروع ساخت ZIP...", alert=False)
 
     info = state["info"]
     images = info.get("images", [])
@@ -21841,9 +21991,10 @@ async def main():
     client.add_event_handler(fux_cancel_callback, events.CallbackQuery(pattern=r"fux_cancel_.+"))
     client.add_event_handler(hoes_quality_callback, events.CallbackQuery(pattern=r"hoe_q_.+"))
     client.add_event_handler(hoes_cancel_callback, events.CallbackQuery(pattern=r"hoe_cancel_.+"))
-    # FotonovelasXXX (فوتونولا — PDF / ZIP)
+    # FotonovelasXXX (فوتونولا — PDF / عکس مستقیم / ZIP)
     client.add_event_handler(fotonovelas_pdf_callback, events.CallbackQuery(pattern=r"fnpdf_.+"))
     client.add_event_handler(fotonovelas_images_callback, events.CallbackQuery(pattern=r"fnimg_.+"))
+    client.add_event_handler(fotonovelas_zip_callback, events.CallbackQuery(pattern=r"fnzip_.+"))
 
     # ===== Command handlers =====
     client.add_event_handler(
