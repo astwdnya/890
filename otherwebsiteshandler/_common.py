@@ -291,6 +291,7 @@ async def download_with_ytdlp(
     user_agent: Optional[str] = None,
     max_filesize: int = MAX_DOWNLOAD_SIZE,
     extra_headers: Optional[dict] = None,
+    format_spec: Optional[str] = None,
 ) -> Tuple[bool, str, int]:
     """
     دانلود ویدیو با yt-dlp (با aria2c اگه موجود باشه، وگرنه concurrent fragments).
@@ -303,6 +304,9 @@ async def download_with_ytdlp(
         user_agent: UA سفارشی
         max_filesize: حداکثر حجم مجاز (بایت)
         extra_headers: هدرهای اضافی برای yt-dlp
+        format_spec: انتخاب کیفیت با yt-dlp format selector
+            (مثلاً 'best[height<=720]' برای محدود کردن به 720p).
+            اگه None باشه، بهترین کیفیت پیش‌فرض دانلود می‌شه.
 
     Returns:
         Tuple (success, error_message, file_size).
@@ -344,6 +348,9 @@ async def download_with_ytdlp(
 
         if referer:
             cmd.extend(["--add-header", f"Referer:{referer}"])
+
+        if format_spec:
+            cmd.extend(["-f", format_spec])
 
         if extra_headers:
             for k, v in extra_headers.items():

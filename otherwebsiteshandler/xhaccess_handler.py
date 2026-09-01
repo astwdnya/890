@@ -4,21 +4,27 @@ xhaccess_handler.py
 هندلر برای xHAccess (xhaccess.com).
 
 xhaccess.com یک mirror از پلتفرم xHamster هست (همون window.initials،
-پخش‌کننده xplayer و CDN است xhcdn.com). روش استخراج دقیقاً بر اساس
-ساختار JSON رسمی xHamster پیاده‌سازی شده (مطابق منطق extractor مرجع yt-dlp):
+پخش‌کننده xplayer و CDN xhcdn.com/xhpingcdn.com).
 
+روش استخراج:
   1. window.initials رو با balanced-brace از HTML بیرون می‌کشیم.
-  2. qualities مستقیم mp4 از initials["videoModel"]["sources"] می‌آد
-     (دیکشنری: format_id -> {quality: url}). کلید "download" رد می‌شه.
-     این URLها معمولاً plain هستن و بدون decipher عبور می‌کنن.
-  3. کیفیت HLS از initials["xplayerSettings"]["sources"]["hls"]["url"]
-     (و "fallback") می‌آد. این URLها ممکنه hex-ciphertext باشن و با
-     الگوریتم _ByteGenerator (7 روش) decipher بشن.
+  2. از xplayerSettings["sources"]["hls"] فقط استریم h264 HLS رو می‌گیریم
+     (ساختار: {"av1":{"url":hex},"h264":{"url":hex}}). hex با
+     _ByteGenerator (7 روش) decipher می‌شه → master m3u8.
+  3. رزولوشن‌های موجود رو از پارامتر multi= URL master می‌خونه و برای هر
+     رزولوشن یک quality جدا می‌سازه (144p..2160p).
+  4. دانلود: ارتفاع در fragment URL (#xh_h=H) ذخیره می‌شه و yt-dlp با
+     -f best[height<=H] دقیقاً همون رزولوشن رو می‌گیره.
+
+چرا فقط HLS؟
+  - مستقیم mp4 (videoModel.sources / standard) روی CDN همیشه «Wrong key»
+    (403) می‌ده — مشکل سمت سرور xHamster که yt-dlp هم تاییدش کرده.
+  - AV1 روی تلگرام صفحه‌ی سیاه می‌شه، پس فقط h264 پیش می‌شه.
+  - master m3u8 از نوع H.264 + AAC و بدون encryption است.
 
 نکته مهم درباره محدودیت جغرافیایی:
-  از IP آمریکا، xHamster/yhaccess صفحه‌ی ویدیو رو با یک صفحه‌ی gated
-  (age-verification قانون ویرجینیا) برمی‌گردونه که videoModel توش نیست.
-  سرور ربات (غیر از آمریکا) صفحه‌ی کامل با videoModel رو می‌گیره.
+  از IP آمریکا، xHamster صفحه‌ی gated (age-verification) برمی‌گردونه که
+  videoModel توش نیست. سرور ربات (غیر از آمریکا) صفحه‌ی کامل رو می‌گیره.
   اگه videoModel پیدا نشد، هندلر پیام واضح برمی‌گردونه (نه crash).
 """
 
@@ -36,6 +42,7 @@ from ._common import (
     download_direct as _download_direct_impl,
     download_direct_multi as _download_direct_multi_impl,
     download_m3u8 as _download_m3u8_impl,
+    download_with_ytdlp as _download_with_ytdlp_impl,
     extract_qualities_with_ytdlp,
     extract_title_from_html,
     fetch_html,
@@ -62,6 +69,8 @@ _ALLOWED_HOST_SUFFIXES = (
     "xhaccess.com",
     ".xhcdn.com",
     "xhcdn.com",
+    ".xhpingcdn.com",
+    "xhpingcdn.com",
 )
 
 # ذخیره‌ی referer دقیق صفحه‌ی ویدیو برای هر media-url (برای دانلود).
@@ -90,6 +99,29 @@ def is_xhaccess_url(url: str) -> bool:
 def _is_allowed_host(url: str) -> bool:
     """بررسی اینکه media-url روی هاست مجاز (سایت یا CDN) هست یا نه."""
     return is_url_in_domains(url, _ALLOWED_HOSTS, _ALLOWED_HOST_SUFFIXES)
+
+
+def _parse_resolutions(m3u8_url: str) -> List[Tuple[int, str]]:
+    """رزولوشن‌های موجود در master m3u8 رو از پارامتر multi= URL می‌خونه.
+
+    URL xhcdn شامل multi=WxH:LABEL,WxH:LABEL,... است که رزولوشن‌های
+    موجود در master playlist رو نشون می‌ده. برمی‌گرده:
+        [(144, "144p"), (240, "240p"), (480, "480p"), ...]
+    به‌ترتیب نزولی (بزرگ‌ترین اول). اگه multi= پیدا نشد، [] برمی‌گرده.
+    """
+    m = re.search(r"multi=([^/]+)", m3u8_url)
+    if not m:
+        return []
+    res: List[Tuple[int, str]] = []
+    for part in m.group(1).split(","):
+        part = part.strip().rstrip(":")
+        mm = re.match(r"(\d+)x(\d+):(\d+p)", part)
+        if mm:
+            height = int(mm.group(2))
+            label = mm.group(3)
+            res.append((height, label))
+    res.sort(key=lambda r: r[0], reverse=True)
+    return res
 
 
 # ─── Hex decipher (xHamster ciphertext) ───────────────────
@@ -342,101 +374,65 @@ async def extract_xhaccess_qualities(url: str) -> Tuple[List[dict], str]:
     )
 
     qualities: List[dict] = []
-    seen_urls: set = set()
 
-    # ── 1) qualities مستقیم mp4 از videoModel["sources"] ──
-    sources = video.get("sources")
-    if isinstance(sources, dict):
-        for fmt_id, fmt_dict in sources.items():
-            if fmt_id == "download":
-                # لینک download هنوز تولید نشده، رد می‌شه
-                continue
-            if not isinstance(fmt_dict, dict):
-                continue
-            for quality, fmt_item in fmt_dict.items():
-                raw = fmt_item if isinstance(fmt_item, str) else (
-                    fmt_item.get("url") if isinstance(fmt_item, dict) else None
-                )
-                u = _decipher_url(raw)
-                if not u or u in seen_urls:
-                    continue
-                if not _is_allowed_host(u):
-                    logger.debug("[xHAccess] skipping non-allowed host: %s", u[:80])
-                    continue
-                seen_urls.add(u)
-                _REFERERS[u] = url
-                qlabel = str(quality) if quality else "Auto"
-                qualities.append({
-                    "label": f"📡 {qlabel}",
-                    "url": u,
-                    "method": "direct",
-                })
-
-    # ── 2) HLS از xplayerSettings["sources"]["hls"] ──
+    # ── HLS از xplayerSettings["sources"]["hls"] ──
+    # فقط استریم h264 رو می‌گیریم. AV1 روی تلگرام صفحه‌ی سیاه می‌شه (تلگرام
+    # AV1 رو دیکد نمی‌کنه) و مستقیم mp4 روی CDN همیشه «Wrong key» (403)
+    # می‌ده (مشکل سمت سرور xHamster که yt-dlp هم تاییدش کرده).
+    master_m3u8 = None
     xplayer_settings = initials.get("xplayerSettings") or {}
     if isinstance(xplayer_settings, dict):
         xp_sources = xplayer_settings.get("sources")
         if isinstance(xp_sources, dict):
             hls = xp_sources.get("hls")
             if isinstance(hls, dict):
-                for key in ("url", "fallback"):
-                    raw = hls.get(key)
-                    if not raw:
-                        continue
-                    hu = _decipher_url(raw)
-                    if not hu or hu in seen_urls:
-                        continue
-                    if not _is_allowed_host(hu):
-                        logger.debug("[xHAccess] skipping non-allowed hls host: %s", hu[:80])
-                        continue
-                    seen_urls.add(hu)
-                    _REFERERS[hu] = url
-                    hls_label = "📡 HLS (Adaptive)" if key == "url" else "📡 HLS (Fallback)"
-                    qualities.append({
-                        "label": hls_label,
-                        "url": hu,
-                        "method": "m3u8",
-                    })
-            # ── 3) standard sources (mp4/m3u8 آبی) ──
-            standard = xp_sources.get("standard")
-            if isinstance(standard, dict):
-                for identifier, fmt_list in standard.items():
-                    if not isinstance(fmt_list, list):
-                        continue
-                    for fmt in fmt_list:
-                        if not isinstance(fmt, dict):
+                # codec-keyed: {"av1": {"url": hex}, "h264": {"url": hex}}
+                h264_entry = hls.get("h264")
+                if isinstance(h264_entry, dict):
+                    for key in ("url", "fallback"):
+                        raw = h264_entry.get(key)
+                        if not raw:
                             continue
-                        for key in ("url", "fallback"):
-                            raw = fmt.get(key)
-                            if not raw:
-                                continue
-                            su = _decipher_url(raw)
-                            if not su or su in seen_urls:
-                                continue
-                            if not _is_allowed_host(su):
-                                continue
-                            seen_urls.add(su)
-                            _REFERERS[su] = url
-                            qlabel = (
-                                str(fmt.get("quality") or fmt.get("label") or identifier)
-                            )
-                            if su.split("?")[0].lower().endswith(".m3u8"):
-                                method = "m3u8"
-                                label = "📡 HLS (Adaptive)"
-                            else:
-                                method = "direct"
-                                label = f"📡 {qlabel}"
-                            qualities.append({
-                                "label": label,
-                                "url": su,
-                                "method": method,
-                            })
+                        mu = _decipher_url(raw)
+                        if mu and _is_allowed_host(mu):
+                            master_m3u8 = mu
+                            break
+                # fallback: ساختار قدیمی xhamster {"url": hex, "fallback": hex}
+                if not master_m3u8:
+                    for key in ("url", "fallback"):
+                        raw = hls.get(key)
+                        if not raw:
+                            continue
+                        mu = _decipher_url(raw)
+                        if mu and _is_allowed_host(mu):
+                            master_m3u8 = mu
+                            break
 
-    if not qualities:
+    if not master_m3u8:
         return [], (
-            "❌ هیچ کیفیت‌ای پیدا نشد. ممکنه ویدیو حذف شده باشه یا "
-            "محدودیت جغرافیایی/سنی فعال باشه."
+            "❌ این ویدیو استریم H.264 قابل پخش در تلگرام نداره "
+            "(احتمالاً فقط کدک AV1 موجود است که تلگرام پخشش نمی‌کنه)."
         )
+
+    res_list = _parse_resolutions(master_m3u8)
+    if res_list:
+        for height, rlabel in res_list:
+            # ارتفاع رو در fragment URL می‌ذاریم تا دانلودر با -f درست بزنه
+            qurl = f"{master_m3u8}#xh_h={height}"
+            _REFERERS[qurl] = url
+            qualities.append({
+                "label": f"📡 {rlabel} (H.264)",
+                "url": qurl,
+                "method": "m3u8",
+            })
+    else:
+        # master بدون لیست رزولوشن → یک quality Adaptive
+        _REFERERS[master_m3u8] = url
+        qualities.append({
+            "label": "📡 HLS (H.264)",
+            "url": master_m3u8,
+            "method": "m3u8",
+        })
 
     qualities.sort(key=quality_sort_key, reverse=True)
     logger.info(
@@ -480,10 +476,28 @@ async def download_xhaccess_m3u8(
     filepath: str,
     progress_cb: ProgressCallback,
 ) -> Tuple[bool, str, int]:
-    """دانلود HLS/m3u8 از xhaccess/xhcdn با yt-dlp."""
+    """دانلود HLS/m3u8 از xhaccess/xhcdn با yt-dlp.
+
+    اگر URL fragment ``#xh_h=<height>`` داشته باشه، فقط همون رزولوشن
+    (یا نزدیک‌ترین پایین‌تر) با ``-f best[height<=H]`` دانلود می‌شه.
+    اگه fragment نبود، بهترین کیفیت پیش‌فرض دانلود می‌شه.
+    """
     referer = _REFERERS.get(url, _SITE_REFERER)
-    success, error, size = await _download_m3u8_impl(
-        url, filepath, progress_cb, referer=referer,
+
+    # ارتفاع رو از fragment بکش بیرون و fragment رو از URL حذف کن
+    clean_url = url
+    format_spec: Optional[str] = None
+    if "#" in url:
+        base, frag = url.split("#", 1)
+        clean_url = base
+        m = re.search(r"xh_h=(\d+)", frag)
+        if m:
+            height = int(m.group(1))
+            format_spec = f"best[height<={height}]"
+
+    success, error, size = await _download_with_ytdlp_impl(
+        clean_url, filepath, progress_cb,
+        referer=referer, format_spec=format_spec,
     )
     if success:
         return True, "", size
