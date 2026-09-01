@@ -543,6 +543,10 @@ from otherwebsiteshandler.porntop_handler import (
     is_porntop_url, extract_porntop_qualities,
     download_porntop_direct, download_porntop_m3u8, porntop_sessions,
 )
+from otherwebsiteshandler.xhaccess_handler import (
+    is_xhaccess_url, extract_xhaccess_qualities,
+    download_xhaccess_direct, download_xhaccess_m3u8, xhaccess_sessions,
+)
 from otherwebsiteshandler.generic_handler import (
     is_pornone_url, is_pornhd_url, is_xtube_url, is_mofosex_url, is_fapvid_url,
     is_monsterporn_url, is_fetishkitsch_url, is_javhihi_url, is_tokyoporn_url,
@@ -17491,6 +17495,12 @@ process_porntop_request, porntop_quality_callback, porntop_cancel_callback = _ma
     porntop_sessions, "PornTop",
 )
 
+# xHAccess (xHamster mirror - videoModel sources + HLS)
+process_xhaccess_request, xhaccess_quality_callback, xhaccess_cancel_callback = _make_site_handler(
+    "xha", extract_xhaccess_qualities, download_xhaccess_direct, download_xhaccess_m3u8,
+    xhaccess_sessions, "xHAccess",
+)
+
 # Generic yt-dlp fallback (14 sites)
 process_pornone_request, pornone_quality_callback, pornone_cancel_callback = _make_site_handler(
     "pon", extract_pornone_qualities, download_pornone_direct, download_pornone_m3u8,
@@ -17875,6 +17885,7 @@ NEW_SITE_HANDLERS = [
     (is_hdzog_url, process_hdzog_request, "HDzog"),
     (is_drtuber_url, process_drtuber_request, "DrTuber"),
     (is_porntop_url, process_porntop_request, "PornTop"),
+    (is_xhaccess_url, process_xhaccess_request, "xHAccess"),
     (is_pornone_url, process_pornone_request, "PornOne"),
     (is_pornhd_url, process_pornhd_request, "PornHD"),
     (is_xtube_url, process_xtube_request, "xTube"),
@@ -21961,6 +21972,8 @@ async def main():
     client.add_event_handler(drtuber_cancel_callback, events.CallbackQuery(pattern=r"drt_cancel_.+"))
     client.add_event_handler(porntop_quality_callback, events.CallbackQuery(pattern=r"ptp2_q_.+"))
     client.add_event_handler(porntop_cancel_callback, events.CallbackQuery(pattern=r"ptp2_cancel_.+"))
+    client.add_event_handler(xhaccess_quality_callback, events.CallbackQuery(pattern=r"xha_q_.+"))
+    client.add_event_handler(xhaccess_cancel_callback, events.CallbackQuery(pattern=r"xha_cancel_.+"))
     client.add_event_handler(pornone_quality_callback, events.CallbackQuery(pattern=r"pon_q_.+"))
     client.add_event_handler(pornone_cancel_callback, events.CallbackQuery(pattern=r"pon_cancel_.+"))
     client.add_event_handler(pornhd_quality_callback, events.CallbackQuery(pattern=r"phd2_q_.+"))
