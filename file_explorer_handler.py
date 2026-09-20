@@ -380,7 +380,8 @@ def _render_listing(sess: dict):
 
 # ═══════════════════════ نمایش درصد پیشرفت ═══════════════════════
 class _ProgEdit:
-    """progress_callback همگام تلگرام → ادیت دوره‌ای پیام وضعیت."""
+    """progress_callback همگام تلگرام → ادیت دوره‌ای پیام وضعیت.
+    اگه msg صفر (None) باشه (مثلاً پیام پاک شده باشه) فقط بی‌صدا رد میشه."""
 
     def __init__(self, msg, label: str):
         self.msg = msg
@@ -388,6 +389,8 @@ class _ProgEdit:
         self.last_t = 0.0
 
     def cb(self, current: int, total: int):
+        if self.msg is None:
+            return
         now = time.time()
         if now - self.last_t < 3.5:
             return
@@ -404,6 +407,8 @@ class _ProgEdit:
 
     async def _edit(self, text: str):
         try:
+            if self.msg is None:
+                return
             await self.msg.edit(text, parse_mode="html")
         except Exception:
             pass
@@ -558,7 +563,13 @@ async def fe_open_cb(event):
             local_name = _safe_disk_name(fname) or f"archive{os.path.splitext(fname)[1] or '.bin'}"
             local_path = os.path.join(sess_dir, local_name)
 
-            prog = _ProgEdit(event.message, "دانلود")
+            # ⚠️ FIX: روی CallbackQuery.Event ویژگی message وجود نداره —
+            # باید از get_message() استفاده بشه (اگه پیام پاک شده باشه None برمی‌گرده)
+            try:
+                btn_msg = await event.get_message()
+            except Exception:
+                btn_msg = None
+            prog = _ProgEdit(btn_msg, "دانلود")
             try:
                 got = await event.client.download_media(msg, file=local_path, progress_callback=prog.cb)
             except Exception as e:
