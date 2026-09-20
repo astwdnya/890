@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ═══════════════════════════════════════════════════════════════════
-#  File Explorer + Renamer — واکنش به هر داکیومنت با ۲ دکمه شیشه‌ای
+#  File Explorer + Renamer — واکنش به هر داکیومنت با منوی شیشه‌ای
 # ───────────────────────────────────────────────────────────────────
 #  ۱) 🔍 جستجو در فایل:
 #     اگه فایل آرشیو باشه (zip / apk / rar / 7z / tar و ...) محتویاتش
@@ -9,10 +9,26 @@
 #  ۲) ✏️ تغییر نام:
 #     ربات اسم جدید رو می‌پرسه (مثلاً mamad.apk) و همون فایل رو با
 #     اسم جدید برمی‌گردونه (بدون هیچ تغییری توی محتوا).
+#  ۳) ☁️ آپلود به Filebin (https://filebin.net):
+#     فایل رو استریمی و با نوار پیشرفت روی filebin.net آپلود می‌کنه.
+#     هوشمند: پسوندهای بلاک‌شده (exe/apk/msi/dll/scr) مستقیم با پسوند
+#     .zip آپلود میشن (مثلاً mamad.apk → mamad.apk.zip) و اگه سایت هر
+#     پسوند دیگه‌ای رو رد کرد، دوباره با .zip تلاش میشه.
+#     نتیجه سه تا لینک میده: ⚡️ لینک دانلود مستقیم واقعی (URL امضاشده
+#     S3 — ربات قدم تأیید کوکی رو خودکار انجام میده؛ حدود ۱۵ دقیقه
+#     اعتبار داره) + 📄 لینک صفحه فایل + 🗃 لینک صفحه باکس.
+#  ۴) 🎬 آپلود برای پخش در VLC:
+#     فایل رو روی هاستِ «لینک مستقیم» می‌ذاره که لینکش بایت خام میده و
+#     مستقیم تو VLC و بقیه پلیرها پلی میشه (برخلاف Filebin که صفحه
+#     تأیید داره). هوشمند: اگه PIXDRAIN_API_KEY تو .env تنظیم شده باشه
+#     → Pixeldrain (تا ۲۰ گیگ، هر پسوندی، لینک پخش + دانلود + صفحه)؛
+#     وگرنه فایل‌های تا ۱ گیگ → Litterbox (بدون ثبت‌نام، لینک ۷۲ ساعته).
+#     برای فایل بزرگ‌تر بدون کلید، راهنمای ساخت کلید رایگان میده.
 # ═══════════════════════════════════════════════════════════════════
 
 import asyncio
 import html
+import json
 import logging
 import math
 import os
@@ -23,6 +39,7 @@ import tarfile
 import time
 import zipfile
 from typing import Callable, Dict, Optional
+from urllib.parse import quote
 
 from telethon import Button, events
 from telethon.errors import MessageNotModifiedError
@@ -31,6 +48,12 @@ from telethon.tl.types import (
     DocumentAttributeSticker,
     DocumentAttributeVideo,
 )
+
+# aiohttp — برای آپلود به Filebin (تو requirements.txt هست)
+try:
+    import aiohttp  # type: ignore
+except Exception:
+    aiohttp = None
 
 # کتابخانه‌های اختیاری — اگه نصب نباشن فقط فرمت مربوطه غیرفعال میشه
 try:
@@ -70,6 +93,30 @@ PAGE_SIZE = 28                                 # تعداد دکمه در هر �
 MAX_SESSIONS = 6                               # حداکثر آرشیو باز همزمان (محدودیت دیسک)
 MAX_NAME_LEN = 120
 
+# ───────────────────────── Filebin (آپلود ابری) ─────────────────────────
+# API ساده: POST /{bin}/{filename} با بدنه‌ی باینری → 201 Created + JSON
+# پسوندهای بلاک‌شده روی filebin.net (تست تجربی + منطق filebin2):
+#   403 "Illegal file extension" — برای اینا مستقیم با .zip آپلود می‌کنیم
+FILEBIN_BASE = os.environ.get("FILEBIN_BASE", "https://filebin.net").rstrip("/")
+FILEBIN_MAX_BYTES = 4 * 1024 * 1024 * 1024          # 4GB — بیشتر از سقف تلگرام
+FILEBIN_BLOCKED_EXTS = {".exe", ".apk", ".msi", ".dll", ".scr"}
+FILEBIN_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+# ───────── VLC: Pixeldrain / Litterbox (لینک مستقیم قابل پخش) ─────────
+# برخلاف filebin (که برای دانلود صفحه تأیید HTML میده)، لینک این‌ها بایت
+# خام + Accept-Ranges میده و مستقیم تو VLC پلی میشه. تست تجربی:
+#   • litterbox: POST multipart به api.php → لینک https://litter.catbox.moe/xx.ext
+#     (بدون ثبت‌نام، سقف ۱ گیگ، ۷۲ ساعت، Range → 206 ✓)
+#   • pixeldrain: PUT /api/file/{name} با BasicAuth (پسورد = API Key
+#     اکانت رایگان) → سقف ۲۰ گیگ، لینک /api/file/{id} تو VLC پلی میشه
+PIXDRAIN_BASE = os.environ.get("PIXDRAIN_BASE", "https://pixeldrain.com").rstrip("/")
+PIXDRAIN_MAX_BYTES = 20 * 1024 * 1024 * 1024        # 20GB — سقف اکانت رایگان
+LITTERBOX_BASE = os.environ.get("LITTERBOX_BASE", "https://litterbox.catbox.moe").rstrip("/")
+LITTERBOX_MAX_BYTES = 1000 * 1024 * 1024            # ۱ گیگ — سقف بدون ثبت‌نام
+
 # ⚠️ FIX: ReplyInlineMarkup(rows=[]) روی سرور تلگرام نامعتبره و خطای
 # ReplyMarkupInvalidError میده. برای «غیرفعال کردن» دکمه‌های قبلی موقع ادیت
 # باید یه دکمه‌ی no-op معتبر (کلیکش هیچ کاری نمی‌کنه) جایگزین بشه.
@@ -77,6 +124,195 @@ MAX_NAME_LEN = 120
 def _idle_rows(label: str):
     """یه ردیف دکمه no-op معتبر — جایگزین امن برای مارک‌آپ خالی."""
     return [[Button.inline(label, "fexnoop")]]
+
+
+def _menu_rows(chat_id: int, msg_id: int):
+    """منوی اصلی چهاردکمه‌ای هر داکیومنت (جستجو / تغییر نام / Filebin / VLC)."""
+    return [
+        [Button.inline("🔍 جستجو در فایل", f"fexopen_{chat_id}_{msg_id}")],
+        [Button.inline("✏️ تغییر نام", f"fren_{chat_id}_{msg_id}")],
+        [Button.inline("☁️ آپلود به Filebin", f"fbin_{chat_id}_{msg_id}")],
+        [Button.inline("🎬 آپلود برای پخش در VLC", f"fvlc_{chat_id}_{msg_id}")],
+    ]
+
+
+def _filebin_remote_name(name: str) -> str:
+    """اسم فایل برای آپلود به Filebin — فارسی/فاصله مجازه، فقط کنترلی/مسیر تمیز میشه."""
+    name = _sanitize_filename(name) or "file"
+    return name[:180]
+
+
+class _ProgressFilePayload(aiohttp.payload.Payload):
+    """Payload استریمی aiohttp با حجم مشخص (Content-Length درست) + نوار پیشرفت.
+
+    ⚠️ سایت filebin.net آپلود chunked بدون Content-Length رو با 411 رد می‌کنه،
+    پس باید payload دارای size بدیم — جنریتور ساده کافی نیست."""
+
+    def __init__(self, path: str, prog, total: int, chunk_size: int = 512 * 1024, **kwargs):
+        self._file = open(path, "rb")
+        self._path = path
+        self._prog = prog
+        self._total = max(int(total), 1)
+        self._chunk_size = chunk_size
+        self._sent = 0
+        super().__init__(
+            self._file,
+            content_type=kwargs.pop("content_type", "application/octet-stream"),
+        )
+        # ⚠️ aiohttp 3.13+ کیورد size رو تو __init__ نمی‌خونه — مستقیم ست می‌کنیم
+        # تا Content-Length درست ارسال بشه (filebin بدون Content-Length → 411)
+        self._size = os.path.getsize(path)
+
+    def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
+        # payload باینری — نمایش رشته‌ای نداره
+        return ""
+
+    async def write(self, writer):
+        while True:
+            chunk = self._file.read(self._chunk_size)
+            if not chunk:
+                break
+            await writer.write(chunk)
+            self._sent += len(chunk)
+            self._prog.cb(self._sent, self._total)
+
+    async def close(self):
+        if not self._file.closed:
+            self._file.close()
+
+
+async def _filebin_upload(bin_name: str, remote_name: str, local_path: str, prog) -> tuple:
+    """آپلود استریمی یه فایل به Filebin — خروجی: (status_code, body_text).
+
+    bin_name: اسم باکس (تصادفی)، remote_name: اسم فایل روی سایت،
+    prog: نمونه‌ی _ProgEdit برای نوار پیشرفت آپلود."""
+    url = f"{FILEBIN_BASE}/{bin_name}/{quote(remote_name)}"
+    total = os.path.getsize(local_path)
+
+    ctype = "application/zip" if remote_name.lower().endswith(".zip") else "application/octet-stream"
+    headers = {
+        "Accept": "application/json, */*",
+        "User-Agent": FILEBIN_UA,
+    }
+    payload = _ProgressFilePayload(local_path, prog, total, content_type=ctype)
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, data=payload, headers=headers) as resp:
+            try:
+                body = (await resp.text(errors="ignore"))[:400]
+            except Exception:
+                body = ""
+            return resp.status, body
+
+
+async def _filebin_direct_url(bin_name: str, remote_name: str) -> Optional[str]:
+    """لینک دانلود مستقیمِ واقعی (URL امضاشده S3) رو از filebin بیرون می‌کشه.
+
+    filebin.net برای GET بدون کوکی «verified» صفحه HTML برمی‌گردونه (نه فایل!)
+    — طبق مستندات رسمی‌شون، بعد از تأیید، کلاینت به URL امضاشده S3 ریدایرکت
+    میشه که بایت خام + Range میده. ربات این قدم رو خودکار انجام میده:
+      GET اول → صفحه تأیید + Set-Cookie: verified=...
+      GET دوم (همون کوکی) → 302 → Location: URL امضاشده S3 (≈۱۵ دقیقه اعتبار)
+    هر مشکلی پیش بیاد None برمی‌گرده تا لینک ساده صفحه فایل جایگزین بشه."""
+    if aiohttp is None:
+        return None
+    url = f"{FILEBIN_BASE}/{bin_name}/{quote(remote_name)}"
+    headers = {"Accept": "application/json, */*", "User-Agent": FILEBIN_UA}
+    timeout = aiohttp.ClientTimeout(total=90, sock_connect=30, sock_read=30)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # قدم ۱ — گرفتن صفحه تأیید و برداشت دستی کوکی verified
+            # (⚠️ aiohttp کوکی هاست‌های IP رو تو jar ذخیره نمی‌کنه — دستی می‌بریم)
+            async with session.get(url, headers=headers) as r1:
+                await r1.read()
+                if r1.status != 200:
+                    return None
+                set_cookie = r1.headers.get("Set-Cookie", "")
+            cookie_pair = set_cookie.split(";")[0].strip()  # «verified=...»
+            if not cookie_pair or "=" not in cookie_pair:
+                return None
+            # قدم ۲ — با کوکی تأیید: 302 به URL امضاشده S3 (بدون دنبال کردن)
+            headers2 = {**headers, "Cookie": cookie_pair}
+            async with session.get(url, headers=headers2, allow_redirects=False) as r2:
+                if r2.status in (301, 302, 303, 307, 308):
+                    return r2.headers.get("Location") or None
+    except Exception as e:
+        logger.warning(f"[FileExplorer] filebin direct-url probe failed: {e}")
+    return None
+
+
+async def _pixeldrain_upload(remote_name: str, local_path: str, prog, api_key: str) -> dict:
+    """آپلود استریمی به pixeldrain.com — نیاز به API Key اکانت رایگان داره.
+
+    PUT /api/file/{name} با BasicAuth (پسورد = کلید) → JSON {"success":true,"id":...}
+    خروجی: dict با play_url (لینک پخش در VLC) / dl_url / page_url."""
+    url = f"{PIXDRAIN_BASE}/api/file/{quote(remote_name)}"
+    total = os.path.getsize(local_path)
+    headers = {"Accept": "application/json", "User-Agent": FILEBIN_UA}
+    auth = aiohttp.BasicAuth("", api_key)  # طبق مستندات: کلید تو فیلد پسورد
+    payload = _ProgressFilePayload(local_path, prog, total)
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.put(url, data=payload, headers=headers, auth=auth) as resp:
+                body = (await resp.text(errors="ignore"))[:500]
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    data = {}
+                if resp.status == 200 and data.get("success") and data.get("id"):
+                    fid = str(data["id"])
+                    return {
+                        "name": remote_name,
+                        "play_url": f"{PIXDRAIN_BASE}/api/file/{fid}",
+                        "dl_url": f"{PIXDRAIN_BASE}/api/file/{fid}?download",
+                        "page_url": f"{PIXDRAIN_BASE}/u/{fid}",
+                    }
+                if resp.status == 401:
+                    raise _FeError(
+                        "کلید API پیکسل‌درین معتبر نیست — مقدار "
+                        "<code>PIXDRAIN_API_KEY</code> رو تو <code>.env</code> چک کن"
+                    )
+                msg = str(data.get("message") or body[:120])
+                raise _FeError(
+                    f"پیکسل‌درین آپلود رو قبول نکرد (کد {resp.status}):\n<code>{_esc(msg)}</code>"
+                )
+    except _FeError:
+        raise
+    except Exception as e:
+        raise _FeError(f"خطای اتصال به پیکسل‌درین:\n<code>{_esc(str(e)[:120])}</code>")
+
+
+async def _litterbox_upload(remote_name: str, local_path: str, prog) -> dict:
+    """آپلود استریمی به litterbox.catbox.moe — بدون ثبت‌نام (سقف ۱ گیگ، ۷۲ ساعت).
+
+    POST multipart به api.php با فیلدهای reqtype=fileupload / time=72h /
+    fileToUpload → جواب: متن ساده‌ی لینک مستقیم (بایت خام + Range → VLC ✓)
+    خروجی: dict با play_url (همون لینک مستقیم برای پخش و دانلود)."""
+    url = f"{LITTERBOX_BASE}/resources/internals/api.php"
+    total = os.path.getsize(local_path)
+    payload = _ProgressFilePayload(local_path, prog, total)
+    form = aiohttp.FormData()
+    form.add_field("reqtype", "fileupload")
+    form.add_field("time", "72h")
+    form.add_field("fileToUpload", payload, filename=remote_name or "file.bin")
+    headers = {"Accept": "*/*", "User-Agent": FILEBIN_UA}
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, data=form, headers=headers) as resp:
+                body = (await resp.text(errors="ignore")).strip()
+                if resp.status == 200 and body.startswith("http"):
+                    link = body.split()[0][:300]
+                    return {"name": remote_name, "play_url": link, "dl_url": link, "page_url": ""}
+                raise _FeError(
+                    f"Litterbox آپلود رو قبول نکرد (کد {resp.status}):\n"
+                    f"<code>{_esc(body[:120])}</code>"
+                )
+    except _FeError:
+        raise
+    except Exception as e:
+        raise _FeError(f"خطای اتصال به Litterbox:\n<code>{_esc(str(e)[:120])}</code>")
 
 
 async def _safe_edit(event, text: str, rows=None) -> bool:
@@ -451,7 +687,7 @@ async def _session_gc_loop():
 
 # ═══════════════════════ ۱) واکنش به داکیومنت ═══════════════════════
 async def document_receive_handler(event):
-    """هر داکیومنتی که هندلر دیگه‌ای نمی‌گیره → ۲ دکمه شیشه‌ای."""
+    """هر داکیومنتی که هندلر دیگه‌ای نمی‌گیره → منوی شیشه‌ای چهاردکمه‌ای."""
     try:
         doc = event.document
         if doc is None:
@@ -486,10 +722,7 @@ async def document_receive_handler(event):
             return
 
         size = getattr(doc, "size", 0) or 0
-        buttons = [
-            [Button.inline("🔍 جستجو در فایل", f"fexopen_{event.chat_id}_{event.id}")],
-            [Button.inline("✏️ تغییر نام", f"fren_{event.chat_id}_{event.id}")],
-        ]
+        buttons = _menu_rows(event.chat_id, event.id)
         await event.reply(
             f"📎 <b>{_esc(fname)}</b>"
             + (f" ({_fmt_size(size)})" if size else "")
@@ -545,10 +778,7 @@ async def fe_open_cb(event):
             return
 
         _open_inflight.add(inflight_key)
-        retry_buttons = [
-            [Button.inline("🔍 جستجو در فایل", f"fexopen_{chat_id}_{msg_id}")],
-            [Button.inline("✏️ تغییر نام", f"fren_{chat_id}_{msg_id}")],
-        ]
+        retry_buttons = _menu_rows(chat_id, msg_id)
         try:
             # دکمه‌های قبلی با یه دکمه «لطفاً صبر کن» جایگزین بشن که وسط کار
             # دوباره زده نشن (مارک‌آپ خالی روی تلگرام ReplyMarkupInvalid میده)
@@ -1058,6 +1288,340 @@ async def fe_rename_text_handler(event):
     raise events.StopPropagation
 
 
+# ═══════════════════════ ۶) آپلود به Filebin ═══════════════════════
+async def fe_filebin_cb(event):
+    """دکمه ☁️ آپلود به Filebin: fbin_<chat_id>_<msg_id>
+
+    هوشمند:
+    • پسوندهای بلاک‌شده سایت (exe/apk/msi/dll/scr) مستقیم با .zip آپلود میشن
+    • اگه سایت پسوند دیگه‌ای رو رد کرد، یه بار دیگه با پسوند .zip تلاش میشه
+    """
+    chat_id = msg_id = None
+    work_dir = None
+    try:
+        if not _is_authorized(event.sender_id):
+            await event.answer("⛔️ اجازه نداری", alert=True)
+            return
+        if aiohttp is None:
+            await event.answer("⚠️ کتابخانه aiohttp روی سرور نصب نیست", alert=True)
+            return
+        _, chat_s, msg_s = event.data.decode("utf-8", "ignore").split("_", 2)
+        chat_id, msg_id = int(chat_s), int(msg_s)
+
+        # گارد دابل‌کلیک
+        inflight_key = ("fbin", chat_id, msg_id)
+        if inflight_key in _send_inflight:
+            await event.answer("⏳ همین الان داره آپلود میشه...", alert=True)
+            return
+
+        msg = await event.client.get_messages(chat_id, ids=msg_id)
+        doc = msg.document if msg else None
+        if doc is None:
+            await event.answer("⚠️ فایل اصلی پیدا نشد — احتمالاً پاک شده", alert=True)
+            return
+
+        fname = _doc_filename(doc) or f"file_{msg_id}"
+        size = getattr(doc, "size", 0) or 0
+        if size > FILEBIN_MAX_BYTES:
+            await event.answer(
+                f"⚠️ فایل {_fmt_size(size)} هست — از حد مجاز Filebin بزرگ‌تره",
+                alert=True,
+            )
+            return
+
+        _send_inflight.add(inflight_key)
+        try:
+            await event.answer("☁️ شروع آپلود به Filebin...")
+        except Exception:
+            pass
+
+        await _safe_edit(
+            event,
+            f"☁️ در حال دانلود <b>{_esc(fname)}</b> برای آپلود به Filebin...",
+            _idle_rows("⏳ لطفاً صبر کن..."),
+        )
+
+        work_dir = os.path.join(_output_folder, f"fbin_{event.sender_id}_{secrets.token_hex(4)}")
+        os.makedirs(work_dir, exist_ok=True)
+        local_path = os.path.join(work_dir, _safe_disk_name(fname) or "file.bin")
+
+        try:
+            btn_msg = await event.get_message()
+        except Exception:
+            btn_msg = None
+        prog = _ProgEdit(btn_msg, "دانلود")
+        got = await event.client.download_media(msg, file=local_path, progress_callback=prog.cb)
+        if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
+            await _safe_edit(
+                event,
+                "❌ دانلود فایل ناموفق بود — دوباره امتحان کن",
+                _menu_rows(chat_id, msg_id),
+            )
+            return
+
+        remote_name = _filebin_remote_name(fname)
+        ext = os.path.splitext(remote_name)[1].lower()
+        bin_name = secrets.token_hex(4)  # اسم باکس تصادفی
+        prog_up = _ProgEdit(btn_msg, "آپلود")
+
+        # ترتیب تلاش‌ها — منطق هوشمند پسوند:
+        if ext in FILEBIN_BLOCKED_EXTS:
+            # بلاک معلومه → مستقیم با .zip (مثلاً mamad.apk → mamad.apk.zip)
+            attempts = [remote_name + ".zip"]
+        elif remote_name.lower().endswith(".zip"):
+            attempts = [remote_name]
+        else:
+            attempts = [remote_name, remote_name + ".zip"]
+
+        last_status, last_body = 0, ""
+        uploaded = None
+        for i, name in enumerate(attempts):
+            if i > 0:
+                await _safe_edit(
+                    event,
+                    "⚠️ سایت این پسوند رو قبول نکرد — با پسوند <code>.zip</code> دوباره تلاش می‌کنم...",
+                    _idle_rows("⏳ در حال تلاش مجدد..."),
+                )
+            try:
+                status_code, body = await _filebin_upload(bin_name, name, got, prog_up)
+            except Exception as e:
+                # خطای شبکه/تایم‌اوت — با .zip هم حل نمیشه
+                logger.error(f"[FileExplorer] filebin upload network error: {e}", exc_info=True)
+                last_status, last_body = -1, f"{e.__class__.__name__}: {e}"
+                break
+            last_status, last_body = status_code, body
+            logger.info(f"[FileExplorer] filebin upload {name!r} → HTTP {status_code}")
+            if status_code in (200, 201, 202):
+                uploaded = name
+                break
+            if status_code in (429, 413):
+                # محدودیت/حجم — تلاش با .zip بی‌فایده‌ست
+                break
+            # بقیه‌ی خطاهای HTTP (مثل 403 پسوند بلاک) → تلاش بعدی با .zip
+
+        if uploaded:
+            fsize = os.path.getsize(got)
+            bin_url = f"{FILEBIN_BASE}/{bin_name}"
+            file_url = f"{FILEBIN_BASE}/{bin_name}/{quote(uploaded)}"
+            # ⚡️ لینک دانلود مستقیم واقعی: filebin بدون کوکی verified صفحه HTML
+            # برمی‌گردونه — ربات خودش قدم تأیید رو انجام میده و URL امضاشده‌ی
+            # S3 (بایت خام + Range، حدوداً ۱۵ دقیقه اعتبار) رو استخراج می‌کنه
+            s3_url = await _filebin_direct_url(bin_name, uploaded)
+            parts = [
+                "✅ <b>آپلود به Filebin انجام شد!</b>\n\n",
+                f"📄 فایل: <code>{_esc(uploaded)}</code>\n",
+                f"📏 حجم: {_fmt_size(fsize)}\n\n",
+            ]
+            rows = []
+            if s3_url:
+                parts.append("⚡️ لینک دانلود مستقیم (سریع — حدود ۱۵ دقیقه اعتبار داره):\n")
+                parts.append(f"{_esc(s3_url)}\n\n")
+                rows.append([Button.url("⬇️ دانلود مستقیم", s3_url)])
+            parts.append("📄 لینک صفحه فایل (دانلود در مرورگر):\n")
+            parts.append(f"{file_url}\n\n")
+            parts.append("🗃 لینک صفحه باکس:\n")
+            parts.append(f"{bin_url}\n\n")
+            parts.append(
+                "ℹ️ فایل‌های Filebin حدود ۶ روز بعد پاک میشن. "
+                "برای پخش ویدیو تو VLC از دکمه‌ی «آپلود برای پخش در VLC» استفاده کن."
+            )
+            rows.append([Button.url("📄 صفحه فایل", file_url), Button.url("🗃 صفحه باکس", bin_url)])
+            await _safe_edit(event, "".join(parts), rows)
+        else:
+            if last_status == 429:
+                detail = "سایت Filebin فعلاً محدودیت زده (429) — چند دقیقه بعد دوباره امتحان کن"
+            elif last_status == 413:
+                detail = "حجم فایل برای Filebin زیاده (413)"
+            elif last_status == -1:
+                detail = f"خطای اتصال به Filebin:\n<code>{_esc(last_body[:150])}</code>"
+            else:
+                detail = (
+                    f"آپلود انجام نشد (کد {last_status})\n"
+                    f"<code>{_esc(last_body[:150])}</code>"
+                )
+            await _safe_edit(
+                event,
+                f"❌ آپلود به Filebin ناموفق بود.\n{detail}",
+                _menu_rows(chat_id, msg_id),
+            )
+    except Exception as e:
+        logger.error(f"[FileExplorer] filebin cb error: {e}", exc_info=True)
+        try:
+            await event.answer("❌ خطا در آپلود به Filebin", alert=True)
+        except Exception:
+            pass
+    finally:
+        try:
+            _send_inflight.discard(("fbin", chat_id, msg_id))
+        except Exception:
+            pass
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ═══════════════════════ ۴) آپلود برای پخش در VLC ═══════════════════════
+async def fe_vlc_cb(event):
+    """دکمه 🎬 آپلود برای پخش در VLC: fvlc_<chat_id>_<msg_id>
+
+    فایل رو دانلود می‌کنه و روی هاستی می‌ذاره که لینکش بایت خام میده و
+    مستقیم تو VLC پلی میشه (برخلاف filebin که صفحه تأیید داره). هوشمند:
+    • اگه PIXDRAIN_API_KEY تو .env تنظیم شده باشه → Pixeldrain (تا ۲۰ گیگ)
+    • وگرنه برای فایل‌های تا ۱ گیگ → Litterbox (بدون ثبت‌نام، لینک ۷۲ ساعته)
+    • فایل بزرگ‌تر بدون کلید → راهنمای ساخت کلید رایگان Pixeldrain
+    """
+    chat_id = msg_id = None
+    work_dir = None
+    try:
+        if not _is_authorized(event.sender_id):
+            await event.answer("⛔️ اجازه نداری", alert=True)
+            return
+        if aiohttp is None:
+            await event.answer("⚠️ کتابخانه aiohttp روی سرور نصب نیست", alert=True)
+            return
+        _, chat_s, msg_s = event.data.decode("utf-8", "ignore").split("_", 2)
+        chat_id, msg_id = int(chat_s), int(msg_s)
+
+        # گارد دابل‌کلیک
+        inflight_key = ("vlc", chat_id, msg_id)
+        if inflight_key in _send_inflight:
+            await event.answer("⏳ همین الان داره آپلود میشه...", alert=True)
+            return
+        _send_inflight.add(inflight_key)
+
+        msg = await event.client.get_messages(chat_id, ids=msg_id)
+        doc = msg.document if msg else None
+        if doc is None:
+            await event.answer("⚠️ فایل اصلی پیدا نشد — احتمالاً پاک شده", alert=True)
+            return
+
+        fname = _doc_filename(doc) or f"file_{msg_id}"
+        size = getattr(doc, "size", 0) or 0
+
+        # انتخاب هوشمند هاست — کلید پیکسل‌درین اختیاریه (تا ۲۰ گیگ)
+        api_key = (os.environ.get("PIXDRAIN_API_KEY") or "").strip()
+        if api_key:
+            provider = "pixeldrain"
+            if size > PIXDRAIN_MAX_BYTES:
+                await event.answer(
+                    f"⚠️ فایل {_fmt_size(size)} هست — از سقف ۲۰ گیگ پیکسل‌درین بزرگ‌تره",
+                    alert=True,
+                )
+                return
+        elif size <= LITTERBOX_MAX_BYTES:
+            provider = "litterbox"
+        else:
+            # فایل بزرگ بدون کلید → راهنمای ساخت کلید رایگان + برگشت منو
+            try:
+                await event.answer("⚠️ برای فایل بزرگ‌تر از ۱ گیگ کلید Pixeldrain لازمه", alert=True)
+            except Exception:
+                pass
+            await _safe_edit(
+                event,
+                "⚠️ حجم فایل <b>" + _esc(_fmt_size(size)) + "</b> هست و بدون تنظیمات، "
+                "سقف آپلودِ لینکِ قابل‌پخش (VLC) برای فایل‌ها <b>۱ گیگ</b>ه.\n\n"
+                "برای فایل‌های بزرگ‌تر (تا <b>۲۰ گیگ</b>):\n"
+                "۱️⃣ تو سایت pixeldrain.com یه اکانت رایگان بساز\n"
+                "۲️⃣ از بخش تنظیمات اکانت، API Key رو کپی کن\n"
+                "۳️⃣ تو فایل <code>.env</code> ربات این خط رو اضافه کن:\n"
+                "<code>PIXDRAIN_API_KEY=کلید-شما</code>\n"
+                "۴️⃣ ربات رو ری‌استارت کن و دوباره دکمه رو بزن",
+                _menu_rows(chat_id, msg_id),
+            )
+            return
+
+        try:
+            await event.answer("🎬 شروع آماده‌سازی لینک پخش...")
+        except Exception:
+            pass
+
+        prov_fa = "پیکسل‌درین" if provider == "pixeldrain" else "Litterbox"
+        await _safe_edit(
+            event,
+            f"🎬 در حال دانلود <b>{_esc(fname)}</b> برای آپلود به {prov_fa}...",
+            _idle_rows("⏳ لطفاً صبر کن..."),
+        )
+
+        work_dir = os.path.join(_output_folder, f"vlc_{event.sender_id}_{secrets.token_hex(4)}")
+        os.makedirs(work_dir, exist_ok=True)
+        local_path = os.path.join(work_dir, _safe_disk_name(fname) or "file.bin")
+
+        try:
+            btn_msg = await event.get_message()
+        except Exception:
+            btn_msg = None
+        prog = _ProgEdit(btn_msg, "دانلود")
+        got = await event.client.download_media(msg, file=local_path, progress_callback=prog.cb)
+        if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
+            await _safe_edit(
+                event,
+                "❌ دانلود فایل ناموفق بود — دوباره امتحان کن",
+                _menu_rows(chat_id, msg_id),
+            )
+            return
+
+        remote_name = _filebin_remote_name(fname)
+        prog_up = _ProgEdit(btn_msg, "آپلود")
+        if provider == "pixeldrain":
+            res = await _pixeldrain_upload(remote_name, got, prog_up, api_key)
+        else:
+            res = await _litterbox_upload(remote_name, got, prog_up)
+
+        fsize = os.path.getsize(got)
+        vlc_hint = "🎬 پخش تو VLC: Media → Open Network Stream (Ctrl+N) → لینک رو Paste کن"
+        if provider == "pixeldrain":
+            text = (
+                "✅ <b>آپلود به پیکسل‌درین انجام شد!</b>\n\n"
+                f"📄 فایل: <code>{_esc(res['name'])}</code>\n"
+                f"📏 حجم: {_fmt_size(fsize)}\n\n"
+                "▶️ لینک مستقیم پخش در VLC:\n"
+                f"{res['play_url']}\n\n"
+                "⬇️ لینک دانلود مستقیم:\n"
+                f"{res['dl_url']}\n\n"
+                "📄 لینک صفحه:\n"
+                f"{res['page_url']}\n\n"
+                f"{vlc_hint}"
+            )
+            rows = [
+                [Button.url("▶️ پخش در VLC", res["play_url"]), Button.url("⬇️ دانلود", res["dl_url"])],
+                [Button.url("📄 صفحه فایل", res["page_url"])],
+            ]
+        else:
+            text = (
+                "✅ <b>فایل برای پخش آماده شد! (Litterbox)</b>\n\n"
+                f"📄 فایل: <code>{_esc(res['name'])}</code>\n"
+                f"📏 حجم: {_fmt_size(fsize)}\n\n"
+                "▶️ لینک مستقیم پخش در VLC (برای دانلود مستقیم هم همینه):\n"
+                f"{res['play_url']}\n\n"
+                "⏳ اعتبار این لینک: ۷۲ ساعت\n"
+                f"{vlc_hint}"
+            )
+            rows = [
+                [Button.url("▶️ پخش در VLC", res["play_url"]), Button.url("⬇️ دانلود", res["play_url"])],
+            ]
+        await _safe_edit(event, text, rows)
+    except _FeError as e:
+        # خطای دوستانه از آپلودرها — متنش HTML امنه
+        logger.warning(f"[FileExplorer] vlc upload failed: {e}")
+        try:
+            rows = _menu_rows(chat_id, msg_id) if chat_id is not None and msg_id is not None else None
+            await _safe_edit(event, f"❌ {e}", rows)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[FileExplorer] vlc cb error: {e}", exc_info=True)
+        try:
+            await event.answer("❌ خطا در آپلود برای پخش", alert=True)
+        except Exception:
+            pass
+    finally:
+        try:
+            _send_inflight.discard(("vlc", chat_id, msg_id))
+        except Exception:
+            pass
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
 # ═══════════════════════ ثبت هندلرها ═══════════════════════
 def register_file_explorer_handlers(
     client,
@@ -1085,10 +1649,14 @@ def register_file_explorer_handlers(
     client.add_event_handler(fe_up_cb, events.CallbackQuery(pattern=r"^fexup_[0-9a-f]+$"))
     client.add_event_handler(fe_close_cb, events.CallbackQuery(pattern=r"^fexclose_[0-9a-f]+$"))
     client.add_event_handler(fe_noop_cb, events.CallbackQuery(pattern=r"^fexnoop$"))
+    # آپلود به Filebin
+    client.add_event_handler(fe_filebin_cb, events.CallbackQuery(pattern=r"^fbin_-?\d+_\d+$"))
+    # آپلود برای پخش در VLC (Litterbox / Pixeldrain)
+    client.add_event_handler(fe_vlc_cb, events.CallbackQuery(pattern=r"^fvlc_-?\d+_\d+$"))
     # تغییر نام
     client.add_event_handler(fe_rename_cb, events.CallbackQuery(pattern=r"^fren_-?\d+_\d+$"))
     client.add_event_handler(fe_rename_cancel_cb, events.CallbackQuery(pattern=r"^frenc_\d+$"))
     client.add_event_handler(fe_rename_text_handler, events.NewMessage(incoming=True))
 
     asyncio.ensure_future(_session_gc_loop())
-    logger.info("[FileExplorer] handlers registered (zip/apk/tar/7z/rar + rename)")
+    logger.info("[FileExplorer] handlers registered (zip/apk/tar/7z/rar + rename + filebin + vlc)")

@@ -7462,6 +7462,14 @@ async def _flush_video_send_batch(
     # دکمه زیرنویس فقط برای یه فایل منطقی‌تره
     if count == 1:
         buttons.append([Button.inline("🔤 Burn Subtitle", f"subburn_{batch_key}")])
+        # ☁️ آپلود ابری فقط برای فایل تکی — همون هندلرهای file_explorer_handler
+        # (هندلرهای fbin_/fvlc_ خودشون پیام وضعیت + نوار پیشرفت نشون میدن)
+        buttons.append([
+            Button.inline("☁️ آپلود به Filebin", f"fbin_{chat_id}_{files[0]['message_id']}"),
+        ])
+        buttons.append([
+            Button.inline("🎬 آپلود برای پخش در VLC", f"fvlc_{chat_id}_{files[0]['message_id']}"),
+        ])
 
     # دکمه اشتراک‌گذاری با لینک
     buttons.append([Button.inline("🔗 Share Link", f"sharelink_{batch_key}")])
