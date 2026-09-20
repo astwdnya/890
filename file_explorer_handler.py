@@ -30,7 +30,6 @@ from telethon.tl.types import (
     DocumentAttributeAnimated,
     DocumentAttributeSticker,
     DocumentAttributeVideo,
-    ReplyInlineMarkup,
 )
 
 # کتابخانه‌های اختیاری — اگه نصب نباشن فقط فرمت مربوطه غیرفعال میشه
@@ -71,8 +70,33 @@ PAGE_SIZE = 28                                 # تعداد دکمه در هر �
 MAX_SESSIONS = 6                               # حداکثر آرشیو باز همزمان (محدودیت دیسک)
 MAX_NAME_LEN = 120
 
-# برای حذف دکمه‌های قبلی موقع ادیت — چون buttons=None یعنی «دکمه‌ها بمونن»
-_NO_BUTTONS = ReplyInlineMarkup(rows=[])
+# ⚠️ FIX: ReplyInlineMarkup(rows=[]) روی سرور تلگرام نامعتبره و خطای
+# ReplyMarkupInvalidError میده. برای «غیرفعال کردن» دکمه‌های قبلی موقع ادیت
+# باید یه دکمه‌ی no-op معتبر (کلیکش هیچ کاری نمی‌کنه) جایگزین بشه.
+# (buttons=None یعنی دکمه‌های قبلی سر جاشون بمونن)
+def _idle_rows(label: str):
+    """یه ردیف دکمه no-op معتبر — جایگزین امن برای مارک‌آپ خالی."""
+    return [[Button.inline(label, "fexnoop")]]
+
+
+async def _safe_edit(event, text: str, rows=None) -> bool:
+    """ادیت امن پیام — اگه ادیت ممکن نبود (پیام پاک شده، مارک‌آپ رد شده و ...)
+    به‌جاش همون متن رو به‌صورت پیام جدید می‌فرسته که کاربر همیشه UI ببینه."""
+    try:
+        await event.edit(text, buttons=rows, parse_mode="html")
+        return True
+    except MessageNotModifiedError:
+        return True
+    except Exception as e:
+        logger.warning(
+            f"[FileExplorer] edit failed ({e.__class__.__name__}) → send new message instead"
+        )
+        try:
+            await event.respond(text, buttons=rows, parse_mode="html")
+            return True
+        except Exception as e2:
+            logger.error(f"[FileExplorer] fallback send failed: {e2}", exc_info=True)
+            return False
 
 # ───────────────────────── وضعیت سراسری ─────────────────────────
 # sid → اطلاعات سشن مرور آرشیو
@@ -521,15 +545,13 @@ async def fe_open_cb(event):
             [Button.inline("✏️ تغییر نام", f"fren_{chat_id}_{msg_id}")],
         ]
         try:
-            # دکمه‌های قبلی پاک بشن که وسط کار دوباره زده نشن
-            try:
-                await event.edit(
-                    "⏳ در حال دانلود فایل برای بررسی...",
-                    buttons=_NO_BUTTONS,
-                    parse_mode="html",
-                )
-            except MessageNotModifiedError:
-                pass
+            # دکمه‌های قبلی با یه دکمه «لطفاً صبر کن» جایگزین بشن که وسط کار
+            # دوباره زده نشن (مارک‌آپ خالی روی تلگرام ReplyMarkupInvalid میده)
+            await _safe_edit(
+                event,
+                "⏳ در حال دانلود فایل برای بررسی...",
+                _idle_rows("⏳ لطفاً صبر کن..."),
+            )
 
             sess_dir = os.path.join(_output_folder, f"fex_{secrets.token_hex(4)}_{int(time.time())}")
             os.makedirs(sess_dir, exist_ok=True)
@@ -542,34 +564,31 @@ async def fe_open_cb(event):
             except Exception as e:
                 logger.error(f"[FileExplorer] archive download failed: {e}", exc_info=True)
                 shutil.rmtree(sess_dir, ignore_errors=True)
-                await event.edit(
+                await _safe_edit(
+                    event,
                     "❌ دانلود فایل ناموفق بود — دوباره امتحان کن",
-                    buttons=retry_buttons,
-                    parse_mode="html",
+                    retry_buttons,
                 )
                 return
 
             if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
                 shutil.rmtree(sess_dir, ignore_errors=True)
-                await event.edit(
+                await _safe_edit(
+                    event,
                     "❌ فایل دانلود نشد — دوباره امتحان کن",
-                    buttons=retry_buttons,
-                    parse_mode="html",
+                    retry_buttons,
                 )
                 return
 
-            try:
-                await event.edit("📂 در حال باز کردن آرشیو...", parse_mode="html")
-            except MessageNotModifiedError:
-                pass
+            await _safe_edit(event, "📂 در حال باز کردن آرشیو...")
 
             tree, count, err = await asyncio.to_thread(_build_archive_tree, got, kind)
             if err or tree is None:
                 shutil.rmtree(sess_dir, ignore_errors=True)
-                await event.edit(
+                await _safe_edit(
+                    event,
                     f"❌ باز کردن آرشیو ناموفق بود:\n<code>{_esc(err or 'unknown')}</code>",
-                    buttons=retry_buttons,
-                    parse_mode="html",
+                    retry_buttons,
                 )
                 return
         finally:
@@ -599,7 +618,7 @@ async def fe_open_cb(event):
             "last_access": time.time(),
         }
         text, rows = _render_listing(fex_sessions[sid])
-        await event.edit(text, buttons=rows, parse_mode="html")
+        await _safe_edit(event, text, rows)
     except MessageNotModifiedError:
         pass
     except Exception as e:
@@ -631,7 +650,7 @@ async def fe_nav_cb(event):
         sess["cwd"] = f"{sess['cwd']}/{name}" if sess["cwd"] else name
         sess["page"] = 0
         text, rows = _render_listing(sess)
-        await event.edit(text, buttons=rows, parse_mode="html")
+        await _safe_edit(event, text, rows)
         await event.answer()
     except MessageNotModifiedError:
         pass
@@ -661,7 +680,7 @@ async def fe_up_cb(event):
             sess["cwd"] = ""
         sess["page"] = 0
         text, rows = _render_listing(sess)
-        await event.edit(text, buttons=rows, parse_mode="html")
+        await _safe_edit(event, text, rows)
         await event.answer()
     except MessageNotModifiedError:
         pass
@@ -690,7 +709,7 @@ async def fe_page_cb(event):
         except Exception:
             sess["page"] = 0
         text, rows = _render_listing(sess)
-        await event.edit(text, buttons=rows, parse_mode="html")
+        await _safe_edit(event, text, rows)
         await event.answer()
     except MessageNotModifiedError:
         pass
@@ -717,14 +736,11 @@ async def fe_close_cb(event):
             await event.answer("⛔️ اجازه نداری", alert=True)
             return
         _cleanup_session(sid)
-        try:
-            await event.edit(
-                "🔒 بسته شد — برای شروع دوباره، فایل رو بفرست",
-                buttons=_NO_BUTTONS,
-                parse_mode="html",
-            )
-        except MessageNotModifiedError:
-            pass
+        await _safe_edit(
+            event,
+            "🔒 بسته شد — برای شروع دوباره، فایل رو بفرست",
+            _idle_rows("🔒 بسته شد"),
+        )
         await event.answer()
     except Exception as e:
         logger.error(f"[FileExplorer] close error: {e}", exc_info=True)
@@ -906,16 +922,13 @@ async def fe_rename_cb(event):
             "file_name": fname,
             "created": time.time(),
         }
-        try:
-            await event.edit(
-                f"✏️ فایل: <b>{_esc(fname)}</b>\n\n"
-                "چه اسمی میخوای براش بزاری؟ اسم کامل همراه پسوند رو بفرست.\n"
-                "مثلاً: <code>mamad.apk</code>",
-                buttons=[[Button.inline("❌ لغو", f"frenc_{event.sender_id}")]],
-                parse_mode="html",
-            )
-        except MessageNotModifiedError:
-            pass
+        await _safe_edit(
+            event,
+            f"✏️ فایل: <b>{_esc(fname)}</b>\n\n"
+            "چه اسمی میخوای براش بزاری؟ اسم کامل همراه پسوند رو بفرست.\n"
+            "مثلاً: <code>mamad.apk</code>",
+            [[Button.inline("❌ لغو", f"frenc_{event.sender_id}")]],
+        )
         await event.answer()
     except Exception as e:
         logger.error(f"[FileExplorer] rename cb error: {e}", exc_info=True)
@@ -933,10 +946,7 @@ async def fe_rename_cancel_cb(event):
             await event.answer("⛔️ این عملیات مال تو نیست", alert=True)
             return
         frename_pending.pop(uid, None)
-        try:
-            await event.edit("❌ تغییر نام لغو شد", buttons=_NO_BUTTONS, parse_mode="html")
-        except MessageNotModifiedError:
-            pass
+        await _safe_edit(event, "❌ تغییر نام لغو شد", _idle_rows("❌ لغو شد"))
         await event.answer()
     except Exception as e:
         logger.error(f"[FileExplorer] rename cancel error: {e}", exc_info=True)
