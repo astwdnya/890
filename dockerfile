@@ -25,6 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4 \
     libbrotli1 \
     libzstd1 \
+    # ─── پشتیبانی فایل‌های RAR برای File Explorer (backend کتابخانه rarfile) ───
+    unar \
     && rm -rf /var/lib/apt/lists/*
 
 # تنظیمات محیطی
@@ -48,6 +50,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # کپی کد ربات
 COPY bot.py .
+COPY file_explorer_handler.py .
 COPY FastTelethon.py .
 COPY github.py .
 COPY savep_handler.py .

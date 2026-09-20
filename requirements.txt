@@ -22,3 +22,7 @@ python-bidi>=0.4.2
 requests>=2.31.0
 # ─── وابستگی‌های ترجمه کامیک PDF به فارسی (comic_translate_handler) ───
 PyMuPDF>=1.24.0
+
+# ─── File Explorer (باز کردن آرشیو zip/rar/7z داخل ربات) ───
+py7zr>=0.21.0
+rarfile>=4.2

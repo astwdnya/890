@@ -49,6 +49,8 @@ from github import (
     GITHUB_BASE_DIR,
 )
 from savep_handler import process_savep_request, trigger_savep_cancel
+# File Explorer + Rename — واکنش به داکیومنت‌ها (zip/apk/rar/7z/...) با ۲ دکمه شیشه‌ای
+from file_explorer_handler import register_file_explorer_handlers
 # YouTube direct download (InnerTube ANDROID_VR + cobalt fallback — RE'd)
 from yt_direct_handler import (
     is_youtube_url as is_ytdirect_url,
@@ -22081,6 +22083,34 @@ async def main():
     )
     client.add_event_handler(snapwc_captcha_handler, events.NewMessage(incoming=True))
     client.add_event_handler(generic_url_handler, events.NewMessage(incoming=True))
+
+    # ─── File Explorer + Rename: واکنش به هر داکیومنت (zip/apk/rar/...) با ۲ دکمه ───
+    def _filex_skip_check(ev):
+        # اگه سشن burn زیرنویس برای این چت فعاله و فایل زیرنویسه → هندلر خودش بگیره
+        try:
+            if ev.chat_id in subtitle_sessions:
+                d = ev.document
+                nm = ""
+                if d is not None:
+                    for attr in getattr(d, "attributes", []):
+                        fn = getattr(attr, "file_name", None)
+                        if fn:
+                            nm = fn
+                            break
+                if os.path.splitext(nm)[1].lower() in (
+                    ".srt", ".ass", ".ssa", ".vtt", ".sub"
+                ):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    register_file_explorer_handlers(
+        client,
+        skip_check=_filex_skip_check,
+        is_authorized=lambda uid: uid in AUTHORIZED_USERS,
+        output_folder=OUTPUT_FOLDER,
+    )
 
     # Inline search handler
     client.add_event_handler(xnxx_inline_handler, events.InlineQuery())
