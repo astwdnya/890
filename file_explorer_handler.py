@@ -17,13 +17,17 @@
 #     نتیجه سه تا لینک میده: ⚡️ لینک دانلود مستقیم واقعی (URL امضاشده
 #     S3 — ربات قدم تأیید کوکی رو خودکار انجام میده؛ حدود ۱۵ دقیقه
 #     اعتبار داره) + 📄 لینک صفحه فایل + 🗃 لینک صفحه باکس.
-#  ۴) 🎬 آپلود برای پخش در VLC:
+# ۴) 🎬 آپلود برای پخش در VLC:
 #     فایل رو روی هاستِ «لینک مستقیم» می‌ذاره که لینکش بایت خام میده و
 #     مستقیم تو VLC و بقیه پلیرها پلی میشه (برخلاف Filebin که صفحه
 #     تأیید داره). هوشمند: اگه PIXDRAIN_API_KEY تو .env تنظیم شده باشه
 #     → Pixeldrain (تا ۲۰ گیگ، هر پسوندی، لینک پخش + دانلود + صفحه)؛
 #     وگرنه فایل‌های تا ۱ گیگ → Litterbox (بدون ثبت‌نام، لینک ۷۲ ساعته).
 #     برای فایل بزرگ‌تر بدون کلید، راهنمای ساخت کلید رایگان میده.
+#  ۵) ❌ لغو (در همه مراحل):
+#     منوی اصلی دکمه «بستن» داره؛ آپلودهای Filebin/VLC و عملیات تغییر نام
+#     هم موقع دانلود/آپلود دکمه «لغو» دارن که همون لحظه عملیات رو قطع
+#     می‌کنه و فایل‌های موقت رو پاک می‌کنه.
 # ═══════════════════════════════════════════════════════════════════
 
 import asyncio
@@ -127,13 +131,57 @@ def _idle_rows(label: str):
 
 
 def _menu_rows(chat_id: int, msg_id: int):
-    """منوی اصلی چهاردکمه‌ای هر داکیومنت (جستجو / تغییر نام / Filebin / VLC)."""
+    """منوی اصلی هر داکیومنت (جستجو / تغییر نام / Filebin / VLC / بستن)."""
     return [
         [Button.inline("🔍 جستجو در فایل", f"fexopen_{chat_id}_{msg_id}")],
         [Button.inline("✏️ تغییر نام", f"fren_{chat_id}_{msg_id}")],
         [Button.inline("☁️ آپلود به Filebin", f"fbin_{chat_id}_{msg_id}")],
         [Button.inline("🎬 آپلود برای پخش در VLC", f"fvlc_{chat_id}_{msg_id}")],
+        [Button.inline("❌ بستن", f"fexdism_{chat_id}_{msg_id}")],
     ]
+
+
+# ───────────── 🆕 زیرساخت لغو (دکمه ❌ لغو در همه مراحل) ─────────────
+# هر عملیات (آپلود Filebin/VLC، تغییر نام) یه توکن یکتا می‌گیره؛ دکمه‌ی
+# «لغو» اون توکن رو تو این ست ثبت می‌کنه و حلقه‌ی دانلود/آپلود تو اولین
+# چانک بعدی با _UploadAborted می‌ایسته. توکن‌ها موقع پایان عملیات پاک می‌شن.
+_ABORT_FLAGS: set = set()
+# 🆕 تسک‌های آپلود جاری (توکن → تسک) — دکمه لغو با کنسل کردنِ تسک، آپلود
+# aiohttp رو قطع می‌کنه (مسیر استاندارد لغو؛ raise از داخل payload باعث
+# هنگ می‌شه، برای همین آپلود با کنسل-تسک قطع میشه)
+_UPLOADER_TASKS: dict = {}
+
+
+class _UploadAborted(BaseException):
+    """سیگنال داخلی: کاربر دکمه ❌ لغو رو زده.
+
+    ⚠️ عمداً از BaseException ارث می‌بره تا توسط except Exception های
+    میانی (مثل مدیریت خطای شبکه‌ی آپلودر) بلعیده نشه."""
+
+
+async def _run_upload_with_abort(token: str, coro):
+    """🆕 آپلود رو به‌صورت تسکِ جدا اجرا می‌کنه تا دکمه ❌ لغو بتونه قطعش کنه.
+
+    اگه پرچم لغو ست شده باشه و تسک کنسل بشه → _UploadAborted؛ اگه کنسل
+    شدنِ بیرونی بود (مثل خاموشی ربات) → CancelledError دوباره raise میشه."""
+    # اگه لغو قبل از شروع آپلود (مثلاً وسط دانلود) زده شده بود
+    if token in _ABORT_FLAGS:
+        raise _UploadAborted()
+    task = asyncio.ensure_future(coro)
+    _UPLOADER_TASKS[token] = task
+    try:
+        return await task
+    except asyncio.CancelledError:
+        if token in _ABORT_FLAGS:
+            raise _UploadAborted() from None
+        raise
+    finally:
+        _UPLOADER_TASKS.pop(token, None)
+
+
+def _abort_rows(token: str):
+    """ردیف دکمه‌ی لغو برای پیام‌های پیشرفت دانلود/آپلود."""
+    return [[Button.inline("❌ لغو", f"fexab_{token}")]]
 
 
 def _filebin_remote_name(name: str) -> str:
@@ -617,14 +665,22 @@ def _render_listing(sess: dict):
 # ═══════════════════════ نمایش درصد پیشرفت ═══════════════════════
 class _ProgEdit:
     """progress_callback همگام تلگرام → ادیت دوره‌ای پیام وضعیت.
-    اگه msg صفر (None) باشه (مثلاً پیام پاک شده باشه) فقط بی‌صدا رد میشه."""
+    اگه msg صفر (None) باشه (مثلاً پیام پاک شده باشه) فقط بی‌صدا رد میشه.
 
-    def __init__(self, msg, label: str):
+    🆕 اگه abort_token داده بشه، با زدن دکمه «لغو» (ثبت توکن تو
+    _ABORT_FLAGS) از همون فراخوانی بعدیِ cb عملیات با _UploadAborted قطع
+    میشه — بدون تأخیرِ محدودیت ۳.۵ ثانیه‌ای ادیت."""
+
+    def __init__(self, msg, label: str, abort_token: Optional[str] = None):
         self.msg = msg
         self.label = label
         self.last_t = 0.0
+        self.abort_token = abort_token
 
     def cb(self, current: int, total: int):
+        # 🆕 چک لغو — قبل از هر چیز و بدون تrottle تا فوری قطع بشه
+        if self.abort_token and self.abort_token in _ABORT_FLAGS:
+            raise _UploadAborted()
         if self.msg is None:
             return
         now = time.time()
@@ -1197,6 +1253,56 @@ async def fe_rename_cancel_cb(event):
             pass
 
 
+async def fe_dismiss_cb(event):
+    """🆕 دکمه ❌ بستن منوی اصلی: fexdism_<chat_id>_<msg_id>
+
+    پیام منو رو کامل پاک می‌کنه (فایل اصلی دست‌نخورده می‌مونه)."""
+    try:
+        if not _is_authorized(event.sender_id):
+            await event.answer("⛔️ اجازه نداری", alert=True)
+            return
+        try:
+            await event.answer()
+        except Exception:
+            pass
+        try:
+            await event.delete()
+        except Exception:
+            # اگه پاک کردن نشد (مثلاً پیام قدیمی شده)، خالی‌ش کن
+            await _safe_edit(event, "❌ بسته شد", _idle_rows("❌ بسته شد"))
+    except Exception as e:
+        logger.error(f"[FileExplorer] dismiss error: {e}", exc_info=True)
+
+
+async def fe_abort_cb(event):
+    """🆕 دکمه ❌ لغو وسط عملیات (آپلود Filebin/VLC، تغییر نام): fexab_<token>
+
+    فقط توکن رو تو _ABORT_FLAGS ثبت می‌کنه؛ حلقه‌ی دانلود/آپلود تو اولین
+    فراخوانی بعدیِ progress_callback با _UploadAborted می‌ایسته و پیام
+    «لغو شد» + منو نمایش داده میشه."""
+    try:
+        if not _is_authorized(event.sender_id):
+            await event.answer("⛔️ اجازه نداری", alert=True)
+            return
+        token = event.data.decode("utf-8", "ignore").split("_", 1)[1]
+        if not token:
+            await event.answer("❌ توکن نامعتبر", alert=True)
+            return
+        _ABORT_FLAGS.add(token)
+        # 🆕 اگه آپلودی در جریانه، تسکش رو همون لحظه کنسل کن (aiohttp مسیر
+        # استاندارد لغو رو تمیز می‌کنه)؛ دانلود تلگرام با پرچم تو cb قطع میشه
+        t = _UPLOADER_TASKS.get(token)
+        if t and not t.done():
+            t.cancel()
+        await event.answer("🚫 در حال لغو... چند لحظه صبر کن", alert=False)
+    except Exception as e:
+        logger.error(f"[FileExplorer] abort cb error: {e}", exc_info=True)
+        try:
+            await event.answer("❌ خطا", alert=True)
+        except Exception:
+            pass
+
+
 async def fe_rename_text_handler(event):
     """دریافت اسم جدید از کاربر و ارسال فایل با اسم جدید."""
     st = frename_pending.get(event.sender_id)
@@ -1229,10 +1335,15 @@ async def fe_rename_text_handler(event):
 
     work_dir = os.path.join(_output_folder, f"fren_{event.sender_id}_{secrets.token_hex(4)}")
     status = None
+    # 🆕 توکن لغو — دکمه «❌ لغو» روی پیام وضعیت می‌شینه و وسط دانلود/ارسال
+    # عملیات رو قطع می‌کنه
+    abort_token = secrets.token_hex(6)
     try:
         client = event.client
         status = await event.reply(
-            f"⏳ در حال آماده‌سازی <b>{_esc(new_name)}</b>...", parse_mode="html"
+            f"⏳ در حال آماده‌سازی <b>{_esc(new_name)}</b>...",
+            parse_mode="html",
+            buttons=_abort_rows(abort_token),
         )
         msg = await client.get_messages(st["chat_id"], ids=st["msg_id"])
         if msg is None or msg.document is None:
@@ -1248,7 +1359,7 @@ async def fe_rename_text_handler(event):
         os.makedirs(work_dir, exist_ok=True)
         tmp_path = os.path.join(work_dir, _safe_disk_name(old_name) or "file.bin")
 
-        prog = _ProgEdit(status, "دانلود")
+        prog = _ProgEdit(status, "دانلود", abort_token=abort_token)
         got = await client.download_media(msg, file=tmp_path, progress_callback=prog.cb)
         if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
             await status.edit("❌ دانلود فایل ناموفق بود — دوباره امتحان کن", parse_mode="html")
@@ -1263,19 +1374,39 @@ async def fe_rename_text_handler(event):
         except MessageNotModifiedError:
             pass
 
+        # 🆕 progress_callback برای ارسال — هم درصد پیشرفت میده هم نقطه‌ی لغو
+        prog_up = _ProgEdit(status, "ارسال", abort_token=abort_token)
         await client.send_file(
             st["chat_id"],
             final_path,
             force_document=True,
             caption=f"✏️ <b>{_esc(old_name)}</b> ← <b>{_esc(new_name)}</b>",
             parse_mode="html",
+            progress_callback=prog_up.cb,
         )
         try:
-            await status.edit(f"✅ فایل با اسم جدید ارسال شد: <code>{_esc(new_name)}</code>", parse_mode="html")
+            await status.edit(
+                f"✅ فایل با اسم جدید ارسال شد: <code>{_esc(new_name)}</code>",
+                parse_mode="html",
+                buttons=None,
+            )
         except Exception:
             pass
     except events.StopPropagation:
         raise
+    except _UploadAborted:
+        # 🆕 کاربر دکمه لغو رو زده
+        logger.info("[FileExplorer] rename cancelled by user mid-operation")
+        if status:
+            try:
+                await status.edit(
+                    "❌ تغییر نام لغو شد.",
+                    parse_mode="html",
+                    buttons=None,
+                )
+            except Exception:
+                pass
+        raise events.StopPropagation
     except Exception as e:
         logger.error(f"[FileExplorer] rename error: {e}", exc_info=True)
         if status:
@@ -1285,6 +1416,11 @@ async def fe_rename_text_handler(event):
                 pass
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+        # 🆕 پاکسازی پرچم لغو
+        try:
+            _ABORT_FLAGS.discard(abort_token)
+        except Exception:
+            pass
     raise events.StopPropagation
 
 
@@ -1298,6 +1434,7 @@ async def fe_filebin_cb(event):
     """
     chat_id = msg_id = None
     work_dir = None
+    abort_token = None
     try:
         if not _is_authorized(event.sender_id):
             await event.answer("⛔️ اجازه نداری", alert=True)
@@ -1335,10 +1472,13 @@ async def fe_filebin_cb(event):
         except Exception:
             pass
 
+        # 🆕 توکن یکتا برای دکمه لغو این عملیات
+        abort_token = secrets.token_hex(6)
+
         await _safe_edit(
             event,
             f"☁️ در حال دانلود <b>{_esc(fname)}</b> برای آپلود به Filebin...",
-            _idle_rows("⏳ لطفاً صبر کن..."),
+            _abort_rows(abort_token),
         )
 
         work_dir = os.path.join(_output_folder, f"fbin_{event.sender_id}_{secrets.token_hex(4)}")
@@ -1349,7 +1489,7 @@ async def fe_filebin_cb(event):
             btn_msg = await event.get_message()
         except Exception:
             btn_msg = None
-        prog = _ProgEdit(btn_msg, "دانلود")
+        prog = _ProgEdit(btn_msg, "دانلود", abort_token=abort_token)
         got = await event.client.download_media(msg, file=local_path, progress_callback=prog.cb)
         if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
             await _safe_edit(
@@ -1362,6 +1502,8 @@ async def fe_filebin_cb(event):
         remote_name = _filebin_remote_name(fname)
         ext = os.path.splitext(remote_name)[1].lower()
         bin_name = secrets.token_hex(4)  # اسم باکس تصادفی
+        # ⚠️ آپلود بدون توکن‌ریز در cb — لغوِ آپلود aiohttp با کنسلِ تسک انجام
+        # میشه (raise از داخل payload باعث هنگ می‌شه)
         prog_up = _ProgEdit(btn_msg, "آپلود")
 
         # ترتیب تلاش‌ها — منطق هوشمند پسوند:
@@ -1380,11 +1522,18 @@ async def fe_filebin_cb(event):
                 await _safe_edit(
                     event,
                     "⚠️ سایت این پسوند رو قبول نکرد — با پسوند <code>.zip</code> دوباره تلاش می‌کنم...",
-                    _idle_rows("⏳ در حال تلاش مجدد..."),
+                    _abort_rows(abort_token),
                 )
             try:
-                status_code, body = await _filebin_upload(bin_name, name, got, prog_up)
+                status_code, body = await _run_upload_with_abort(
+                    abort_token, _filebin_upload(bin_name, name, got, prog_up)
+                )
+            except _UploadAborted:
+                raise  # 🆕 کاربر لغو کرده — مستقیم برو به هندلر لغو
             except Exception as e:
+                # 🆕 ممکنه خطا در واقع لغو باشه (چانک وسط آپلود قطع شده)
+                if abort_token in _ABORT_FLAGS:
+                    raise _UploadAborted() from None
                 # خطای شبکه/تایم‌اوت — با .zip هم حل نمیشه
                 logger.error(f"[FileExplorer] filebin upload network error: {e}", exc_info=True)
                 last_status, last_body = -1, f"{e.__class__.__name__}: {e}"
@@ -1444,6 +1593,14 @@ async def fe_filebin_cb(event):
                 f"❌ آپلود به Filebin ناموفق بود.\n{detail}",
                 _menu_rows(chat_id, msg_id),
             )
+    except _UploadAborted:
+        # 🆕 کاربر دکمه لغو رو زده — پیام لغو + برگشت منو
+        logger.info("[FileExplorer] filebin upload cancelled by user")
+        try:
+            rows = _menu_rows(chat_id, msg_id) if chat_id is not None and msg_id is not None else None
+            await _safe_edit(event, "❌ آپلود به Filebin لغو شد.", rows)
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"[FileExplorer] filebin cb error: {e}", exc_info=True)
         try:
@@ -1453,6 +1610,12 @@ async def fe_filebin_cb(event):
     finally:
         try:
             _send_inflight.discard(("fbin", chat_id, msg_id))
+        except Exception:
+            pass
+        # 🆕 پاکسازی پرچم لغو این عملیات
+        try:
+            if abort_token:
+                _ABORT_FLAGS.discard(abort_token)
         except Exception:
             pass
         if work_dir:
@@ -1471,6 +1634,7 @@ async def fe_vlc_cb(event):
     """
     chat_id = msg_id = None
     work_dir = None
+    abort_token = None
     try:
         if not _is_authorized(event.sender_id):
             await event.answer("⛔️ اجازه نداری", alert=True)
@@ -1535,10 +1699,14 @@ async def fe_vlc_cb(event):
             pass
 
         prov_fa = "پیکسل‌درین" if provider == "pixeldrain" else "Litterbox"
+
+        # 🆕 توکن یکتا برای دکمه لغو این عملیات
+        abort_token = secrets.token_hex(6)
+
         await _safe_edit(
             event,
             f"🎬 در حال دانلود <b>{_esc(fname)}</b> برای آپلود به {prov_fa}...",
-            _idle_rows("⏳ لطفاً صبر کن..."),
+            _abort_rows(abort_token),
         )
 
         work_dir = os.path.join(_output_folder, f"vlc_{event.sender_id}_{secrets.token_hex(4)}")
@@ -1549,7 +1717,7 @@ async def fe_vlc_cb(event):
             btn_msg = await event.get_message()
         except Exception:
             btn_msg = None
-        prog = _ProgEdit(btn_msg, "دانلود")
+        prog = _ProgEdit(btn_msg, "دانلود", abort_token=abort_token)
         got = await event.client.download_media(msg, file=local_path, progress_callback=prog.cb)
         if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
             await _safe_edit(
@@ -1560,11 +1728,16 @@ async def fe_vlc_cb(event):
             return
 
         remote_name = _filebin_remote_name(fname)
+        # ⚠️ آپلود بدون توکن‌ریز در cb — لغو با کنسلِ تسک (بخش Filebin)
         prog_up = _ProgEdit(btn_msg, "آپلود")
         if provider == "pixeldrain":
-            res = await _pixeldrain_upload(remote_name, got, prog_up, api_key)
+            res = await _run_upload_with_abort(
+                abort_token, _pixeldrain_upload(remote_name, got, prog_up, api_key)
+            )
         else:
-            res = await _litterbox_upload(remote_name, got, prog_up)
+            res = await _run_upload_with_abort(
+                abort_token, _litterbox_upload(remote_name, got, prog_up)
+            )
 
         fsize = os.path.getsize(got)
         vlc_hint = "🎬 پخش تو VLC: Media → Open Network Stream (Ctrl+N) → لینک رو Paste کن"
@@ -1599,6 +1772,14 @@ async def fe_vlc_cb(event):
                 [Button.url("▶️ پخش در VLC", res["play_url"]), Button.url("⬇️ دانلود", res["play_url"])],
             ]
         await _safe_edit(event, text, rows)
+    except _UploadAborted:
+        # 🆕 کاربر دکمه لغو رو زده — پیام لغو + برگشت منو
+        logger.info("[FileExplorer] vlc upload cancelled by user")
+        try:
+            rows = _menu_rows(chat_id, msg_id) if chat_id is not None and msg_id is not None else None
+            await _safe_edit(event, "❌ آپلود لغو شد.", rows)
+        except Exception:
+            pass
     except _FeError as e:
         # خطای دوستانه از آپلودرها — متنش HTML امنه
         logger.warning(f"[FileExplorer] vlc upload failed: {e}")
@@ -1616,6 +1797,12 @@ async def fe_vlc_cb(event):
     finally:
         try:
             _send_inflight.discard(("vlc", chat_id, msg_id))
+        except Exception:
+            pass
+        # 🆕 پاکسازی پرچم لغو این عملیات
+        try:
+            if abort_token:
+                _ABORT_FLAGS.discard(abort_token)
         except Exception:
             pass
         if work_dir:
@@ -1657,6 +1844,9 @@ def register_file_explorer_handlers(
     client.add_event_handler(fe_rename_cb, events.CallbackQuery(pattern=r"^fren_-?\d+_\d+$"))
     client.add_event_handler(fe_rename_cancel_cb, events.CallbackQuery(pattern=r"^frenc_\d+$"))
     client.add_event_handler(fe_rename_text_handler, events.NewMessage(incoming=True))
+    # 🆕 بستن منوی اصلی + لغو عملیات‌ها
+    client.add_event_handler(fe_dismiss_cb, events.CallbackQuery(pattern=r"^fexdism_-?\d+_\d+$"))
+    client.add_event_handler(fe_abort_cb, events.CallbackQuery(pattern=r"^fexab_[0-9a-f]+$"))
 
     asyncio.ensure_future(_session_gc_loop())
-    logger.info("[FileExplorer] handlers registered (zip/apk/tar/7z/rar + rename + filebin + vlc)")
+    logger.info("[FileExplorer] handlers registered (zip/apk/tar/7z/rar + rename + filebin + vlc + cancel)")

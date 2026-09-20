@@ -686,6 +686,59 @@ video_github_pending: Dict[str, Dict] = {}
 video_send_pending: Dict[str, Dict] = {}
 # تسک‌های تایمر batch ویدیو
 video_send_timers: Dict[str, asyncio.Task] = {}
+# 🆕 batch فعال هر چت (chat_id → batch_key) — بعد از flush آزاد میشه تا
+# ویدیوی بعدی «بچِ تازه» بگیره نه اینکه به بچ قدیمی اضافه بشه
+video_send_active: Dict[int, str] = {}
+# 🆕 لغو عملیات‌های ویدیویی (vsend/uplod): batch_key → True
+video_cancel_flags: Dict[str, bool] = {}
+# 🆕 تسک دانلود جاری هر batch — برای کنسل کردن لحظه‌ای با دکمه لغو
+video_cancel_tasks: Dict[str, asyncio.Task] = {}
+
+
+class _VideoOpCancelled(BaseException):
+    """سیگنال داخلی: عملیات ویدیو توسط کاربر لغو شد.
+
+    ⚠️ عمداً از BaseException ارث می‌بره تا توسط except Exception های
+    میانی بلعیده نشه و فقط هندلر اصلی بگیرتش."""
+
+
+def _vcancel_rows(batch_key: str):
+    """ردیف دکمه‌ی لغو برای عملیات‌های چندمرحله‌ای ویدیو (vsend/uplod)."""
+    return [[Button.inline("❌ Cancel", f"vopcancel_{batch_key}")]]
+
+
+def _prune_video_batches(max_age: float = 7200.0, max_entries: int = 60):
+    """پاکسازی بچ‌های قدیمی از حافظه (بعد از اتمام کار دکمه‌هاشون).
+
+    ورودی‌های قدیمی‌تر از ۲ ساعت و اگه از ۶۰ تا بیشتر شد، قدیمی‌ترین‌ها
+    حذف میشن تا حافظه نشت نکنه (با کلیدهای یکتا، هر بچ یه ورودیه)."""
+    now = time.time()
+
+    def _drop(key: str):
+        video_send_pending.pop(key, None)
+        video_cancel_flags.pop(key, None)
+        t = video_cancel_tasks.pop(key, None)
+        if t and not t.done():
+            t.cancel()
+        tmr = video_send_timers.pop(key, None)
+        if tmr and not tmr.done():
+            tmr.cancel()
+        for cid, k in list(video_send_active.items()):
+            if k == key:
+                video_send_active.pop(cid, None)
+
+    stale = [
+        k for k, b in list(video_send_pending.items())
+        if now - b.get("created", now) > max_age
+    ]
+    for k in stale:
+        _drop(k)
+    while len(video_send_pending) > max_entries:
+        oldest = min(
+            video_send_pending,
+            key=lambda k: video_send_pending[k].get("created", 0),
+        )
+        _drop(oldest)
 
 # اشتراک‌گذاری ویدیو با لینک از طریق آرکایو کانال تلگرام
 ARCHIVE_CHANNEL_ID: int = int(os.getenv("ARCHIVE_CHANNEL_ID", "0"))
@@ -7433,6 +7486,13 @@ async def _flush_video_send_batch(
     """بعد از ۳ ثانیه، پیام batch ویدیو رو ارسال میکنه."""
     await asyncio.sleep(3)
     video_send_timers.pop(batch_key, None)
+    # 🆕 FIX: slot «batch فعال» آزاد میشه تا ویدیوی بعدی (حتی چند ثانیه بعد)
+    # بچِ تازه خودش رو بگیره — نه اینکه به این بچ اضافه بشه و پیام
+    # «3 video files received» با دکمه‌های اضافی بیاد.
+    # خودِ batch از video_send_pending پاک نمیشه تا دکمه‌های همین پیام
+    # (Send as Video و ...) بعداً هم کار کنن.
+    if video_send_active.get(chat_id) == batch_key:
+        video_send_active.pop(chat_id, None)
     batch = video_send_pending.get(batch_key)
     if not batch or not batch.get("files"):
         return
@@ -7479,6 +7539,9 @@ async def _flush_video_send_batch(
 
     if GITHUB_ENABLED:
         buttons.append([Button.inline("☁️ Upload to GitHub", f"vgh_batch_{batch_key}")])
+
+    # 🆕 دکمه لغو — بستن این منو و دور ریختن بچ
+    buttons.append([Button.inline("❌ Cancel", f"vbcancel_{batch_key}")])
 
     try:
         await client.send_message(
@@ -7545,20 +7608,27 @@ async def video_receive_handler(event):
 
     filename = fname_attr or f"video_{event.id}{ext or '.mp4'}"
 
-    # batch key برای همه ویدیوهای همزمان (تا ۳ ثانیه)
-    batch_key = f"vbatch_{event.chat_id}"
-
-    # اگه batch قبلی هنوز بازه (تایمر تموم نشده)، فایل جدید اضافه کن
-    if batch_key in video_send_pending:
+    # 🆕 FIX: اگه بچ فعالِ همین چت هنوز بازه (تایمر ۳ ثانیه‌ای هنوز فلاش
+    # نکرده)، فایل جدید به همون اضافه میشه؛ وگرنه «بچِ تازه» با کلید یکتا
+    # ساخته میشه — قبل از این، کلید بچ ثابت بود و بچِ قبلی هیچ‌وقت از حافظه
+    # پاک نمی‌شد، برای همین ویدیوی جدید به بچ قدیمی اضافه می‌شد و پیام
+    # «N video files received» با بچ جمع‌شده می‌اومد.
+    active_key = video_send_active.get(event.chat_id)
+    if active_key and active_key in video_send_pending:
+        batch_key = active_key
         video_send_pending[batch_key]["files"].append({
             "message_id": event.id,
             "file_size": file_size,
             "filename": filename,
         })
     else:
+        # بچ قدیمی‌های خیلی عادی رو از حافظه پاک کن (کلیدها یکتا شدن)
+        _prune_video_batches()
+        batch_key = f"vbatch_{event.chat_id}_{int(time.time() * 1000)}"
         video_send_pending[batch_key] = {
             "chat_id": event.chat_id,
             "reply_to_id": event.id,
+            "created": time.time(),
             "files": [
                 {
                     "message_id": event.id,
@@ -7567,6 +7637,7 @@ async def video_receive_handler(event):
                 }
             ],
         }
+        video_send_active[event.chat_id] = batch_key
 
     # شروع (یا ریست) تایمر ۳ ثانیه‌ای
     if batch_key in video_send_timers:
@@ -7688,84 +7759,170 @@ async def vsend_callback(event):
     files = batch["files"]
     total = len(files)
 
+    # 🆕 پرچم لغو ممکنه از عملیات قبلی مونده باشه — پاکش کن
+    video_cancel_flags.pop(batch_key, None)
+
+    def _chk_cancel():
+        """اگه کاربر لغو زده باشه سیگنال لغو میده (BaseException → از
+        except Exception های میانی رد میشه)."""
+        if video_cancel_flags.pop(batch_key, None):
+            raise _VideoOpCancelled()
+
     try:
         await event.edit(
             f"⏳ Downloading and sending {total} video{'s' if total > 1 else ''}...",
-            buttons=None,
+            buttons=_vcancel_rows(batch_key),
         )
     except Exception:
         pass
 
     sent = 0
-    for i, file_info in enumerate(files):
-        msg_id = file_info["message_id"]
-        filename = file_info["filename"]
-        title = os.path.splitext(filename)[0]
+    cancelled = False
+    try:
+        for i, file_info in enumerate(files):
+            _chk_cancel()
+            msg_id = file_info["message_id"]
+            filename = file_info["filename"]
+            title = os.path.splitext(filename)[0]
 
-        tmp_path = os.path.join(
-            OUTPUT_FOLDER, f"vsend_{int(time.time())}_{i}_{filename}"
-        )
-        try:
-            msg = await event.client.get_messages(chat_id, ids=msg_id)
-            if not msg:
-                logger.warning(f"[VSEND] Message {msg_id} not found")
-                continue
-
+            tmp_path = os.path.join(
+                OUTPUT_FOLDER, f"vsend_{int(time.time())}_{i}_{filename}"
+            )
             try:
-                await event.edit(
-                    f"⬇️ Downloading {i + 1}/{total}: `{filename}`...",
-                    parse_mode="markdown",
-                    buttons=None,
+                msg = await event.client.get_messages(chat_id, ids=msg_id)
+                if not msg:
+                    logger.warning(f"[VSEND] Message {msg_id} not found")
+                    continue
+
+                try:
+                    await event.edit(
+                        f"⬇️ Downloading {i + 1}/{total}: `{filename}`...",
+                        parse_mode="markdown",
+                        buttons=_vcancel_rows(batch_key),
+                    )
+                except Exception:
+                    pass
+
+                # 🆕 دانلود به‌صورت تسک جدا تا دکمه لغو بتونه همون لحظه
+                # قطعش کنه (کنسل کردن تسکِ دانلود، هندلر اصلی رو نمی‌کشه)
+                dl_task = asyncio.ensure_future(
+                    event.client.download_media(msg, file=tmp_path)
                 )
-            except Exception:
-                pass
+                video_cancel_tasks[batch_key] = dl_task
+                try:
+                    await dl_task
+                except asyncio.CancelledError:
+                    if video_cancel_flags.pop(batch_key, None):
+                        raise _VideoOpCancelled() from None
+                    raise
+                finally:
+                    video_cancel_tasks.pop(batch_key, None)
 
-            await event.client.download_media(msg, file=tmp_path)
+                if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                    logger.warning(f"[VSEND] Download failed for {filename}")
+                    continue
 
-            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
-                logger.warning(f"[VSEND] Download failed for {filename}")
-                continue
+                _chk_cancel()
 
-            try:
-                await event.edit(
-                    f"📤 Uploading {i + 1}/{total}: `{filename}`...",
-                    parse_mode="markdown",
-                    buttons=None,
-                )
-            except Exception:
-                pass
+                try:
+                    await event.edit(
+                        f"📤 Uploading {i + 1}/{total}: `{filename}`...",
+                        parse_mode="markdown",
+                        buttons=_vcancel_rows(batch_key),
+                    )
+                except Exception:
+                    pass
 
-            ul_id = f"vsend_{chat_id}_{msg_id}"
-            active_uploads[ul_id] = {"paused": False, "cancelled": False}
-            try:
-                await send_file_with_progress(
-                    client=event.client,
-                    chat_id=chat_id,
-                    filepath=tmp_path,
-                    caption=title,
-                    status_msg=None,
-                    ul_id=ul_id,
-                )
-                sent += 1
+                ul_id = f"vsend_{chat_id}_{msg_id}"
+                active_uploads[ul_id] = {"paused": False, "cancelled": False}
+                try:
+                    await send_file_with_progress(
+                        client=event.client,
+                        chat_id=chat_id,
+                        filepath=tmp_path,
+                        caption=title,
+                        status_msg=None,
+                        ul_id=ul_id,
+                    )
+                    sent += 1
+                finally:
+                    active_uploads.pop(ul_id, None)
+
+            except _VideoOpCancelled:
+                raise
+            except Exception as e:
+                logger.error(f"[VSEND] Error sending {filename}: {e}", exc_info=True)
             finally:
-                active_uploads.pop(ul_id, None)
-
-        except Exception as e:
-            logger.error(f"[VSEND] Error sending {filename}: {e}", exc_info=True)
-        finally:
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+    except _VideoOpCancelled:
+        cancelled = True
+    finally:
+        video_cancel_flags.pop(batch_key, None)
+        video_cancel_tasks.pop(batch_key, None)
 
     try:
-        result_text = (
-            f"✅ Sent {sent}/{total} video{'s' if total > 1 else ''} successfully!"
-        )
+        if cancelled:
+            result_text = (
+                f"❌ لغو شد — {sent} از {total} ویدیو ارسال شده بود."
+                if sent
+                else "❌ لغو شد — هیچ ویدیویی ارسال نشد."
+            )
+        else:
+            result_text = (
+                f"✅ Sent {sent}/{total} video{'s' if total > 1 else ''} successfully!"
+            )
         await event.edit(result_text, buttons=None)
     except Exception:
         pass
+
+
+# ====================== CANCEL: منوی بچ و عملیات‌های ویدیویی ======================
+
+
+async def vbatch_cancel_callback(event):
+    """🆕 دکمه ❌ Cancel منوی بچ ویدیو — پیام رو پاک می‌کنه و بچ رو می‌ندازه."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+
+    batch_key = event.data.decode().replace("vbcancel_", "")
+    video_send_pending.pop(batch_key, None)
+    video_cancel_flags.pop(batch_key, None)
+    t = video_cancel_tasks.pop(batch_key, None)
+    if t and not t.done():
+        t.cancel()
+    # اگه این بچ هنوز «فعال» همین چت بود، slot رو هم آزاد کن
+    for cid, k in list(video_send_active.items()):
+        if k == batch_key:
+            video_send_active.pop(cid, None)
+
+    await event.answer("❌ Cancelled", alert=False)
+    try:
+        await event.delete()
+    except Exception:
+        try:
+            await event.edit("❌ Cancelled.", buttons=None)
+        except Exception:
+            pass
+
+
+async def vop_cancel_callback(event):
+    """🆕 دکمه ❌ Cancel وسط عملیات (دانلود/ارسال ویدیو، آپلود uplod.ir).
+
+    پرچم لغو رو ست می‌کنه و اگه دانلودی در جریان باشه، همون لحظه کنسلش می‌کنه.
+    عملیات اصلی تو نقطه‌چک بعدی می‌ایسته و پیام «لغو شد» میده."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.answer("⛔ Unauthorized", alert=True)
+
+    batch_key = event.data.decode().replace("vopcancel_", "")
+    video_cancel_flags[batch_key] = True
+    t = video_cancel_tasks.get(batch_key)
+    if t and not t.done():
+        t.cancel()
+    await event.answer("🚫 Cancelling...", alert=False)
 
 
 # ====================== SHARE LINK ======================
@@ -7858,6 +8015,9 @@ async def uplod_callback(event):
 
     await event.answer("⏳ Working...", alert=False)
 
+    # 🆕 پرچم لغو ممکنه از عملیات قبلی مونده باشه — پاکش کن
+    video_cancel_flags.pop(batch_key, None)
+
     log_lines = []
     def log_msg(msg):
         log_lines.append(msg)
@@ -7865,18 +8025,23 @@ async def uplod_callback(event):
 
     async def update_status(text):
         try:
-            await event.edit(text, buttons=None, parse_mode="md")
+            await event.edit(text, buttons=_vcancel_rows(batch_key), parse_mode="md")
         except Exception:
             pass
 
     files = batch["files"]
     chat_id = batch["chat_id"]
     links = []
+    cancelled = False
 
     log_msg(f"📦 Found {len(files)} file(s) in batch")
     await update_status(f"📦 Found {len(files)} file(s)\n⏳ Starting upload process...")
 
     for i, file_info in enumerate(files):
+        # 🆕 نقطه‌چک لغو
+        if video_cancel_flags.pop(batch_key, None):
+            cancelled = True
+            break
         msg_id = file_info["message_id"]
         filename = file_info["filename"]
         status = f"📄 **File {i + 1}/{len(files)}:** `{filename}`\n"
@@ -7897,7 +8062,25 @@ async def uplod_callback(event):
                 await update_status(status)
                 continue
 
-            await event.client.download_media(msg, file=tmp_path)
+            # 🆕 دانلود به‌صورت تسک جدا تا دکمه لغو بتونه همون لحظه قطعش کنه
+            dl_task = asyncio.ensure_future(
+                event.client.download_media(msg, file=tmp_path)
+            )
+            video_cancel_tasks[batch_key] = dl_task
+            try:
+                await dl_task
+            except asyncio.CancelledError:
+                if video_cancel_flags.pop(batch_key, None):
+                    cancelled = True
+                    break
+                raise
+            finally:
+                video_cancel_tasks.pop(batch_key, None)
+
+            # 🆕 نقطه‌چک لغو قبل از آپلود
+            if video_cancel_flags.pop(batch_key, None):
+                cancelled = True
+                break
 
             if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
                 log_msg(f"❌ Download failed — file empty or missing")
@@ -7937,7 +8120,7 @@ async def uplod_callback(event):
                     try:
                         await event.edit(
                             status_ref + f"\n{bar} Still uploading... (check console for progress)",
-                            buttons=None, parse_mode="md",
+                            buttons=_vcancel_rows(batch_key), parse_mode="md",
                         )
                     except Exception:
                         pass
@@ -8026,6 +8209,23 @@ async def uplod_callback(event):
                     log_msg(f"⚠️ Failed to clean up: {e}")
 
     # ── Final result ──
+    video_cancel_flags.pop(batch_key, None)
+    video_cancel_tasks.pop(batch_key, None)
+
+    # 🆕 اگه کاربر لغو کرده بود
+    if cancelled:
+        final = "❌ **لغو شد.**\n\n"
+        if links:
+            final += f"✅ {len(links)} فایل قبل از لغو آپلود شده بود:\n"
+            for link in links:
+                final += f"🔗 {link}\n"
+        final += "\n📋 **Log:**\n" + "\n".join(log_lines[-10:])
+        try:
+            await event.edit(final, buttons=None, parse_mode="md", link_preview=False)
+        except Exception:
+            pass
+        return await event.answer("❌ لغو شد.", alert=True)
+
     if not links:
         final = "❌ **Upload failed — no link received.**\n\n"
         final += "📋 **Full log:**\n" + "\n".join(log_lines[-20:])
@@ -21459,6 +21659,12 @@ async def main():
     )
     client.add_event_handler(
         vsend_callback, events.CallbackQuery(pattern=r"vsend_(.+)")
+    )
+    client.add_event_handler(
+        vbatch_cancel_callback, events.CallbackQuery(pattern=r"vbcancel_(.+)")
+    )
+    client.add_event_handler(
+        vop_cancel_callback, events.CallbackQuery(pattern=r"vopcancel_(.+)")
     )
     client.add_event_handler(
         subburn_callback, events.CallbackQuery(pattern=r"subburn_vbatch_(.+)")
