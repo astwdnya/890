@@ -50,7 +50,7 @@ from github import (
 )
 from savep_handler import process_savep_request, trigger_savep_cancel
 # File Explorer + Rename — واکنش به داکیومنت‌ها (zip/apk/rar/7z/...) با ۲ دکمه شیشه‌ای
-from file_explorer_handler import register_file_explorer_handlers
+from file_explorer_handler import register_file_explorer_handlers, upload_file_via_chain
 # YouTube direct download (InnerTube ANDROID_VR + cobalt fallback — RE'd)
 from yt_direct_handler import (
     is_youtube_url as is_ytdirect_url,
@@ -13943,22 +13943,94 @@ def _imdb_seasons_buttons(eps) -> list:
     return buttons
 
 
+def _imdb_agg_qualities(sq: list) -> list:
+    """🆕 تجمیع کیفیت‌های همه‌ی سرورها → [{label, resolution, servers[]}].
+
+    ورودی: خروجی get_all_server_qualities (پروب همه‌ی سرورها)
+    خروجی مرتب‌شده از بهترین به کمترین (بر اساس height) — بدون Auto."""
+    seen = {}
+    order = []
+    for s in sq or []:
+        for q in s.get("qualities", []):
+            lbl = q.get("label", "")
+            if not lbl or lbl.lower() == "auto":
+                continue
+            srv = s.get("server", "?")
+            if lbl not in seen:
+                seen[lbl] = {"label": lbl, "resolution": q.get("resolution", ""),
+                             "servers": [srv]}
+                order.append(seen[lbl])
+            elif srv not in seen[lbl]["servers"]:
+                seen[lbl]["servers"].append(srv)
+
+    def _height(item):
+        m = re.match(r"(\d{3,4})p", item["label"].lower())
+        if m:
+            return int(m.group(1))
+        low = item["label"].lower()
+        if "4k" in low or "2160" in low:
+            return 2160
+        return 0
+
+    order.sort(key=_height, reverse=True)
+    return order
+
+
 def _imdb_quality_buttons(qualities: list, is_episode: bool) -> list:
-    buttons = []
+    """🆕 دکمه‌های کیفیت (از لیست تجمیع‌شده) — انتخاب زیرنویس بعداً انجام میشه."""
+    pfx = "imd_eq_" if is_episode else "imd_q_"
+    buttons = [[Button.inline("⚡️ Auto (بهترین کیفیت)", f"{pfx}Auto")]]
     row = []
     for q in qualities:
         label = q["label"]
         if q.get("resolution"):
             label += f" ({q['resolution']})"
-        row.append(Button.inline(label, f"imd_eq_{q['label']}" if is_episode else f"imd_q_{q['label']}"))
+        srv = q.get("servers")
+        if srv:
+            label += f" · {len(srv)} سرور"
+        row.append(Button.inline(label, f"{pfx}{q['label']}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
-    buttons.append([Button.inline("⏭ بدون زیرنویس", "imd_enosub" if is_episode else "imd_nosub")])
     buttons.append([Button.inline("🚫 بستن", "imd_close")])
     return buttons
+
+
+def _imdb_server_buttons(servers: list, quality_label: str, is_episode: bool) -> list:
+    """🆕 دکمه‌های انتخاب سرور — فقط سرورهایی که این کیفیت رو دارن."""
+    pfx = "imd_esrv_" if is_episode else "imd_srv_"
+    buttons = [[Button.inline("⚡️ خودکار (اولین سرور در دسترس)", f"{pfx}auto")]]
+    row = []
+    for s in servers:
+        qm = None
+        for q in s.get("qualities", []):
+            if q.get("label", "").lower() == quality_label.lower():
+                qm = q
+                break
+        label = f"🖥 {s.get('server', '?')}"
+        if s.get("type") == "mp4":
+            label += " · MP4"
+        if qm and qm.get("resolution"):
+            label += f" · {qm['resolution']}"
+        row.append(Button.inline(label, f"{pfx}{s.get('server', '?')}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([Button.inline("🚫 بستن", "imd_close")])
+    return buttons
+
+
+def _imdb_dest_buttons() -> list:
+    """🆕 دکمه‌های مقصد خروجی — تلگرام یا حافظه‌ی ابری سرورمون."""
+    return [
+        [Button.inline("📨 ارسال همینجا (تلگرام)", "imd_dest_tg")],
+        [Button.inline("☁️ حافظه‌ی ابری سرورمون (لینک مستقیم)", "imd_dest_cloud")],
+        [Button.inline("🚫 بستن", "imd_close")],
+    ]
 
 
 def _imdb_sub_buttons(subs: list, is_episode: bool) -> list:
@@ -14018,12 +14090,14 @@ async def imdb_cb_title(event):
         await event.edit(caption, buttons=buttons, parse_mode="md")
     else:
         imdb_states[user_id] = {"imdb_id": imdb_id, "info": info}
-        await event.edit(f"{caption}\n\n⏳ در حال گرفتن لیست کیفیت‌ها...", parse_mode="md")
-        qualities = await get_qualities(imdb_id)
-        if not qualities:
-            await event.edit(f"{caption}\n\n❌ کیفیت‌ها در دسترس نیست.", parse_mode="md")
+        await event.edit(f"{caption}\n\n⏳ در حال بررسی سرورها و کیفیت‌ها...", parse_mode="md")
+        # 🆕 پروب همه‌ی سرورها → کاربر سرور و کیفیت رو باهم می‌بینه
+        sq = await get_all_server_qualities(imdb_id)
+        qualities = _imdb_agg_qualities(sq)
+        if not qualities and not sq:
+            await event.edit(f"{caption}\n\n❌ هیچ سروری این عنوان رو نداره.", parse_mode="md")
             return
-        imdb_states[user_id]["qualities"] = qualities
+        imdb_states[user_id]["sq"] = sq
         q_buttons = _imdb_quality_buttons(qualities, is_episode=False)
         cover = info.get("cover")
         if cover:
@@ -14102,14 +14176,16 @@ async def imdb_cb_episode(event):
     state["selected_season"] = season
     state["selected_episode"] = episode
     await event.edit(
-        f"🎬 **{title}** - S{season:02d}E{episode:02d}\n\n⏳ در حال گرفتن لیست کیفیت‌ها...",
+        f"🎬 **{title}** - S{season:02d}E{episode:02d}\n\n⏳ در حال بررسی سرورها و کیفیت‌ها...",
         parse_mode="md",
     )
-    qualities = await get_qualities(imdb_id, season, episode)
-    if not qualities:
-        await event.edit("❌ کیفیت‌ها در دسترس نیست.")
+    # 🆕 پروب همه‌ی سرورها برای این قسمت
+    sq = await get_all_server_qualities(imdb_id, season, episode)
+    qualities = _imdb_agg_qualities(sq)
+    if not qualities and not sq:
+        await event.edit("❌ هیچ سروری این قسمت رو نداره.")
         return
-    state["qualities"] = qualities
+    state["sq"] = sq
     await event.edit(
         f"🎬 **{title}** - S{season:02d}E{episode:02d}\n\n🎯 کیفیت رو انتخاب کن:",
         buttons=_imdb_quality_buttons(qualities, is_episode=True),
@@ -14117,26 +14193,116 @@ async def imdb_cb_episode(event):
     )
 
 
+async def _imdb_show_server_menu(event, state, is_episode: bool):
+    """🆕 بعد از انتخاب کیفیت → منوی سرور (فقط سرورهای دارای این کیفیت)."""
+    quality_label = state.get("quality", "Auto")
+    sq = state.get("sq") or []
+    if quality_label.lower() == "auto":
+        servers = sq
+    else:
+        servers = [
+            s for s in sq
+            if any(q.get("label", "").lower() == quality_label.lower()
+                   for q in s.get("qualities", []))
+        ]
+    if not servers:
+        # 🆕 باگ قدیمی: اینجا قبلاً بی‌صدا Auto دانلود می‌شد (480p → 431MB)!
+        # حالا صادقانه می‌گیم کدوم کیفیت‌ها واقعاً موجوده.
+        avail = _imdb_agg_qualities(sq)
+        await event.answer(f"⚠️ کیفیت {quality_label} در دسترس نیست", alert=True)
+        await event.edit(
+            f"❌ کیفیت **{quality_label}** از هیچ سروری در دسترس نیست.\n"
+            f"👇 یکی از کیفیت‌های موجود رو انتخاب کن:",
+            buttons=_imdb_quality_buttons(avail, is_episode=is_episode),
+            parse_mode="md",
+        )
+        return
+    await event.edit(
+        f"✅ کیفیت: **{quality_label}**\n\n🖥 کدوم سرور؟",
+        buttons=_imdb_server_buttons(servers, quality_label, is_episode),
+        parse_mode="md",
+    )
+
+
 async def imdb_cb_quality(event):
     data = event.data.decode()
-    quality_label = data.replace("imd_q_", "")
+    quality_label = data.replace("imd_q_", "", 1)
     user_id = event.sender_id
     state = imdb_states.get(user_id)
     if not state:
         await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
         return
     state["quality"] = quality_label
-    await event.edit(f"✅ کیفیت: **{quality_label}**\n\n🔍 در حال جستجوی زیرنویس فارسی...")
+    await _imdb_show_server_menu(event, state, is_episode=False)
+
+
+async def imdb_cb_equality(event):
+    data = event.data.decode()
+    quality_label = data.replace("imd_eq_", "", 1)
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
+        return
+    state["quality"] = quality_label
+    await _imdb_show_server_menu(event, state, is_episode=True)
+
+
+async def imdb_cb_server(event):
+    """🆕 انتخاب سرور (imd_srv_/imd_esrv_) → بعدش منوی زیرنویس."""
+    data = event.data.decode()
+    is_ep = data.startswith("imd_esrv_")
+    server_name = data[len("imd_esrv_"):] if is_ep else data[len("imd_srv_"):]
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
+        return
+    state["server"] = None if server_name == "auto" else server_name
+    await event.answer("✅ سرور انتخاب شد", alert=False)
+    await _imdb_show_sub_menu(event, state, is_episode=is_ep)
+
+
+async def _imdb_show_sub_menu(event, state, is_episode: bool):
+    """🆕 جستجوی زیرنویس فارسی بعد از انتخاب سرور."""
+    quality_label = state.get("quality", "Auto")
+    srv = state.get("server") or "خودکار"
     imdb_id = state["imdb_id"]
-    # Search Persian subtitles from OpenSubtitles
-    subs = await search_subtitles(imdb_id, "per")
+    await event.edit(
+        f"✅ کیفیت: **{quality_label}** | 🖥 سرور: **{srv}**\n\n🔍 در حال جستجوی زیرنویس فارسی...",
+        parse_mode="md",
+    )
+    if is_episode:
+        season = state.get("selected_season")
+        episode = state.get("selected_episode")
+        subs = await search_subtitles(imdb_id, "per", season, episode)
+    else:
+        subs = await search_subtitles(imdb_id, "per")
     state["subs"] = subs
     sub_count_text = f"📄 {len(subs)} زیرنویس پیدا شد:" if subs else "❌ زیرنویسی پیدا نشد"
     await event.edit(
-        f"✅ کیفیت: **{quality_label}**\n\n📝 زیرنویس فارسی:\n{sub_count_text}",
-        buttons=_imdb_sub_buttons(subs, is_episode=False),
+        f"✅ کیفیت: **{quality_label}** | 🖥 سرور: **{srv}**\n\n📝 زیرنویس فارسی:\n{sub_count_text}",
+        buttons=_imdb_sub_buttons(subs, is_episode),
         parse_mode="md",
     )
+
+
+async def imdb_cb_dest(event):
+    """🆕 انتخاب مقصد خروجی (imd_dest_tg / imd_dest_cloud) → شروع دانلود."""
+    data = event.data.decode()
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("⏰ نشست شما منقضی شده.", alert=True)
+        return
+    pending = state.get("pending") or {"with_subtitle": False, "softsub": None}
+    state["delivery"] = "cloud" if data.endswith("cloud") else "tg"
+    await event.answer("✅ شروع دانلود...", alert=False)
+    asyncio.create_task(_imdb_download_task(
+        event, user_id,
+        with_subtitle=pending.get("with_subtitle", False),
+        softsub=pending.get("softsub"),
+    ))
 
 
 async def _check_persian_subtitle_available(imdb_id, season=None, episode=None):
@@ -14165,30 +14331,6 @@ async def _check_persian_subtitle_available(imdb_id, season=None, episode=None):
         return {"available": False}
 
 
-async def imdb_cb_equality(event):
-    data = event.data.decode()
-    quality_label = data.replace("imd_eq_", "")
-    user_id = event.sender_id
-    state = imdb_states.get(user_id)
-    if not state:
-        await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
-        return
-    state["quality"] = quality_label
-    season = state.get("selected_season")
-    episode = state.get("selected_episode")
-    await event.edit(f"✅ کیفیت: **{quality_label}**\n\n🔍 در حال جستجوی زیرنویس فارسی...")
-    imdb_id = state["imdb_id"]
-    # Search Persian subtitles from OpenSubtitles
-    subs = await search_subtitles(imdb_id, "per", season, episode)
-    state["subs"] = subs
-    sub_count_text = f"📄 {len(subs)} زیرنویس پیدا شد:" if subs else "❌ زیرنویسی پیدا نشد"
-    await event.edit(
-        f"✅ کیفیت: **{quality_label}**\n\n📝 زیرنویس فارسی:\n{sub_count_text}",
-        buttons=_imdb_sub_buttons(subs, is_episode=True),
-        parse_mode="md",
-    )
-
-
 async def imdb_cb_sub(event):
     """Handler for subtitle selection — show delivery options after selecting a subtitle"""
     data = event.data.decode()
@@ -14198,19 +14340,34 @@ async def imdb_cb_sub(event):
         await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
         return
     if data == "imd_withsub":
-        # imdbplay softsub — download Persian sub from imdbplay and embed
+        # imdbplay softsub — دانلود زیرنویس فارسی از imdbplay و جاسازی
         state["selected_sub"] = None
         state["use_imdbplay_sub"] = True
-        await event.answer("✅ شروع دانلود با softsub...", alert=False)
-        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
+        # 🆕 به‌جای شروع فوری → انتخاب مقصد خروجی
+        state["pending"] = {"with_subtitle": True, "softsub": None}
+        await event.edit(
+            "✅ زیرنویس: imdbplay (softsub)\n\n📬 خروجی کجا بفرستم؟",
+            buttons=_imdb_dest_buttons(),
+            parse_mode="md",
+        )
     elif data == "imd_softsub":
-        # User chose softsub delivery for previously selected subtitle
-        await event.answer("✅ شروع دانلود با softsub...", alert=False)
-        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True, softsub=True))
+        # زیرنویس انتخابی به‌صورت softsub داخل ویدیو
+        # 🆕 به‌جای شروع فوری → انتخاب مقصد خروجی
+        state["pending"] = {"with_subtitle": True, "softsub": True}
+        await event.edit(
+            "✅ نحوه‌ی زیرنویس: softsub\n\n📬 خروجی کجا بفرستم؟",
+            buttons=_imdb_dest_buttons(),
+            parse_mode="md",
+        )
     elif data == "imd_sepsub":
-        # User chose separate file delivery for previously selected subtitle
-        await event.answer("✅ شروع دانلود...", alert=False)
-        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True, softsub=False))
+        # زیرنویس به‌صورت فایل جداگانه
+        # 🆕 به‌جای شروع فوری → انتخاب مقصد خروجی
+        state["pending"] = {"with_subtitle": True, "softsub": False}
+        await event.edit(
+            "✅ نحوه‌ی زیرنویس: فایل جداگانه\n\n📬 خروجی کجا بفرستم؟",
+            buttons=_imdb_dest_buttons(),
+            parse_mode="md",
+        )
     else:
         # Specific subtitle from OpenSubtitles — show delivery options
         sub_idx = int(data.replace("imd_sub_", ""))
@@ -14238,14 +14395,27 @@ async def imdb_cb_esub(event):
     if data == "imd_withsub":
         state["selected_sub"] = None
         state["use_imdbplay_sub"] = True
-        await event.answer("✅ شروع دانلود با softsub...", alert=False)
-        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True))
+        # 🆕 به‌جای شروع فوری → انتخاب مقصد خروجی
+        state["pending"] = {"with_subtitle": True, "softsub": None}
+        await event.edit(
+            "✅ زیرنویس: imdbplay (softsub)\n\n📬 خروجی کجا بفرستم؟",
+            buttons=_imdb_dest_buttons(),
+            parse_mode="md",
+        )
     elif data == "imd_softsub":
-        await event.answer("✅ شروع دانلود با softsub...", alert=False)
-        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True, softsub=True))
+        state["pending"] = {"with_subtitle": True, "softsub": True}
+        await event.edit(
+            "✅ نحوه‌ی زیرنویس: softsub\n\n📬 خروجی کجا بفرستم؟",
+            buttons=_imdb_dest_buttons(),
+            parse_mode="md",
+        )
     elif data == "imd_sepsub":
-        await event.answer("✅ شروع دانلود...", alert=False)
-        asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=True, softsub=False))
+        state["pending"] = {"with_subtitle": True, "softsub": False}
+        await event.edit(
+            "✅ نحوه‌ی زیرنویس: فایل جداگانه\n\n📬 خروجی کجا بفرستم؟",
+            buttons=_imdb_dest_buttons(),
+            parse_mode="md",
+        )
     else:
         sub_idx = int(data.replace("imd_esub_", ""))
         if sub_idx >= len(state.get("subs", [])):
@@ -14267,8 +14437,9 @@ async def imdb_cb_nosub(event):
     if not state:
         await event.answer("وضعیت شما منقضی شده.", alert=True)
         return
-    await event.answer("⏭ بدون زیرنویس", alert=False)
-    asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=False))
+    # 🆕 بدون زیرنویس → انتخاب مقصد خروجی
+    state["pending"] = {"with_subtitle": False, "softsub": None}
+    await event.edit("⏭ بدون زیرنویس\n\n📬 خروجی کجا بفرستم؟", buttons=_imdb_dest_buttons())
 
 
 async def imdb_cb_enosub(event):
@@ -14277,8 +14448,9 @@ async def imdb_cb_enosub(event):
     if not state:
         await event.answer("وضعیت شما منقضی شده.", alert=True)
         return
-    await event.answer("⏭ بدون زیرنویس", alert=False)
-    asyncio.create_task(_imdb_download_task(event, user_id, with_subtitle=False))
+    # 🆕 بدون زیرنویس → انتخاب مقصد خروجی
+    state["pending"] = {"with_subtitle": False, "softsub": None}
+    await event.edit("⏭ بدون زیرنویس\n\n📬 خروجی کجا بفرستم؟", buttons=_imdb_dest_buttons())
 
 
 async def _imdb_download_cover(url: str, out_dir: str) -> Optional[str]:
@@ -14295,6 +14467,122 @@ async def _imdb_download_cover(url: str, out_dir: str) -> Optional[str]:
     return None
 
 
+class _IMDBUploadProg:
+    """🆕 پیشرفت آپلود ابری برای زنجیره‌ی file_explorer_handler (cb از آپلودرها)."""
+    def __init__(self):
+        self.done = 0
+        self.total = 0
+
+    def cb(self, done, total):
+        self.done, self.total = done, total
+
+
+async def _imdb_cloud_deliver(event, status_msg, state, final_path, title,
+                              season, episode, quality, size_mb, sub_note,
+                              separate_sub_path, active_downloads, dl_id) -> bool:
+    """🆕 آپلود فایل نهایی IMDb به حافظه‌ی ابری سرورمون (زنجیره‌ی fallback).
+
+    زنجیره: سرور خودمون → پیکسل‌درین → Litterbox → Catbox → Uguu → Gofile
+    Returns:
+        True = آپلود موفق و پیام لینک‌ها ارسال شد؛
+        False = شکست → مسیر تلگرام ادامه پیدا می‌کنه (اگه فایل جا شد)."""
+    import html as _html
+    try:
+        disp = re.sub(r'[<>:"/\\|?*]', '_', title)[:80] or "video"
+        if season and episode:
+            disp += f" S{season:02d}E{episode:02d}"
+        disp += os.path.splitext(final_path)[1] or ".mp4"
+
+        prog = _IMDBUploadProg()
+
+        async def _status(text):
+            try:
+                await status_msg.edit(text, buttons=None, parse_mode="html")
+            except Exception:
+                pass
+
+        async def _updater():
+            while True:
+                await asyncio.sleep(5)
+                if prog.total:
+                    pct = prog.done * 100 // prog.total
+                    try:
+                        await status_msg.edit(
+                            f"⬆️ آپلود ابری: {human_readable_size(prog.done)} / {human_readable_size(prog.total)} ({pct}%)",
+                            buttons=None,
+                        )
+                    except Exception:
+                        pass
+
+        up_task = asyncio.create_task(_updater())
+        try:
+            out = await upload_file_via_chain(final_path, disp, prog=prog, status_cb=_status)
+        finally:
+            up_task.cancel()
+
+        res = out["res"]
+        srv_name = state.get("server") or "خودکار"
+        ep_txt = f" S{season:02d}E{episode:02d}" if season and episode else ""
+        t_esc = _html.escape(title)
+        lines = [
+            f"✅ <b>آپلود ابری انجام شد! ({_html.escape(out['fa'])})</b>",
+            "",
+            f"🎬 <b>{t_esc}</b>{ep_txt}",
+            f"🎯 کیفیت: {_html.escape(str(quality))} | 🖥 سرور: {_html.escape(str(srv_name))}",
+            f"💾 حجم: {size_mb:.1f} MB",
+            "",
+            "▶️ لینک مستقیم پخش در VLC:",
+            f"{res['play_url']}",
+        ]
+        if res.get("dl_url") and res["dl_url"] != res["play_url"]:
+            lines.append("")
+            lines.append("⬇️ لینک دانلود مستقیم:")
+            lines.append(f"{res['dl_url']}")
+        if res.get("page_url"):
+            lines.append("")
+            lines.append("📄 صفحه‌ی فایل:")
+            lines.append(f"{res['page_url']}")
+        lines.append("")
+        lines.append(out["expiry_note"])
+        if sub_note:
+            lines.append(f"📝 زیرنویس: {_html.escape(str(sub_note))}")
+
+        rows = [[Button.url("▶️ پخش در VLC", res["play_url"]),
+                 Button.url("⬇️ دانلود", res["dl_url"] or res["play_url"])]]
+        if res.get("page_url"):
+            rows.append([Button.url("📄 صفحه فایل", res["page_url"])])
+
+        # 🆕 زیرنویس جداگانه هم آپلود بشه
+        if separate_sub_path and os.path.exists(separate_sub_path):
+            try:
+                sub_out = await upload_file_via_chain(
+                    separate_sub_path,
+                    os.path.basename(separate_sub_path),
+                    status_cb=_status,
+                )
+                sres = sub_out["res"]
+                lines.append("")
+                lines.append("📄 زیرنویس جداگانه (لینک مستقیم):")
+                lines.append(f"{sres['dl_url'] or sres['play_url']}")
+                rows.append([Button.url("⬇️ دانلود زیرنویس", sres["dl_url"] or sres["play_url"])])
+            except Exception as sub_up_err:
+                logger.warning(f"[IMDB] sub cloud upload failed: {sub_up_err}")
+
+        active_downloads.pop(dl_id, None)
+        await status_msg.edit("\n".join(lines), buttons=rows, parse_mode="html")
+        return True
+    except Exception as e:
+        logger.error(f"[IMDB] cloud deliver failed: {e}", exc_info=True)
+        try:
+            await status_msg.edit(
+                f"⚠️ آپلود ابری ناموفق بود:\n<code>{_html.escape(str(e)[:300])}</code>\n\n📤 از طریق تلگرام ارسال می‌شه...",
+                parse_mode="html",
+            )
+        except Exception:
+            pass
+        return False
+
+
 async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub: bool = None):
     state = imdb_states.get(user_id)
     if not state:
@@ -14307,6 +14595,9 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
     quality = state.get("quality", "Auto")
     season = state.get("selected_season")
     episode = state.get("selected_episode")
+    # 🆕 سرور انتخابی و مقصد خروجی (تلگرام / حافظه ابری)
+    preferred_server = state.get("server")
+    delivery = state.get("delivery", "tg")
 
     out_dir = os.path.join(IMDB_OUTPUT_FOLDER, f"{user_id}_{int(time.time())}")
     os.makedirs(out_dir, exist_ok=True)
@@ -14336,28 +14627,34 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                 status_msg = None
 
         label = f"S{season:02d}E{episode:02d}" if season and episode else ""
-        # Get server info before download to show in status
+        # 🆕 اطلاعات سرور — اگه کاربر سرور خاصی انتخاب کرده، دیگه پروب نکن
         server_info_text = ""
         server_info = None
-        try:
-            server_info = await get_server_info(imdb_id, season, episode)
-            if server_info:
-                srv_name = server_info.get("server", "Unknown")
-                srv_method = server_info.get("method", "Unknown")
-                srv_type = server_info.get("stream_type", "unknown").upper()
-                server_info_text = f"\n🖥 سرور: {srv_name} | 🔧 متد: {srv_method} | 📡 نوع: {srv_type}"
-        except Exception:
-            pass
+        if preferred_server:
+            server_info = {"server": preferred_server}
+            server_info_text = f"\n🖥 سرور انتخابی: {preferred_server}"
+        else:
+            try:
+                server_info = await get_server_info(imdb_id, season, episode)
+                if server_info:
+                    srv_name = server_info.get("server", "Unknown")
+                    srv_method = server_info.get("method", "Unknown")
+                    srv_type = server_info.get("stream_type", "unknown").upper()
+                    server_info_text = f"\n🖥 سرور: {srv_name} | 🔧 متد: {srv_method} | 📡 نوع: {srv_type}"
+            except Exception:
+                pass
         await status_msg.edit(f"📥 دانلود {label} با کیفیت {quality}{server_info_text}", buttons=cancel_btn)
 
         sub_name = None
         use_imdbplay_sub = state.get("use_imdbplay_sub", False)
+        persian_sub_path = None
         if with_subtitle and state.get("selected_sub") and not use_imdbplay_sub:
             # User selected a specific subtitle from OpenSubtitles
             await status_msg.edit("📝 دانلود زیرنویس از OpenSubtitles...")
             sub_path = await download_subtitle(state["selected_sub"], out_dir)
             if sub_path:
                 sub_name = state["selected_sub"].get("file_name", "")
+                persian_sub_path = sub_path  # 🆕 برای ارسال/آپلود جداگانه هم در دسترس باشه
                 await status_msg.edit(f"✅ زیرنویس: `{sub_name}`", parse_mode="md")
             else:
                 await status_msg.edit("⚠ زیرنویس دانلود نشد، ادامه بدون زیرنویس.")
@@ -14387,7 +14684,8 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
 
         try:
             video_path = await download_with_quality(
-                imdb_id, quality, out_dir, season, episode, progress_cb=vid_progress
+                imdb_id, quality, out_dir, season, episode, progress_cb=vid_progress,
+                preferred_server=preferred_server, strict_quality=True,
             )
         except Exception as dl_err:
             logger.error(f"[IMDB] video download error: {dl_err}", exc_info=True)
@@ -14417,7 +14715,6 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
         await status_msg.edit(f"✅ ویدیو دانلود شد ({vid_size:.1f} MB)")
 
         final_path = video_path
-        persian_sub_path = None
 
         # Determine if we should do softsub or separate subtitle file
         # softsub=True → embed subtitle in video and send as document
@@ -14483,8 +14780,21 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
 
         file_size = os.path.getsize(final_path)
         size_mb = file_size / 1024 / 1024
+
+        # 🆕 حافظه ابری — زنجیره: سرور خودمون → پیکسل‌درین → ... → گوفایل
+        if delivery == "cloud":
+            cloud_ok = await _imdb_cloud_deliver(
+                event, status_msg, state, final_path, title, season, episode,
+                quality, size_mb, sub_name if with_subtitle else None,
+                persian_sub_path if do_separate_sub else None,
+                active_downloads, dl_id,
+            )
+            if cloud_ok:
+                return
+            # آپلود ابری شکست خورد و فایل قابل ارسال تلگرامه → ادامه به مسیر تلگرام
+
         if size_mb > 1900:
-            await status_msg.edit(f"⚠ فایل خیلی بزرگه ({size_mb:.1f} MB). محدودیت تلگرام 2GB.")
+            await status_msg.edit(f"⚠ فایل خیلی بزرگه ({size_mb:.1f} MB). محدودیت تلگرام 2GB. برای فایل‌های بزرگ‌تر از گزینه‌ی «حافظه‌ی ابری» استفاده کن.")
             return
 
         await status_msg.edit(f"📤 در حال آپلود ({size_mb:.1f} MB)...", buttons=None)
@@ -14583,17 +14893,14 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
         if updater:
             updater.cancel()
         imdb_states.pop(user_id, None)
-        for p in [cover_path, sub_path, video_path]:
+        # 🆕 final_path هم پاک بشه (برای آپلود ابری، هارد‌لینک سرور خودمون
+        # داده رو زنده نگه می‌داره؛ برای تلگرام هم فایل قبلاً ارسال شده)
+        for p in [cover_path, sub_path, video_path, final_path]:
             if p and os.path.exists(p):
                 try:
                     os.unlink(p)
                 except Exception:
                     pass
-        if final_path and final_path != video_path and os.path.exists(final_path):
-            try:
-                os.unlink(final_path)
-            except Exception:
-                pass
         try:
             os.rmdir(out_dir)
         except Exception:
@@ -22415,6 +22722,10 @@ async def main():
     client.add_event_handler(imdb_cb_sub, events.CallbackQuery(pattern=r"imd_sepsub$"))
     client.add_event_handler(imdb_cb_nosub, events.CallbackQuery(pattern=r"imd_nosub$"))
     client.add_event_handler(imdb_cb_enosub, events.CallbackQuery(pattern=r"imd_enosub$"))
+    # 🆕 انتخاب سرور (بعد از کیفیت) + انتخاب مقصد خروجی (تلگرام / ابری)
+    client.add_event_handler(imdb_cb_server, events.CallbackQuery(pattern=r"imd_esrv_"))
+    client.add_event_handler(imdb_cb_server, events.CallbackQuery(pattern=r"imd_srv_"))
+    client.add_event_handler(imdb_cb_dest, events.CallbackQuery(pattern=r"imd_dest_"))
 
     me = await client.get_me()
     global BOT_USERNAME

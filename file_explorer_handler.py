@@ -442,6 +442,135 @@ def _self_upload(remote_name: str, local_path: str, prog) -> dict:
     return {"name": remote_name, "play_url": info["url"], "dl_url": info["url"], "page_url": ""}
 
 
+# ───────── 🆕 زنجیره‌ی آپلود ابری قابل استفاده توسط ماژول‌های دیگه ─────────
+class _ChainNullProg:
+    """شیء prog پیش‌فرض برای upload_file_via_chain — cb ناپیدای عمومی."""
+    def cb(self, done, total):
+        pass
+
+
+async def upload_file_via_chain(local_path: str, remote_name: str,
+                                prog=None, status_cb=None) -> dict:
+    """🆕 آپلود فایل به بهترین هاست موجود (زنجیره‌ی fallback) — برای جریان IMDb.
+
+    زنجیره: سرور خودم (PUBLIC_BASE_URL) → پیکسل‌درین → Litterbox → Catbox
+    → Uguu → Gofile. هر هاست حداکثر ۲ تلاش؛ خطای احراز (401/کلید نامعتبر)
+    → بدون ری‌تای، هاست بعدی.
+
+    Args:
+        local_path: مسیر فایل محلی
+        remote_name: نام فایل روی هاست
+        prog: شیء دارای .cb(done, total) برای پیشرفت آپلود (اختیاری)
+        status_cb: async callable(text) برای نمایش وضعیت (اختیاری)
+
+    Returns:
+        {"provider": id هاست, "fa": نام فارسی, "res": dict نتیجه,
+         "errors": [خطاها], "expiry_note": متن اعتبار لینک}
+
+    Raises:
+        _FeError: وقتی همه‌ی هاست‌ها شکست خوردن.
+    """
+    prog = prog or _ChainNullProg()
+
+    async def _status(text: str):
+        if status_cb:
+            try:
+                await status_cb(text)
+            except Exception:
+                pass
+
+    api_key = (os.environ.get("PIXDRAIN_API_KEY") or "").strip()
+    size = os.path.getsize(local_path)
+    chain: list = []
+    if _self_server_base() and size <= SELF_MAX_BYTES:
+        chain.append("self")
+    if api_key and size <= PIXDRAIN_MAX_BYTES:
+        chain.append("pixeldrain")
+    if size <= LITTERBOX_MAX_BYTES:
+        chain.append("litterbox")
+    if size <= CATBOX_MAX_BYTES:
+        chain.append("catbox")
+    if size <= UGUU_MAX_BYTES:
+        chain.append("uguu")
+    chain.append("gofile")
+
+    prov_fa = {
+        "self": "سرور خودت",
+        "pixeldrain": "پیکسل‌درین",
+        "litterbox": "Litterbox",
+        "catbox": "Catbox",
+        "uguu": "Uguu",
+        "gofile": "Gofile",
+    }
+    expiry_note = {
+        "self": f"⏳ اعتبار لینک: {SELF_EXPIRY_HOURS:g} ساعت (هاست: سرور خودت)",
+        "pixeldrain": (
+            f"⏳ اعتبار لینک: {PIXELDRAIN_AUTO_DELETE_HOURS:g} ساعت (بعدش خودکار پاک میشه)"
+            if PIXELDRAIN_AUTO_DELETE_HOURS > 0
+            else "♾ تا وقتی خودت پاکش نکنی معتبره"
+        ),
+        "litterbox": "⏳ اعتبار این لینک: ۷۲ ساعت",
+        "catbox": "♾ این لینک دائمیـه",
+        "uguu": "⏳ اعتبار این لینک: ۳ ساعت",
+        "gofile": (
+            f"⏳ اعتبار لینک: {GOFILE_AUTO_DELETE_HOURS:g} ساعت (خودکار پاک میشه)"
+            if GOFILE_AUTO_DELETE_HOURS > 0
+            else "♾ معتبره (اگه ۱۰ روز دانلود نشه گوفایل خودش پاکش می‌کنه)"
+        ),
+    }
+
+    res = None
+    used = None
+    err_lines: list = []
+    for prov in chain:
+        fa = prov_fa[prov]
+        attempts = 1 if prov == "self" else 2
+        for att in range(1, attempts + 1):
+            label = fa if attempts == 1 else f"{fa} (تلاش {att}/{attempts})"
+            await _status(f"⬆️ در حال آپلود به <b>{_esc(label)}</b>...")
+            try:
+                if prov == "self":
+                    res = _self_upload(remote_name, local_path, prog)
+                else:
+                    if prov == "pixeldrain":
+                        coro = _pixeldrain_upload(remote_name, local_path, prog, api_key)
+                    elif prov == "litterbox":
+                        coro = _litterbox_upload(remote_name, local_path, prog)
+                    elif prov == "catbox":
+                        coro = _catbox_upload(remote_name, local_path, prog)
+                    elif prov == "uguu":
+                        coro = _uguu_upload(remote_name, local_path, prog)
+                    else:
+                        coro = _gofile_upload(remote_name, local_path, prog)
+                    res = await coro
+                used = prov
+                break
+            except _FeAuthError as e:
+                err_lines.append(f"• {fa}: {e}")
+                break
+            except _FeError as e:
+                err_lines.append(f"• {fa} (تلاش {att}): {e}")
+                if att < attempts:
+                    await asyncio.sleep(2)
+            except Exception as e:
+                err_lines.append(f"• {fa} (تلاش {att}): {_esc(str(e)[:120])}")
+                if att < attempts:
+                    await asyncio.sleep(2)
+        if res:
+            break
+
+    if not res:
+        raise _FeError("همه‌ی هاست‌ها شکست خوردن:\n" + "\n".join(err_lines[-4:]))
+
+    return {
+        "provider": used,
+        "fa": prov_fa[used],
+        "res": res,
+        "errors": err_lines,
+        "expiry_note": expiry_note[used],
+    }
+
+
 async def _catbox_upload(remote_name: str, local_path: str, prog) -> dict:
     """آپلود استریمی به catbox.moe — دائمی (سقف ۲۰۰ مگ)، همون API لیترباکس.
 

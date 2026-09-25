@@ -1172,6 +1172,101 @@ async def get_qualities(imdb_id: str, season: Optional[int] = None, episode: Opt
 # ═══════════════════════════════════════════════════════════
 
 
+async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, episode: Optional[int] = None) -> List[dict]:
+    """
+    🆕 پروب موازی همه‌ی سرورها → لیست کیفیت‌های هر سرور (برای منوی انتخاب سرور).
+
+    برخلاف get_qualities که با اولین سرورِ چندکیفیتی متوقف میشه، این تابع
+    همه‌ی سرورها رو امتحان می‌کنه تا کاربر ببینه کدوم سرور چه کیفیتی داره.
+
+    Returns:
+        لیست dict:
+        - server: نام سرور (Vidzee/Videasy/Vidking/2Embed/GarageBand)
+        - type: "hls" یا "mp4"
+        - headers: هدرهای لازم برای دانلود
+        - url: آدرس stream اصلی
+        - qualities: [{label, url, bandwidth, resolution}]
+          (url هر کیفیت = لینک variant؛ برای MP4 همون url اصلی)
+    """
+    if not imdb_id:
+        return []
+    if not imdb_id.startswith("tt"):
+        imdb_id = f"tt{imdb_id}"
+
+    tmdb_id = await _get_tmdb_id(imdb_id)
+    if not tmdb_id:
+        logger.error("Cannot resolve tmdb_id for %s", imdb_id)
+        return []
+
+    async def _probe(server: dict) -> Optional[dict]:
+        try:
+            stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+            if not stream or not stream.get("url"):
+                return None
+            entry = {
+                "server": stream.get("server") or server["name"],
+                "type": stream.get("type", "hls"),
+                "headers": stream.get("headers", {}),
+                "url": stream["url"],
+                "qualities": [],
+            }
+            # ۱) سرور خودش لیست کیفیت داده (مثل Videasy/Vidking)
+            if stream.get("qualities"):
+                for q in stream["qualities"]:
+                    entry["qualities"].append({
+                        "label": q.get("label", q.get("quality", "Auto")),
+                        "url": q.get("url", "") or entry["url"],
+                        "bandwidth": 0,
+                        "resolution": q.get("resolution", ""),
+                    })
+                if entry["qualities"]:
+                    return entry
+                return None
+            # ۲) m3u8 رو بگیر و پارس کن
+            headers = {"User-Agent": _USER_AGENT}
+            headers.update(entry["headers"])
+            async with AsyncSession() as s:
+                r = await s.get(entry["url"], impersonate=_BROWSER_IMPERSONATE,
+                                timeout=20, headers=headers)
+            if r.status_code != 200:
+                logger.warning("[IMDBPlay] probe %s: m3u8 HTTP %d", entry["server"], r.status_code)
+                return None
+            text = r.text
+            if "#EXT-X-STREAM-INF:" in text:
+                variants = _parse_master_m3u8(text)
+                variants.sort(key=lambda v: -v[1])
+                for u, bw, res in variants:
+                    entry["qualities"].append({
+                        "label": _resolution_to_label(res, bw),
+                        "url": _make_absolute(entry["url"], u),
+                        "bandwidth": bw,
+                        "resolution": res,
+                    })
+            else:
+                label = "Auto"
+                m = re.search(r'/(1080p|720p|480p|360p|4k|2160p)/', entry["url"], re.IGNORECASE)
+                if m:
+                    label = m.group(1).lower()
+                    if label in ("4k", "2160p"):
+                        label = "4K"
+                entry["qualities"].append({
+                    "label": label, "url": entry["url"],
+                    "bandwidth": 0, "resolution": "",
+                })
+            return entry if entry["qualities"] else None
+        except Exception as e:
+            logger.warning("[IMDBPlay] probe %s failed: %s", server["name"], e)
+            return None
+
+    # پروب موازی — کل راند ~۸ ثانیه (به‌جای ~۴۰ ثانیه ترتیبی)
+    results = await asyncio.gather(*[_probe(s) for s in _SERVERS])
+    entries = [r for r in results if r]
+    logger.info("[IMDBPlay] get_all_server_qualities %s → %d server(s): %s",
+                imdb_id, len(entries),
+                [(e["server"], [q["label"] for q in e["qualities"]]) for e in entries])
+    return entries
+
+
 async def download_with_quality(
     imdb_id: str,
     quality_label: str,
@@ -1179,6 +1274,8 @@ async def download_with_quality(
     season: Optional[int] = None,
     episode: Optional[int] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    preferred_server: Optional[str] = None,
+    strict_quality: bool = False,
 ) -> Optional[str]:
     """
     دانلود فیلم یا قسمت سریال با کیفیت انتخابی.
@@ -1189,6 +1286,9 @@ async def download_with_quality(
         out_dir: مسیر خروجی
         season, episode: برای سریال
         progress_cb: callback(done, total)
+        preferred_server: 🆕 نام سرور انتخابی کاربر (None = خودکار)
+        strict_quality: 🆕 اگه True، وقتی هیچ سروری کیفیت رو نداره به‌جای
+            دانلود اشتباه با Auto (باگ 480p→431MB)، خطای واضح میده.
 
     Returns:
         مسیر فایل دانلود شده، یا None در صورت خطا.
@@ -1210,11 +1310,26 @@ async def download_with_quality(
 
     stream = None
     if target_quality == "auto":
-        # برای Auto، اولین سرور موفق کافیه
-        stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
+        # 🆕 اگه کاربر سرور خاصی انتخاب کرده، اول همون سرور امتحان میشه
+        if preferred_server:
+            for server in _SERVERS:
+                if server["name"] == preferred_server:
+                    try:
+                        logger.info("[IMDBPlay] Auto + preferred server %s...", preferred_server)
+                        stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+                    except Exception as e:
+                        logger.warning("[IMDBPlay] preferred server %s failed: %s", preferred_server, e)
+                        stream = None
+                    break
+        if not stream:
+            # برای Auto، اولین سرور موفق کافیه
+            stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
     else:
         # برای کیفیت خاص، سرورها رو به ترتیب امتحان کن تا سروری پیدا بشه که اون کیفیت رو داشته باشه
         for server in _SERVERS:
+            # 🆕 اگه کاربر سرور خاصی انتخاب کرده، فقط همون سرور
+            if preferred_server and server["name"] != preferred_server:
+                continue
             try:
                 logger.info("[IMDBPlay] Trying server %s for quality %s...", server["name"], quality_label)
                 candidate = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
@@ -1251,8 +1366,21 @@ async def download_with_quality(
                 logger.warning("[IMDBPlay] ✗ Server %s exception: %s", server["name"], e)
                 continue
 
-        # اگه هیچ سرور کیفیت مورد نظر رو نداشت، fallback به اولین سرور موفق
+        # اگه هیچ سرور کیفیت مورد نظر رو نداشت:
+        # 🆕 strict_quality=True → به‌جای دانلود اشتباه با Auto، خطای واضح
+        # (این همون باگ «480p انتخاب می‌کردم 431MB دانلود می‌شد» بود)
         if not stream:
+            if strict_quality:
+                avail = sorted({
+                    q.get("label", "?")
+                    for e in (await get_all_server_qualities(imdb_id, season, episode))
+                    for q in e["qualities"]
+                    if q.get("label", "").lower() != "auto"
+                } )
+                raise RuntimeError(
+                    f"کیفیت {quality_label} از هیچ سروری در دسترس نیست. "
+                    f"کیفیت‌های موجود: {', '.join(avail) if avail else 'هیچ'}"
+                )
             logger.warning("[IMDBPlay] No server has quality %s, falling back to Auto", quality_label)
             stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
             # وقتی fallback می‌کنیم، quality_label رو هم به Auto تغییر بده
@@ -1343,8 +1471,19 @@ async def download_with_quality(
                     logger.warning("m3u8 fetch HTTP %d (attempt %d) — re-fetching stream with new seed",
                                    r.status_code, m3u8_attempt + 1)
                     await asyncio.sleep(1 * (m3u8_attempt + 1))
-                    # Stream جدید با seed جدید
-                    new_stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
+                    # 🆕 Stream جدید — اول سرور انتخابی کاربر، بعد ترتیب پیش‌فرض
+                    new_stream = None
+                    if preferred_server:
+                        for server in _SERVERS:
+                            if server["name"] == preferred_server:
+                                try:
+                                    new_stream = await _get_stream_for_server(
+                                        server, tmdb_id, imdb_id, season, episode)
+                                except Exception:
+                                    new_stream = None
+                                break
+                    if not new_stream or not new_stream.get("url"):
+                        new_stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
                     if new_stream and new_stream.get("url"):
                         stream = new_stream
                         m3u8_url = stream["url"]
