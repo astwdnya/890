@@ -41,6 +41,11 @@ import wasmtime
 
 logger = logging.getLogger("VidsrcDownloader")
 
+# ─── دانلود همزمان سگمنت‌ها (قابل تنظیم با متغیرهای محیطی) ───
+# قبلاً concurrency=8 و max_clients پیش‌فرض 10 بود که سرعت را محدود می‌کرد.
+SEGMENT_CONCURRENCY = int(os.environ.get("VIDSRC_SEG_CONCURRENCY", "24"))
+SESSION_MAX_CLIENTS = int(os.environ.get("VIDSRC_MAX_CLIENTS", "32"))
+
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -307,11 +312,13 @@ async def _download_segments(
     out_dir: str,
     quality: str,
     progress_cb=None,
-    concurrency: int = 8,
+    concurrency: int = None,
 ) -> Tuple[List[str], float]:
     """دانلود همه segment‌ها با concurrency
     Returns: (list of segment file paths, total_duration_sec)
     """
+    if concurrency is None:
+        concurrency = SEGMENT_CONCURRENCY
     master_with_token = _apply_token(master_url, token)
     p = urlparse(master_with_token)
     base = f"{p.scheme}://{p.netloc}"
@@ -480,7 +487,7 @@ async def _download(
 
     # temp dir برای segment‌ها
     with tempfile.TemporaryDirectory(prefix="vidsrc_") as tmp:
-        async with AsyncSession() as s:
+        async with AsyncSession(max_clients=SESSION_MAX_CLIENTS) as s:
             # امتحان هر stream URL تا یکی کار کنه
             last_err = None
             for i, master_url in enumerate(info.stream_urls):

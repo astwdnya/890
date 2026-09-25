@@ -64,6 +64,14 @@ _USER_AGENT = (
 
 _BROWSER_IMPERSONATE = "chrome"
 
+# ─── دانلود همزمان سگمنت‌ها (قابل تنظیم با متغیرهای محیطی) ───
+# گلوگاه قبلی: Semaphore(10) + AsyncSession با max_clients پیش‌فرض 10
+# یعنی هر لحظه حداکثر 10 سگمنت در حال دانلود بود. برای لینک‌های کم‌سرعت/
+# پرتأخیر (مثل مسیر بین‌الملل ایران) هر کانکشن TCP محدود میشه و افزایش
+# تعداد کانکشن‌های همزمان سرعت را چند برابر می‌کند.
+SEGMENT_CONCURRENCY = int(os.environ.get("IMDB_SEG_CONCURRENCY", "24"))   # سگمنت همزمان
+SESSION_MAX_CLIENTS = int(os.environ.get("IMDB_MAX_CLIENTS", "32"))       # حداکثر curl handle همزمان
+
 # TMDB API key که vidzee و چند سرور دیگه استفاده می‌کنن (به صورت embedded در JS اون‌هاست).
 # این کلید public در نظر گرفته شده و در فرانت‌اند سایت‌های embed استفاده می‌شه.
 _TMDB_API_KEY = "adc48d20c0956934fb224de5c40bb85d"
@@ -1452,9 +1460,9 @@ async def download_with_quality(
     # download segments in parallel — با session مشترک و retries بیشتر
     seg_paths = [None] * total
     init_path = None
-    sem = asyncio.Semaphore(10)  # 10 concurrent downloads (افزایش سرعت)
+    sem = asyncio.Semaphore(SEGMENT_CONCURRENCY)  # دانلود همزمان سگمنت‌ها (قابل تنظیم با IMDB_SEG_CONCURRENCY)
 
-    async with AsyncSession() as shared_session:
+    async with AsyncSession(max_clients=SESSION_MAX_CLIENTS) as shared_session:
         # اگه init segment وجود داره (fMP4)، اول اون رو دانلود کن
         if init_url:
             init_abs_url = _make_absolute(variant_url, init_url)
