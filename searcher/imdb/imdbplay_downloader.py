@@ -997,6 +997,102 @@ def _make_absolute(base_url: str, url: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
+#   Quality matching helpers (انتخاب کیفیت واقعی)
+# ═══════════════════════════════════════════════════════════
+
+# label → height مورد انتظار
+_QUALITY_HEIGHTS = {
+    "2160p": 2160, "4k": 2160, "uhd": 2160,
+    "1080p fullhd": 1080, "1080p x265": 1080, "1080p": 1080,
+    "720p x265": 720, "720p": 720,
+    "480p": 480,
+    "360p": 360,
+    "240p": 240,
+}
+
+
+class QualityNotAvailable(RuntimeError):
+    """هیچ variantی با height ≤ کیفیت درخواستی روی این سرور نبود (فقط بالاتر).
+
+    این خطا باعث میشه caller بره سراغ سرور بعدی که شاید کیفیت پایین‌تر
+    واقعی داشته باشه — به‌جای اینکه بی‌سروصدا 1080p دانلود کنه.
+    """
+
+    def __init__(self, message: str, best_height: int = 0):
+        super().__init__(message)
+        self.best_height = best_height
+
+
+def _height_of(resolution: str, bandwidth: int) -> int:
+    """حدس زدن height از resolution یا bandwidth (مثل 1920x1080 → 1080)."""
+    if resolution and "x" in resolution:
+        try:
+            return int(resolution.split("x")[-1])
+        except (ValueError, IndexError):
+            pass
+    if bandwidth >= 8_000_000:
+        return 1080
+    if bandwidth >= 4_000_000:
+        return 720
+    if bandwidth >= 2_000_000:
+        return 480
+    if bandwidth >= 1_000_000:
+        return 360
+    return 0
+
+
+def _rank_variants_for_height(variants: List[Tuple[str, int, str]], target_height: int):
+    """بهترین variant برای height هدف رو پیدا می‌کنه.
+
+    Returns:
+        (kind, delta, rel_url) که kind یکی از:
+        - "exact": تطابق دقیق height (delta=0)
+        - "below": نزدیک‌ترین پایین‌تر از هدف (delta = target - h)
+        - "above": نزدیک‌ترین بالاتر از هدف (delta = h - target)
+        None اگه variant نبود یا target نامعتبره.
+    """
+    if not variants or target_height <= 0:
+        return None
+    entries = [(v, _height_of(v[2], v[1])) for v in variants]
+    exact = [(v, h) for v, h in entries if h == target_height]
+    if exact:
+        return ("exact", 0, exact[0][0][0])
+    below = [(v, h) for v, h in entries if 0 < h < target_height]
+    if below:
+        v, h = max(below, key=lambda x: x[1])
+        return ("below", target_height - h, v[0])
+    above = [(v, h) for v, h in entries if h > target_height]
+    if above:
+        v, h = min(above, key=lambda x: x[1])
+        return ("above", h - target_height, v[0])
+    return None
+
+
+async def _probe_variants(stream: dict) -> List[Tuple[str, int, str]]:
+    """fetch کردن m3u8 استریم؛ اگه master بود variantها برمی‌گردونه، وگرنه لیست خالی.
+
+    برای رتبه‌بندی سرورها بر اساس کیفیت واقعی موجود استفاده میشه.
+    """
+    url = stream.get("url", "")
+    if not url or stream.get("type", "hls") != "hls":
+        return []
+    headers = {"User-Agent": _USER_AGENT}
+    headers.update(stream.get("headers", {}))
+    try:
+        async with AsyncSession() as s:
+            r = await s.get(url, impersonate=_BROWSER_IMPERSONATE, timeout=15, headers=headers)
+        if r.status_code != 200:
+            return []
+        text = r.text
+        if "#EXT-X-STREAM-INF:" not in text:
+            return []
+        return _parse_master_m3u8(text)
+    except Exception as e:
+        logger.debug("probe variants failed for %s: %s", url[:80], e)
+        return []
+
+
+# ═══════════════════════════════════════════════════════════
 #   Public API: get_qualities
 # ═══════════════════════════════════════════════════════════
 
@@ -1019,12 +1115,14 @@ async def get_qualities(imdb_id: str, season: Optional[int] = None, episode: Opt
     """
     گرفتن لیست کیفیت‌های موجود برای یک فیلم یا قسمت سریال.
 
-    اولویت با سرورهایی هست که کیفیت‌های متعدد دارن (مثل Videasy/Vidking).
-    اگه هیچ سرور کیفیت متعدد نداشت، کیفیت Auto از اولین سرور موفق برمی‌گرده.
+    برخلاف نسخه قبلی که فقط از «اولین» سروری که جواب می‌داد لیست می‌گرفت،
+    اینجا از «همه» سرورها کیفیت‌های واقعی جمع میشه (با probe کردن master.m3u8)
+    تا کاربر گزینه‌های واقعی ببینه — مثلاً 480p/360p که فقط روی یکی از سرورها هست.
 
     Returns:
         لیست dict با فیلدهای:
         - label, bandwidth, resolution, url, server, is_auto
+        مرتب‌شده از بهترین به پایین‌ترین + Auto در ابتدا.
     """
     if not imdb_id:
         return []
@@ -1036,134 +1134,75 @@ async def get_qualities(imdb_id: str, season: Optional[int] = None, episode: Opt
         logger.error("Cannot resolve tmdb_id for %s", imdb_id)
         return []
 
-    # امتحان سرورها به ترتیب — اول سروری که کیفیت‌های متعدد داره پیدا کن
-    # با retry اگه همه fail شدن
-    multi_quality_stream = None
-    fallback_stream = None
+    collected = {}          # label.lower() → Quality dict (اولین سرور اولویت داره)
+    auto_url = None
+    auto_server = ""
 
-    for attempt in range(2):  # 2 تلاش کل
-        if attempt > 0:
-            logger.info("[IMDBPlay] get_qualities: retry attempt %d after delay...", attempt + 1)
-            await asyncio.sleep(2)
+    for server in _SERVERS:
+        try:
+            stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+        except Exception as e:
+            logger.warning("[IMDBPlay] get_qualities: server %s exception: %s", server["name"], e)
+            continue
+        if not stream or not stream.get("url"):
+            continue
 
-        for server in _SERVERS:
-            try:
-                logger.info("[IMDBPlay] get_qualities: Trying server %s... (attempt %d)",
-                            server["name"], attempt + 1)
-                stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
-                if not stream or not stream.get("url"):
+        # اولین استریم موفق = مبنای Auto
+        if not auto_url:
+            auto_url = stream["url"]
+            auto_server = stream.get("server", server["name"])
+
+        server_name = stream.get("server", server["name"])
+
+        # ۱) اگه سرور خودش لیست کیفیت داده (مثل Videasy/Vidking)
+        if stream.get("qualities"):
+            for q in stream["qualities"]:
+                label = str(q.get("label", q.get("quality", ""))).strip()
+                # Auto رو از لیست سرورها جمع نمی‌کنیم — آخر به‌عنوان
+                # بهترین استریم موفق جداگانه اضافه میشه
+                if not label or label.lower() == "auto":
                     continue
+                if q.get("url") and label.lower() not in collected:
+                    collected[label.lower()] = Quality(
+                        label=label, bandwidth=0, resolution="", url=q["url"],
+                        server=server_name, is_auto=False,
+                    ).to_dict()
+            # اینجا continue نمی‌کنیم — لیست خود سرور ممکنه ناقص باشه
+            # (مثلاً 2Embed فقط «auto» می‌ده)؛ master.m3u8 رو هم probe می‌کنیم
 
-                # اگه fallback نداریم، این رو به‌عنوان fallback نگه دار
-                if not fallback_stream:
-                    fallback_stream = stream
+        # ۲) سرورهای MP4 کیفیت مشخصی ندارن
+        if stream.get("type", "hls") != "hls":
+            continue
 
-                # اگه این سرور کیفیت‌های متعدد داره، اون رو انتخاب کن
-                if stream.get("qualities") and len(stream["qualities"]) > 1:
-                    multi_quality_stream = stream
-                    logger.info("[IMDBPlay] ✓ Server %s has %d qualities",
-                                server["name"], len(stream["qualities"]))
-                    break
-                elif stream.get("qualities") and len(stream["qualities"]) == 1:
-                    logger.info("[IMDBPlay] Server %s has 1 quality: %s",
-                                server["name"], stream["qualities"][0].get("label", "?"))
-            except Exception as e:
-                logger.warning("[IMDBPlay] Server %s exception: %s", server["name"], e)
+        # ۳) probe کردن master.m3u8 برای variantهای واقعی
+        variants = await _probe_variants(stream)
+        base_url = stream["url"]
+        for vurl, bw, res in variants:
+            label = _resolution_to_label(res, bw)
+            if label.lower() in collected:
                 continue
+            collected[label.lower()] = Quality(
+                label=label, bandwidth=bw, resolution=res,
+                url=_make_absolute(base_url, vurl),
+                server=server_name, is_auto=False,
+            ).to_dict()
 
-        # اگه چیزی پیدا کردیم، خارج شو
-        if multi_quality_stream or fallback_stream:
-            break
-
-    # اولویت با multi-quality stream هست
-    stream = multi_quality_stream or fallback_stream
-    if not stream:
+    if not auto_url:
         logger.error("No working stream found for %s (tmdb=%s)", imdb_id, tmdb_id)
         return []
 
-    # اگه سرور خودش لیست کیفیت‌ها رو داده (مثل videasy)
-    if stream.get("qualities"):
-        qualities = []
-        # اگه فقط یک کیفیت داریم و از نوع master m3u8 هست، fetch کن
-        for q in stream["qualities"]:
-            q_label = q.get("label", q.get("quality", "Auto"))
-            q_url = q.get("url", "")
-            qualities.append(Quality(
-                label=q_label,
-                bandwidth=0,
-                resolution="",
-                url=q_url,
-                server=stream.get("server", ""),
-                is_auto=q_label.lower() == "auto",
-            ).to_dict())
-        # اگه چند کیفیت داریم، یه Auto هم اضافه کن (بهترین کیفیت)
-        if len(qualities) > 1 and not any(q["label"].lower() == "auto" for q in qualities):
-            auto_q = Quality(
-                label="Auto",
-                bandwidth=0,
-                resolution="",
-                url=qualities[0]["url"],  # اولین کیفیت (معمولاً بهترین)
-                server=stream.get("server", ""),
-                is_auto=True,
-            )
-            qualities.insert(0, auto_q.to_dict())
-        return qualities
+    # مرتب‌سازی نزولی بر اساس height واقعی
+    qualities = list(collected.values())
+    qualities.sort(key=lambda q: -_height_of(q["resolution"], q["bandwidth"]))
 
-    # در غیر این صورت، m3u8 رو fetch کن و بررسی کن master یا variant
-    m3u8_url = stream["url"]
-    headers = {"User-Agent": _USER_AGENT}
-    headers.update(stream.get("headers", {}))
+    # Auto (بهترین استریم موفق) همیشه اول
+    qualities.insert(0, Quality(
+        label="Auto", bandwidth=0, resolution="", url=auto_url,
+        server=auto_server, is_auto=True,
+    ).to_dict())
 
-    try:
-        async with AsyncSession() as s:
-            r = await s.get(m3u8_url, impersonate=_BROWSER_IMPERSONATE, timeout=20, headers=headers)
-            if r.status_code != 200:
-                logger.warning("m3u8 fetch HTTP %d for %s", r.status_code, m3u8_url[:100])
-                return []
-            text = r.text
-    except Exception as e:
-        logger.warning("m3u8 fetch failed: %s", e)
-        return []
-
-    qualities = []
-
-    if "#EXT-X-STREAM-INF:" in text:
-        variants = _parse_master_m3u8(text)
-        variants.sort(key=lambda v: -v[1])
-        for url, bw, res in variants:
-            abs_url = _make_absolute(m3u8_url, url)
-            label = _resolution_to_label(res, bw)
-            q = Quality(
-                label=label,
-                bandwidth=bw,
-                resolution=res,
-                url=abs_url,
-                server=stream.get("server", ""),
-                is_auto=False,
-            )
-            qualities.append(q.to_dict())
-    else:
-        # variant.m3u8 (playlist سگمنت‌ها) — فقط یک کیفیت
-        label = "Auto"
-        m = re.search(r'/(1080p|720p|480p|360p|4k|2160p)/', m3u8_url, re.IGNORECASE)
-        if m:
-            label = m.group(1).lower()
-            if label == "4k":
-                label = "4K"
-            elif label == "2160p":
-                label = "4K"
-        q = Quality(
-            label=label,
-            bandwidth=0,
-            resolution="",
-            url=m3u8_url,
-            server=stream.get("server", ""),
-            is_auto=True,
-        )
-        qualities.append(q.to_dict())
-
-    logger.info("get_qualities %s -> %d qualities from %s",
-                imdb_id, len(qualities), stream.get("server", ""))
+    logger.info("get_qualities %s -> %d quality label(s) aggregated from servers",
+                imdb_id, len(qualities))
     return qualities
 
 
@@ -1190,6 +1229,14 @@ async def download_with_quality(
         season, episode: برای سریال
         progress_cb: callback(done, total)
 
+    رفتار برای کیفیت خاص (مثلاً 480p):
+      1. همه سرورها probe میشن؛ سروری که دقیقاً 480p داره اولویت داره.
+      2. اگه هیچ‌کس 480p نداشت، نزدیک‌ترین پایین‌تر (مثلاً 360p) دانلود میشه
+         — هرگز مثل قبل بی‌سروصدا به 1080p آپگرید نمیشه.
+      3. vidsrcme (که اغلب کیفیت‌های پایین‌تر واقعی داره) قبل از آپگرید امتحان میشه.
+      4. آپگرید به کیفیت بالاتر فقط وقتی انجام میشه که هیچ گزینه ≤ هدف
+         روی هیچ سروری پیدا نشده باشه.
+
     Returns:
         مسیر فایل دانلود شده، یا None در صورت خطا.
     """
@@ -1204,136 +1251,244 @@ async def download_with_quality(
     if not tmdb_id:
         raise RuntimeError(f"Cannot resolve tmdb_id for {imdb_id}")
 
-    # اگه کیفیت خاصی درخواست شده، سروری رو پیدا کن که اون کیفیت رو داشته باشه
+    # اگه کیفیت خاصی درخواست شده، بین همه سرورها دنبال «واقعی‌ترین» تطابق بگرد
     # اگه "Auto" درخواست شده، اولین سرور موفق کافیه
     target_quality = quality_label.lower() if quality_label else "auto"
 
-    stream = None
     if target_quality == "auto":
-        # برای Auto، اولین سرور موفق کافیه
+        # ─── مسیر Auto: اولین سرور موفق ───
         stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
-    else:
-        # برای کیفیت خاص، سرورها رو به ترتیب امتحان کن تا سروری پیدا بشه که اون کیفیت رو داشته باشه
-        for server in _SERVERS:
-            try:
-                logger.info("[IMDBPlay] Trying server %s for quality %s...", server["name"], quality_label)
-                candidate = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
-                if not candidate or not candidate.get("url"):
-                    continue
+        if not stream:
+            raise RuntimeError(f"No working stream found for {imdb_id}")
 
-                # بررسی اینکه آیا این سرور کیفیت مورد نظر رو داره
-                # اگه سرور لیست کیفیت‌ها رو داره (مثل Videasy/Vidking)، چک کن
-                if candidate.get("qualities"):
-                    has_q = any(
-                        q.get("label", "").lower() == target_quality
-                        for q in candidate["qualities"]
-                    )
-                    if has_q:
-                        # این سرور کیفیت مورد نظر رو داره — URL اون کیفیت رو برگردون
-                        for q in candidate["qualities"]:
-                            if q.get("label", "").lower() == target_quality:
-                                candidate["url"] = q["url"]
-                                break
-                        stream = candidate
-                        logger.info("[IMDBPlay] ✓ Server %s has quality %s", server["name"], quality_label)
-                        break
-                    else:
-                        logger.info("[IMDBPlay] ✗ Server %s doesn't have quality %s (has: %s)",
-                                    server["name"], quality_label,
-                                    [q.get("label") for q in candidate["qualities"]])
-                        continue
-                else:
-                    # سرور فقط Auto داره (مثل Vidzee) — اگه کیفیت Auto خواستیم، خوبه
-                    # اگه نه، این سرور رو رد کن
-                    logger.info("[IMDBPlay] ✗ Server %s only has Auto quality", server["name"])
-                    continue
+        # اگه stream از نوع MP4 باشه (مثل 2Embed/vidlink)، دانلود مستقیم
+        if stream.get("type", "hls") == "mp4":
+            try:
+                return await _download_mp4_stream(stream, out_dir, progress_cb)
             except Exception as e:
-                logger.warning("[IMDBPlay] ✗ Server %s exception: %s", server["name"], e)
+                logger.warning("MP4 download from %s failed: %s — falling back to HLS servers",
+                               stream.get("server", "?"), e)
+                _hls_replacement = None
+                # سرورها رو امتحان کن، ولی فقط HLS ها رو
+                for server in _SERVERS:
+                    if server["name"] == stream.get("server"):
+                        continue  # همین سرور رو رد کن
+                    try:
+                        fallback_stream = await _get_stream_for_server(
+                            server, tmdb_id, imdb_id, season, episode)
+                        if fallback_stream and fallback_stream.get("url") \
+                                and fallback_stream.get("type", "hls") == "hls":
+                            logger.info("[IMDBPlay] ✓ Fallback to %s (HLS)", server["name"])
+                            _hls_replacement = fallback_stream
+                            break
+                    except Exception as e2:
+                        logger.warning("[IMDBPlay] Fallback server %s failed: %s", server["name"], e2)
+                        continue
+                if not _hls_replacement:
+                    raise RuntimeError("MP4 download failed and no HLS fallback available")
+                stream = _hls_replacement
+
+        return await _hls_multiround(stream, quality_label, out_dir, progress_cb,
+                                     tmdb_id, imdb_id, season, episode)
+
+    # ─── مسیر کیفیت خاص: رتبه‌بندی همه سرورها بر اساس نزدیکی واقعی به کیفیت ───
+    #
+    # باگ قبلی: اولین سروری که «لیبل دقیق» داشت انتخاب می‌شد و اگه هیچ سروری
+    # لیبل رو نداشت (مثلاً کاربر 480p خواست ولی سرورها 1080/720/360 دارن)،
+    # بی‌سروصدا به Auto (بهترین کیفیت) fallback می‌شد و 1080p دانلود می‌شد!
+    #
+    # الان همه سرورها probe میشن و بر اساس نزدیکی واقعی رتبه می‌گیرن:
+    #   rank 0 = دقیقاً همون height  → دانلود
+    #   rank 1 = نزدیک‌ترین پایین‌تر → دانلود (strict — هیچ‌وقت بالاتر نمی‌گیره)
+    #   rank 2 = نزدیک‌ترین بالاتر   → فقط آخرین راه (آپگرید)
+    #   rank 3 = نامشخص (MP4 یا probe نشد)
+    target_height = _QUALITY_HEIGHTS.get(target_quality, 0)
+    ranked: List[tuple] = []   # (rank, delta, order, server, stream)
+
+    for order, server in enumerate(_SERVERS):
+        try:
+            cand = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+        except Exception as e:
+            logger.warning("[IMDBPlay] ✗ Server %s exception: %s", server["name"], e)
+            continue
+        if not cand or not cand.get("url"):
+            continue
+
+        if cand.get("type", "hls") == "mp4":
+            # MP4 انتخاب کیفیت نداره — فقط به‌عنوان آخرین راه
+            ranked.append((3, 9999, order, server, cand))
+            continue
+
+        rank, delta = 3, 9999
+        matched = None
+        # ۱) لیست کیفیت خود سرور (مثل Videasy/Vidking)
+        if cand.get("qualities"):
+            for q in cand["qualities"]:
+                if str(q.get("label", "")).strip().lower() == target_quality and q.get("url"):
+                    cand = dict(cand)
+                    cand["url"] = q["url"]
+                    matched = ("exact", 0)
+                    break
+        # ۲) probe کردن master.m3u8 برای variantهای واقعی
+        if matched is None:
+            variants = await _probe_variants(cand)
+            res = _rank_variants_for_height(variants, target_height)
+            if res:
+                kind, d, vurl = res
+                matched = (kind, d)
+                cand = dict(cand)
+                cand["url"] = _make_absolute(cand["url"], vurl)
+
+        if matched:
+            rank = {"exact": 0, "below": 1, "above": 2}[matched[0]]
+            delta = matched[1]
+        logger.info("[IMDBPlay] Server %s → rank %d (delta=%s) for %s",
+                    server["name"], rank, delta, quality_label)
+        ranked.append((rank, delta, order, server, cand))
+
+    ranked.sort(key=lambda x: (x[0], x[1], x[2]))
+
+    async def _try_candidate(cand: dict, allow_upgrade: bool) -> str:
+        return await _download_hls_stream(
+            cand, quality_label, out_dir, progress_cb,
+            tmdb_id, imdb_id, season, episode,
+            allow_upgrade=allow_upgrade,
+        )
+
+    # ─── فاز ۱: تطابق دقیق و نزدیک‌ترین پایین‌تر (سخت‌گیرانه) ───
+    strict_cands = [r for r in ranked if r[0] <= 1]
+    for rank, delta, order, server, cand in strict_cands:
+        try:
+            logger.info("[IMDBPlay] Phase 1: %s (rank %d) for %s",
+                        cand.get("server", "?"), rank, quality_label)
+            return await _try_candidate(cand, allow_upgrade=False)
+        except QualityNotAvailable as e:
+            logger.info("[IMDBPlay] %s: no variant ≤ %s (%s)",
+                        cand.get("server", "?"), quality_label, e)
+            continue
+        except Exception as e:
+            logger.warning("[IMDBPlay] Phase 1: %s failed: %s", cand.get("server", "?"), e)
+            continue
+
+    # ─── فاز ۲: تلاش strict دوباره با stream تازه (خطای گذرا / منقضی شدن seed) ───
+    if strict_cands:
+        await asyncio.sleep(2)
+        for rank, delta, order, server, cand in strict_cands:
+            try:
+                fresh = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+                if fresh and fresh.get("url"):
+                    cand = fresh
+            except Exception:
+                pass
+            try:
+                return await _try_candidate(cand, allow_upgrade=False)
+            except QualityNotAvailable:
+                continue
+            except Exception as e:
+                logger.warning("[IMDBPlay] Phase 2: %s failed: %s", cand.get("server", "?"), e)
                 continue
 
-        # اگه هیچ سرور کیفیت مورد نظر رو نداشت، fallback به اولین سرور موفق
-        if not stream:
-            logger.warning("[IMDBPlay] No server has quality %s, falling back to Auto", quality_label)
-            stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
-            # وقتی fallback می‌کنیم، quality_label رو هم به Auto تغییر بده
-            quality_label = "Auto"
+    # ─── فاز ۳: vidsrcme — معمولاً کیفیت‌های پایین‌تر واقعی داره (360/480/720/1080) ───
+    try:
+        from vidsrc_downloader import download_episode as _vde, download_movie as _vdm
+        logger.info("[IMDBPlay] Phase 3: vidsrcme for exact %s", quality_label)
+        if season and episode:
+            _p = await _vde(imdb_id, season, episode, out_dir=out_dir,
+                            quality=quality_label, progress_cb=progress_cb)
+        else:
+            _p = await _vdm(imdb_id, out_dir=out_dir,
+                            quality=quality_label, progress_cb=progress_cb)
+        if _p:
+            return _p
+    except Exception as e:
+        logger.warning("[IMDBPlay] Phase 3: vidsrcme failed: %s", e)
 
+    # ─── فاز ۴: آپگرید — نزدیک‌ترین بالاتر (فقط وقتی هیچ گزینه ≤ هدف نبود یا همه فیل شدن) ───
+    for rank, delta, order, server, cand in ranked:
+        if cand.get("type", "hls") == "mp4":
+            try:
+                logger.info("[IMDBPlay] Phase 4: MP4 from %s (آخرین راه — کیفیت دقیق پیدا نشد)",
+                            cand.get("server", "?"))
+                return await _download_mp4_stream(cand, out_dir, progress_cb)
+            except Exception as e:
+                logger.warning("[IMDBPlay] Phase 4: MP4 %s failed: %s", cand.get("server", "?"), e)
+                continue
+        try:
+            logger.info("[IMDBPlay] Phase 4: upgrade attempt on %s (rank %d)",
+                        cand.get("server", "?"), rank)
+            return await _try_candidate(cand, allow_upgrade=True)
+        except QualityNotAvailable:
+            continue
+        except Exception as e:
+            logger.warning("[IMDBPlay] Phase 4: %s failed: %s", cand.get("server", "?"), e)
+            continue
+
+    # ─── فاز ۵: آخرین راه — Auto مثل قبل ───
+    logger.warning("[IMDBPlay] All quality-specific phases failed for %s — falling back to Auto",
+                   quality_label)
+    stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
     if not stream:
-        raise RuntimeError(f"No working stream found for {imdb_id}")
+        raise RuntimeError(f"No working stream found for {imdb_id} (quality {quality_label})")
+    quality_label = "Auto"
+    if stream.get("type", "hls") == "mp4":
+        try:
+            return await _download_mp4_stream(stream, out_dir, progress_cb)
+        except Exception:
+            pass
+    return await _hls_multiround(stream, quality_label, out_dir, progress_cb,
+                                 tmdb_id, imdb_id, season, episode)
 
+
+async def _download_mp4_stream(
+    stream: dict,
+    out_dir: str,
+    progress_cb: Optional[Callable[[int, int], None]],
+) -> str:
+    """دانلود مستقیم MP4 از یک استریم. در صورت خطا raise می‌کنه تا caller تصمیم بگیره."""
     m3u8_url = stream["url"]
     headers = {"User-Agent": _USER_AGENT}
     headers.update(stream.get("headers", {}))
+    logger.info("Downloading MP4 directly from %s", stream.get("server", ""))
+    out_path = os.path.join(out_dir, f"{int(time.time())}.mp4")
+    async with AsyncSession() as s:
+        # برای MP4، دانلود با chunked
+        r = await s.get(m3u8_url, impersonate=_BROWSER_IMPERSONATE, timeout=600,
+                        headers=headers, stream=True)
+        if r.status_code != 200:
+            raise RuntimeError(f"MP4 fetch HTTP {r.status_code}")
+        total = int(r.headers.get("content-length", 0))
+        done = 0
+        with open(out_path, "wb") as f:
+            async for chunk in r.aiter_content(chunk_size=1024 * 256):
+                f.write(chunk)
+                done += len(chunk)
+                if progress_cb:
+                    try:
+                        progress_cb(done, total)
+                    except Exception:
+                        pass
+    logger.info("Download complete: %s (%.1f MB)",
+                out_path, os.path.getsize(out_path) / 1024 / 1024)
+    return out_path
 
-    # اگه stream از نوع MP4 باشه (مثل 2Embed/vidlink)، دانلود مستقیم
-    stream_type = stream.get("type", "hls")
-    if stream_type == "mp4":
-        logger.info("Downloading MP4 directly from %s", stream.get("server", ""))
-        out_path = os.path.join(out_dir, f"{int(time.time())}.mp4")
-        mp4_failed = False
-        try:
-            async with AsyncSession() as s:
-                # برای MP4، دانلود با chunked
-                r = await s.get(m3u8_url, impersonate=_BROWSER_IMPERSONATE, timeout=600,
-                                headers=headers, stream=True)
-                if r.status_code != 200:
-                    # اگه 429 (rate limited) یا 5xx، به HLS fallback کن
-                    if r.status_code in (429, 500, 502, 503, 504):
-                        logger.warning("MP4 fetch HTTP %d — falling back to HLS server", r.status_code)
-                        mp4_failed = True
-                    else:
-                        raise RuntimeError(f"MP4 fetch HTTP {r.status_code}")
-                else:
-                    total = int(r.headers.get("content-length", 0))
-                    done = 0
-                    with open(out_path, "wb") as f:
-                        async for chunk in r.aiter_content(chunk_size=1024 * 256):
-                            f.write(chunk)
-                            done += len(chunk)
-                            if progress_cb:
-                                try:
-                                    progress_cb(done, total)
-                                except Exception:
-                                    pass
-                    logger.info("Download complete: %s (%.1f MB)",
-                                out_path, os.path.getsize(out_path) / 1024 / 1024)
-                    return out_path
-        except Exception as e:
-            logger.error("MP4 download failed: %s", e)
-            mp4_failed = True
 
-        # اگه MP4 fail شد (429 یا خطا)، fallback به سرور HLS
-        if mp4_failed:
-            logger.info("Falling back to HLS server (skipping MP4-only servers)...")
-            # سرورها رو دوباره امتحان کن، ولی فقط HLS ها رو
-            for server in _SERVERS:
-                if server["name"] == stream.get("server"):
-                    continue  # همین سرور رو رد کن
-                try:
-                    logger.info("[IMDBPlay] Fallback: trying server %s (HLS)...", server["name"])
-                    fallback_stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
-                    if not fallback_stream or not fallback_stream.get("url"):
-                        continue
-                    # فقط HLS رو بپذیر (نه MP4)
-                    if fallback_stream.get("type", "hls") != "hls":
-                        continue
-                    logger.info("[IMDBPlay] ✓ Fallback to %s (HLS)", server["name"])
-                    stream = fallback_stream
-                    m3u8_url = stream["url"]
-                    headers = {"User-Agent": _USER_AGENT}
-                    headers.update(stream.get("headers", {}))
-                    break
-                except Exception as e:
-                    logger.warning("[IMDBPlay] Fallback server %s failed: %s", server["name"], e)
-                    continue
-            else:
-                raise RuntimeError("MP4 download failed and no HLS fallback available")
+async def _hls_multiround(
+    stream: dict,
+    quality_label: str,
+    out_dir: str,
+    progress_cb: Optional[Callable[[int, int], None]],
+    tmdb_id: str,
+    imdb_id: str,
+    season: Optional[int],
+    episode: Optional[int],
+) -> str:
+    """دانلود HLS با fallback بین همه سرورها (۲ دور تلاش) — آخرین لایه محافظت.
 
-    # ─── HLS: دانلود با fallback بین سرورها (۲ دور تلاش) ───
-    # استریم انتخاب‌شده اول امتحان میشه؛ اگه fail شد (مثلاً variant HTTP 502
-    # یا CDN خراب)، سرورهای بعدی به ترتیب اولویت امتحان میشن.
-    # دور دوم با stream/seed تازه انجام میشه چون بعضی خطاها (502 گذرا،
-    # منقضی شدن seed) بعد از چند ثانیه خودشون درست میشن.
+    استریم انتخاب‌شده اول امتحان میشه؛ اگه fail شد (مثلاً variant HTTP 502
+    یا CDN خراب)، سرورهای بعدی به ترتیب اولویت امتحان میشن.
+    دور دوم با stream/seed تازه انجام میشه چون بعضی خطاها (502 گذرا،
+    منقضی شدن seed) بعد از چند ثانیه خودشون درست میشن.
+    """
     _last_err = None
     for _round in range(2):
         if _round > 0:
@@ -1379,6 +1534,7 @@ async def _download_hls_stream(
     imdb_id: str,
     season: Optional[int],
     episode: Optional[int],
+    allow_upgrade: bool = False,
 ) -> str:
     """دانلود HLS از یک استریم مشخص + fallback بین variantها.
 
@@ -1387,6 +1543,10 @@ async def _download_hls_stream(
     - برای خطاهای موقت CDN (مثل 502) هر variant دو بار تلاش میشه.
     - اگه هیچ variant سالم نبود، RuntimeError بالا میده تا caller
       سرور بعدی رو امتحان کنه.
+    - allow_upgrade=False (حالت strict): هرگز variant بالاتر از کیفیت
+      درخواستی انتخاب نمیشه — به‌جاش QualityNotAvailable برمی‌گرده تا
+      caller سرور دیگه‌ای که کیفیت پایین‌تر واقعی داره رو امتحان کنه.
+      این جلوی «کاربر 480p خواست، 1080p گرفت» رو می‌گیره.
     """
     m3u8_url = stream["url"]
     headers = {"User-Agent": _USER_AGENT}
@@ -1406,8 +1566,19 @@ async def _download_hls_stream(
                     logger.warning("m3u8 fetch HTTP %d (attempt %d) — re-fetching stream with new seed",
                                    r.status_code, m3u8_attempt + 1)
                     await asyncio.sleep(1 * (m3u8_attempt + 1))
-                    # Stream جدید با seed جدید
-                    new_stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
+                    # Stream جدید با seed جدید — اول از «همین سرور» (برای حفظ کیفیت انتخابی)
+                    same_server = next(
+                        (sv for sv in _SERVERS if sv["name"] == stream.get("server")), None)
+                    new_stream = None
+                    if same_server:
+                        try:
+                            new_stream = await _get_stream_for_server(
+                                same_server, tmdb_id, imdb_id, season, episode)
+                        except Exception:
+                            new_stream = None
+                    if not (new_stream and new_stream.get("url")):
+                        new_stream = await _get_first_working_stream(
+                            tmdb_id, imdb_id, season, episode)
                     if new_stream and new_stream.get("url"):
                         stream = new_stream
                         m3u8_url = stream["url"]
@@ -1440,39 +1611,16 @@ async def _download_hls_stream(
 
         # اگر کیفیت خاصی خواستیم، variantها رو بر اساس height مرتب کن (نزولی)
         # تا بتونیم نزدیک‌ترین (پایین‌تر یا مساوی) رو پیدا کنیم
-        def _variant_height(v):
-            """استخراج height از variant (res=1920x1080 → 1080)."""
-            res = v[2]
-            if not res or "x" not in res:
-                # از bandwidth حدس بزن
-                bw = v[1]
-                if bw >= 8_000_000: return 1080
-                if bw >= 4_000_000: return 720
-                if bw >= 2_000_000: return 480
-                return 0
-            try:
-                return int(res.split("x")[-1])
-            except (ValueError, IndexError):
-                return 0
-
-        # Quality map: label → height
-        _QUALITY_HEIGHTS = {
-            "2160p": 2160, "4k": 2160, "uhd": 2160,
-            "1080p fullhd": 1080, "1080p x265": 1080, "1080p": 1080,
-            "720p x265": 720, "720p": 720,
-            "480p": 480,
-            "360p": 360,
-            "240p": 240,
-        }
-
         target_height = _QUALITY_HEIGHTS.get(quality_label.lower() if quality_label else "", 0)
 
         # Sort variants by height descending (best first)
-        variants_with_h = [(v, _variant_height(v)) for v in variants]
+        variants_with_h = [(v, _height_of(v[2], v[1])) for v in variants]
         variants_with_h.sort(key=lambda x: -x[1])
 
         # ─── ساخت لیست اولویت‌دار variantها ───
         # اولین variant سالم استفاده میشه؛ بقیه به عنوان fallback.
+        # با allow_upgrade=False (حالت strict) هرگز variant بالاتر از هدف
+        # انتخاب نمیشه — این جلوی «کاربر 480p خواست، 1080p گرفت» رو می‌گیره.
         chosen_list: List[tuple] = []
         if quality_label and quality_label.lower() != "auto" and target_height > 0:
             # 1) تطابق دقیق label
@@ -1482,19 +1630,35 @@ async def _download_hls_stream(
                     chosen_list.append(v)
                     logger.info("✓ Quality match (exact): %s → height=%d", label, h)
                     break
-            # 2) نزدیک‌ترین height ≤ target (نزولی)
+            # 2) نزدیک‌ترین height ≤ target (نزولی — نزدیک‌ترین اول)
             seen = {v[0] for v in chosen_list}
             for v, h in variants_with_h:
                 if v[0] in seen:
                     continue
-                if h <= target_height:
+                if 0 < h <= target_height:
                     chosen_list.append(v)
                     seen.add(v[0])
-            # 3) بقیه کیفیت‌ها به عنوان fallback (نزولی)
-            for v, h in variants_with_h:
-                if v[0] not in seen:
+            # 3) آپگرید فقط وقتی allow_upgrade=True — نزدیک‌ترین بالاتر اول (صعودی)
+            if allow_upgrade:
+                above_asc = [x for x in variants_with_h
+                             if x[0] not in seen and x[1] > target_height]
+                above_asc.sort(key=lambda x: x[1])
+                for v, h in above_asc:
                     chosen_list.append(v)
                     seen.add(v[0])
+                # هر چیز باقی‌مونده (مثلاً height نامشخص) به عنوان آخرین fallback
+                for v, h in variants_with_h:
+                    if v[0] not in seen:
+                        chosen_list.append(v)
+                        seen.add(v[0])
+            elif not chosen_list:
+                # حالت strict و هیچ variant ≤ هدف نیست — بالاتر نگیر، برو سرور بعدی
+                heights = sorted({h for _, h in variants_with_h}, reverse=True)
+                raise QualityNotAvailable(
+                    f"only heights {heights} available, all > target "
+                    f"{target_height} ({quality_label})",
+                    best_height=heights[0] if heights else 0,
+                )
         else:
             # Auto: بهترین کیفیت اول، بعد بقیه
             chosen_list = [v for v, _ in variants_with_h]
@@ -1556,6 +1720,13 @@ async def _download_hls_stream(
     init_path = None
     sem = asyncio.Semaphore(SEGMENT_CONCURRENCY)  # دانلود همزمان سگمنت‌ها (قابل تنظیم با IMDB_SEG_CONCURRENCY)
 
+    # abort زودهنگام: اگه تعداد زیادی سگمنت پشت‌سرهم fail شد (مثلاً پروکسی
+    # 403 می‌ده یا origin down هست)، بقیه رو بی‌خود امتحان نکن — فاز بعدی
+    # (سرور بعدی / vidsrcme) رو سریع‌تر شروع کن.
+    _fail_count = 0
+    _max_fail = max(8, min(30, total // 10))
+    _abort = False
+
     async with AsyncSession(max_clients=SESSION_MAX_CLIENTS) as shared_session:
         # اگه init segment وجود داره (fMP4)، اول اون رو دانلود کن
         if init_url:
@@ -1587,9 +1758,13 @@ async def _download_hls_stream(
                 logger.error("Init segment failed to download after 5 attempts — concat will likely fail")
 
         async def download_one(idx: int, seg_url: str):
-            nonlocal seg_paths
+            nonlocal seg_paths, _fail_count, _abort
+            if _abort:
+                return
             abs_url = _make_absolute(variant_url, seg_url)
             async with sem:
+                if _abort:
+                    return
                 last_err = None
                 for attempt in range(5):
                     try:
@@ -1616,6 +1791,10 @@ async def _download_hls_stream(
                                 except Exception:
                                     pass
                             return
+                        elif r.status_code in (403, 410):
+                            # خطای دائمی (مثلاً بلاک شدن پروکسی) — retry بی‌فایده
+                            last_err = RuntimeError(f"HTTP {r.status_code}")
+                            break
                         elif r.status_code in (429, 503):
                             await asyncio.sleep(0.5 * (attempt + 1))
                         else:
@@ -1625,6 +1804,11 @@ async def _download_hls_stream(
                         logger.debug("seg %d attempt %d failed: %s", idx, attempt, e)
                         await asyncio.sleep(1 * (attempt + 1))
                 logger.error("seg %d failed after 5 attempts: %s", idx, last_err)
+                _fail_count += 1
+                if _fail_count >= _max_fail and not _abort:
+                    _abort = True
+                    logger.error("Too many failed segments (%d/%d) — aborting remaining segment downloads early",
+                                 _fail_count, total)
 
         await asyncio.gather(*[download_one(i, u) for i, (u, _) in enumerate(segments)])
 
