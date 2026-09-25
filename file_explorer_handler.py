@@ -17,13 +17,18 @@
 #     نتیجه سه تا لینک میده: ⚡️ لینک دانلود مستقیم واقعی (URL امضاشده
 #     S3 — ربات قدم تأیید کوکی رو خودکار انجام میده؛ حدود ۱۵ دقیقه
 #     اعتبار داره) + 📄 لینک صفحه فایل + 🗃 لینک صفحه باکس.
-# ۴) 🎬 آپلود برای پخش در VLC:
-#     فایل رو روی هاستِ «لینک مستقیم» می‌ذاره که لینکش بایت خام میده و
-#     مستقیم تو VLC و بقیه پلیرها پلی میشه (برخلاف Filebin که صفحه
-#     تأیید داره). هوشمند: اگه PIXDRAIN_API_KEY تو .env تنظیم شده باشه
-#     → Pixeldrain (تا ۲۰ گیگ، هر پسوندی، لینک پخش + دانلود + صفحه)؛
-#     وگرنه فایل‌های تا ۱ گیگ → Litterbox (بدون ثبت‌نام، لینک ۷۲ ساعته).
-#     برای فایل بزرگ‌تر بدون کلید، راهنمای ساخت کلید رایگان میده.
+# ۴) 🎬 آپلود برای پخش در VLC (زنجیره‌ی فالباک چند‌هاسته):
+#     فایل رو روی اولین هاستِ سالمِ «لینک مستقیم» می‌ذاره که لینکش بایت
+#     خام میده و مستقیم تو VLC پلی میشه (برخلاف Filebin که صفحه تأیید
+#     داره). ترتیب زنجیره:
+#       • سرور خود ربات (بدون آپلود، بدون سقف — راه‌حل همیشگی؛ پورت
+#         VLC_PORT پیش‌فرض 8099، یا VLC_PUBLIC_BASE تو .env)
+#       • Pixeldrain اگه PIXDRAIN_API_KEY تو .env باشه (تا ۲۰ گیگ)
+#       • Litterbox (تا ۱ گیگ، لینک ۷۲ ساعته)
+#       • Catbox (تا ۲۰۰ مگ، دائمی) → 0x0.st (تا ۵۱۲ مگ، ۳۰ روز)
+#     هر هاست ناشناس اول با یه آپلود ۶۴ کیلوبایتی «سلامت‌سنجی» میشه تا
+#     برای هاست خراب چند صد مگ هدر نره؛ هاست شکست‌خورده هم ۲۰ تا ۴۵
+#     دقیقه cooldown می‌گیره و دفعات بعد خودکار رد میشه.
 #  ۵) ❌ لغو (در همه مراحل):
 #     منوی اصلی دکمه «بستن» داره؛ آپلودهای Filebin/VLC و عملیات تغییر نام
 #     هم موقع دانلود/آپلود دکمه «لغو» دارن که همون لحظه عملیات رو قطع
@@ -53,11 +58,13 @@ from telethon.tl.types import (
     DocumentAttributeVideo,
 )
 
-# aiohttp — برای آپلود به Filebin (تو requirements.txt هست)
+# aiohttp — برای آپلود به Filebin/VLC + سرور HTTP خودمیزبان VLC
 try:
     import aiohttp  # type: ignore
+    from aiohttp import web as _web  # type: ignore
 except Exception:
     aiohttp = None
+    _web = None
 
 # کتابخانه‌های اختیاری — اگه نصب نباشن فقط فرمت مربوطه غیرفعال میشه
 try:
@@ -109,17 +116,55 @@ FILEBIN_UA = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# ───────── VLC: Pixeldrain / Litterbox (لینک مستقیم قابل پخش) ─────────
+# ───── VLC: زنجیره‌ی هاست‌های «لینک مستقیم» + فالباک خودکار ─────
 # برخلاف filebin (که برای دانلود صفحه تأیید HTML میده)، لینک این‌ها بایت
-# خام + Accept-Ranges میده و مستقیم تو VLC پلی میشه. تست تجربی:
+# خام + Accept-Ranges میده و مستقیم تو VLC پلی میشه. نتایج تست تجربی
+# (۲۰۲۶-۰۹ از IP دیتاسنتر):
 #   • litterbox: POST multipart به api.php → لینک https://litter.catbox.moe/xx.ext
-#     (بدون ثبت‌نام، سقف ۱ گیگ، ۷۲ ساعت، Range → 206 ✓)
+#     (سقف ۱ گیگ، ۷۲ ساعت، Range → 206 ✓) — گاهی 403/500 میده (بلاک IP
+#     دیتاسنتر یا اورلود بک‌اند) → همون لحظه میریم سراغ فالباک بعدی
 #   • pixeldrain: PUT /api/file/{name} با BasicAuth (پسورد = API Key
-#     اکانت رایگان) → سقف ۲۰ گیگ، لینک /api/file/{id} تو VLC پلی میشه
+#     اکانت رایگان) → سقف ۲۰ گیگ، لینک /api/file/{id} تو VLC پلی میشه؛
+#     بدون کلید «authentication_required» میده → فقط با کلید
+#   • catbox: هم‌خانواده‌ی litterbox — لینک دائمی ولی سقف ۲۰۰ مگ
+#   • 0x0.st: POST multipart → لینک مستقیم (سقف ۵۱۲ مگ، ۳۰+ روز)
+#   • gofile (لینک مستقیم فقط پرمیوم)، temp.sh (بایت خام فقط با POST
+#     که VLC پشتیبانی نمی‌کنه)، bashupload/pomf/oshi/transfer.sh (مرده)،
+#     tmpfiles (ریدایرکت به صفحه) → همگی تست و از زنجیره حذف شدن
 PIXDRAIN_BASE = os.environ.get("PIXDRAIN_BASE", "https://pixeldrain.com").rstrip("/")
 PIXDRAIN_MAX_BYTES = 20 * 1024 * 1024 * 1024        # 20GB — سقف اکانت رایگان
 LITTERBOX_BASE = os.environ.get("LITTERBOX_BASE", "https://litterbox.catbox.moe").rstrip("/")
 LITTERBOX_MAX_BYTES = 1000 * 1024 * 1024            # ۱ گیگ — سقف بدون ثبت‌نام
+CATBOX_BASE = "https://catbox.moe"
+CATBOX_MAX_BYTES = 200 * 1024 * 1024                # ۲۰۰ مگ — سقف بدون ثبت‌نام
+ZEROX0_BASE = os.environ.get("ZEROX0_BASE", "https://0x0.st").rstrip("/")
+ZEROX0_MAX_BYTES = 512 * 1024 * 1024                # ۵۱۲ مگ
+
+# ⭐ سرور خودمیزبان VLC — «راه حل همیشگی»: فایل از خود سرور ربات با
+# پشتیبانی Range سرو میشه؛ نه آپلود بیرونی می‌خواد نه ثبت‌نام و نه سقف
+# حجمی، و هیچ هاست ثالثی هم نمی‌تونه بلاکش کنه. تنظیمات (همه اختیاری):
+#   VLC_PORT        پورت HTTP سرور (پیش‌فرض 8099)
+#   VLC_PUBLIC_BASE آدرس عمومی اگه دامنه/پورت‌فوروارد خاصی داری
+#                   (مثلاً https://vlc.example.com یا http://5.6.7.8:9000)
+#   VLC_SELF_HOST   بذار 0 تا کلاً غیرفعال بشه
+VLC_SELF_PORT = int(os.environ.get("VLC_PORT", "8099") or "8099")
+VLC_PUBLIC_BASE = os.environ.get("VLC_PUBLIC_BASE", "").strip().rstrip("/")
+VLC_SELF_ENABLED = os.environ.get("VLC_SELF_HOST", "1").strip().lower() not in {"0", "false", "no", "off"}
+VLC_SELF_TTL = 6 * 3600                             # فایل ۶ ساعت سرو میشه
+_VLC_STREAM_DIR = "/tmp/vlc_streams"
+_VLC_WEB_FILES: Dict[str, dict] = {}                # token → اطلاعات فایل
+_VLC_WEB_READY = asyncio.Event()
+_VLC_SERVER_TASK: Optional[asyncio.Task] = None
+_VLC_SERVER_BASE: Optional[str] = None              # وقتی سالم شد ست میشه
+_VLC_SERVER_CHECKED_AT = 0.0
+_VLC_CANARY_PATH = "/tmp/.vlc_canary_64k.bin"
+
+# 🧠 حافظه‌ی سلامت هاست‌ها — هاستی که شکست بخوره تا این‌دیگر امتحان
+# نمیشه (که هر بار چند صد مگ برای هاست مرده آپلود و هدر نشه)
+_HOST_COOLDOWN_UNTIL: Dict[str, float] = {}         # host_key → زمان رفع محرومیت
+_HOST_COOLDOWN_SECS = {"litterbox": 45 * 60, "catbox": 20 * 60, "zerox0": 20 * 60}
+_CANARY_HOSTS = {"litterbox", "catbox", "zerox0"}
+_CANARY_OK_UNTIL: Dict[str, float] = {}             # نتیجه‌ی canary ۱۰ دقیقه‌ای کش میشه
 
 # ⚠️ FIX: ReplyInlineMarkup(rows=[]) روی سرور تلگرام نامعتبره و خطای
 # ReplyMarkupInvalidError میده. برای «غیرفعال کردن» دکمه‌های قبلی موقع ادیت
@@ -315,6 +360,8 @@ async def _pixeldrain_upload(remote_name: str, local_path: str, prog, api_key: s
                         "play_url": f"{PIXDRAIN_BASE}/api/file/{fid}",
                         "dl_url": f"{PIXDRAIN_BASE}/api/file/{fid}?download",
                         "page_url": f"{PIXDRAIN_BASE}/u/{fid}",
+                        "host_fa": "پیکسل‌درین",
+                        "expires_fa": "تا ۳۰ روز بی‌فعالیت",
                     }
                 if resp.status == 401:
                     raise _FeError(
@@ -331,18 +378,19 @@ async def _pixeldrain_upload(remote_name: str, local_path: str, prog, api_key: s
         raise _FeError(f"خطای اتصال به پیکسل‌درین:\n<code>{_esc(str(e)[:120])}</code>")
 
 
-async def _litterbox_upload(remote_name: str, local_path: str, prog) -> dict:
+async def _litterbox_upload(remote_name: str, local_path: str, prog, ttl: str = "72h") -> dict:
     """آپلود استریمی به litterbox.catbox.moe — بدون ثبت‌نام (سقف ۱ گیگ، ۷۲ ساعت).
 
-    POST multipart به api.php با فیلدهای reqtype=fileupload / time=72h /
+    POST multipart به api.php با فیلدهای reqtype=fileupload / time / 
     fileToUpload → جواب: متن ساده‌ی لینک مستقیم (بایت خام + Range → VLC ✓)
-    خروجی: dict با play_url (همون لینک مستقیم برای پخش و دانلود)."""
+    خروجی: dict با play_url (همون لینک مستقیم برای پخش و دانلود).
+    ttl برای canary سلامت‌سنجی «1h» میشه (کم‌هزینه‌ترین گزینه)."""
     url = f"{LITTERBOX_BASE}/resources/internals/api.php"
     total = os.path.getsize(local_path)
     payload = _ProgressFilePayload(local_path, prog, total)
     form = aiohttp.FormData()
     form.add_field("reqtype", "fileupload")
-    form.add_field("time", "72h")
+    form.add_field("time", ttl)
     form.add_field("fileToUpload", payload, filename=remote_name or "file.bin")
     headers = {"Accept": "*/*", "User-Agent": FILEBIN_UA}
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
@@ -352,7 +400,14 @@ async def _litterbox_upload(remote_name: str, local_path: str, prog) -> dict:
                 body = (await resp.text(errors="ignore")).strip()
                 if resp.status == 200 and body.startswith("http"):
                     link = body.split()[0][:300]
-                    return {"name": remote_name, "play_url": link, "dl_url": link, "page_url": ""}
+                    return {
+                        "name": remote_name,
+                        "play_url": link,
+                        "dl_url": link,
+                        "page_url": "",
+                        "host_fa": "Litterbox",
+                        "expires_fa": "۷۲ ساعت" if ttl == "72h" else ttl,
+                    }
                 raise _FeError(
                     f"Litterbox آپلود رو قبول نکرد (کد {resp.status}):\n"
                     f"<code>{_esc(body[:120])}</code>"
@@ -361,6 +416,396 @@ async def _litterbox_upload(remote_name: str, local_path: str, prog) -> dict:
         raise
     except Exception as e:
         raise _FeError(f"خطای اتصال به Litterbox:\n<code>{_esc(str(e)[:120])}</code>")
+
+
+async def _catbox_upload(remote_name: str, local_path: str, prog) -> dict:
+    """آپلود استریمی به catbox.moe — هم‌خانواده‌ی litterbox ولی لینکش دائمی‌ست (سقف ۲۰۰ مگ).
+
+    POST multipart به user/api.php با reqtype=fileupload → جواب: متن ساده‌ی
+    لینک https://files.catbox.moe/xx.ext (بایت خام + Range → VLC ✓)"""
+    url = f"{CATBOX_BASE}/user/api.php"
+    total = os.path.getsize(local_path)
+    payload = _ProgressFilePayload(local_path, prog, total)
+    form = aiohttp.FormData()
+    form.add_field("reqtype", "fileupload")
+    form.add_field("fileToUpload", payload, filename=remote_name or "file.bin")
+    headers = {"Accept": "*/*", "User-Agent": FILEBIN_UA}
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, data=form, headers=headers) as resp:
+                body = (await resp.text(errors="ignore")).strip()
+                if resp.status == 200 and body.startswith("http"):
+                    link = body.split()[0][:300]
+                    return {
+                        "name": remote_name,
+                        "play_url": link,
+                        "dl_url": link,
+                        "page_url": "",
+                        "host_fa": "Catbox",
+                        "expires_fa": "دائمی",
+                    }
+                raise _FeError(
+                    f"Catbox آپلود رو قبول نکرد (کد {resp.status}):\n"
+                    f"<code>{_esc(body[:120])}</code>"
+                )
+    except _FeError:
+        raise
+    except Exception as e:
+        raise _FeError(f"خطای اتصال به Catbox:\n<code>{_esc(str(e)[:120])}</code>")
+
+
+async def _zerox0_upload(remote_name: str, local_path: str, prog) -> dict:
+    """آپلود استریمی به 0x0.st — بدون ثبت‌نام (سقف ۵۱۲ مگ، نگهداری ۳۰+ روز).
+
+    POST multipart با فیلد file → جواب: متن ساده‌ی لینک مستقیم.
+    ⚠️ بعضی IPهای دیتاسنتری رو بلاک می‌کنه — فقط یه فالباک ارزونه."""
+    url = ZEROX0_BASE
+    total = os.path.getsize(local_path)
+    payload = _ProgressFilePayload(local_path, prog, total)
+    form = aiohttp.FormData()
+    form.add_field("file", payload, filename=remote_name or "file.bin")
+    headers = {"Accept": "*/*", "User-Agent": FILEBIN_UA}
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, data=form, headers=headers) as resp:
+                body = (await resp.text(errors="ignore")).strip()
+                if resp.status == 200 and body.startswith("http"):
+                    link = body.split()[0][:300]
+                    return {
+                        "name": remote_name,
+                        "play_url": link,
+                        "dl_url": link,
+                        "page_url": "",
+                        "host_fa": "0x0.st",
+                        "expires_fa": "حداقل ۳۰ روز",
+                    }
+                raise _FeError(
+                    f"0x0.st آپلود رو قبول نکرد (کد {resp.status}):\n"
+                    f"<code>{_esc(body[:120])}</code>"
+                )
+    except _FeError:
+        raise
+    except Exception as e:
+        raise _FeError(f"خطای اتصال به 0x0.st:\n<code>{_esc(str(e)[:120])}</code>")
+
+
+# ═══════ سرور خودمیزبان VLC — راه‌حل همیشگی بدون هاست ثالث ═══════
+# یه HTTP server کوچیک با aiohttp.web که فایل رو با پشتیبانی کامل Range
+# (برای seek در VLC) سرو می‌کنه. فقط یک‌بار راه می‌افته و تا خاموشی ربات
+# زنده می‌مونه. دسترسی عمومی با self-check تأیید میشه (اگه پورت بسته باشه
+# خودکار از زنجیره حذف میشه و بقیه هاست‌ها امتحان میشن).
+
+
+def _vlc_guess_type(name: str) -> str:
+    """تشخیص content-type برای سرو ویدیو/صدا/بقیه."""
+    ext = os.path.splitext(name)[1].lower()
+    return {
+        ".mp4": "video/mp4", ".m4v": "video/mp4", ".mkv": "video/x-matroska",
+        ".webm": "video/webm", ".avi": "video/x-msvideo", ".mov": "video/quicktime",
+        ".wmv": "video/x-msvideo", ".flv": "video/x-flv", ".ts": "video/mp2t",
+        ".mpg": "video/mpeg", ".mpeg": "video/mpeg", ".3gp": "video/3gpp",
+        ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".flac": "audio/flac",
+        ".ogg": "audio/ogg", ".wav": "audio/wav", ".opus": "audio/opus",
+        ".srt": "application/x-subrip", ".vtt": "text/vtt",
+        ".pdf": "application/pdf", ".zip": "application/zip",
+    }.get(ext, "application/octet-stream")
+
+
+def _vlc_sweep_expired():
+    """پاکسازی فایل‌های منقضی‌شده‌ی سرور خودمیزبان."""
+    now = time.time()
+    expired = [t for t, v in _VLC_WEB_FILES.items() if v["expires_at"] < now]
+    for t in expired:
+        v = _VLC_WEB_FILES.pop(t)
+        try:
+            if os.path.islink(v["path"]) or os.path.exists(v["path"]):
+                os.unlink(v["path"])
+        except Exception:
+            pass
+
+
+async def _vlc_health_handler(request):
+    """GET /vlc_health — برای self-check دسترسی عمومی."""
+    return _web.Response(text="ok")
+
+
+async def _vlc_web_handler(request):
+    """GET /vlc/{token}[/{name}] — بایت خام + پشتیبانی کامل Range (206).
+
+    فرم‌های Range پشتیبانی‌شده: bytes=start-end / bytes=start- / bytes=-suffix
+    (همون چیزی که VLC و بقیه پلیرها برای seek می‌فرستن)."""
+    token = request.match_info.get("token", "")
+    info = _VLC_WEB_FILES.get(token)
+    if not info:
+        return _web.Response(status=404, text="not found")
+    if time.time() > info["expires_at"]:
+        _VLC_WEB_FILES.pop(token, None)
+        try:
+            if os.path.islink(info["path"]) or os.path.exists(info["path"]):
+                os.unlink(info["path"])
+        except Exception:
+            pass
+        return _web.Response(status=410, text="expired")
+    path = info["path"]
+    if not os.path.exists(path):
+        return _web.Response(status=404, text="file gone")
+    size = info["size"]
+    hdr_name = re.sub(r"[^A-Za-z0-9._()\[\]-]", "_", info["name"]) or "file.bin"
+    start, end, status = 0, size - 1, 200
+    m = re.match(r"^bytes=(\d*)-(\d*)$", (request.headers.get("Range") or "").strip())
+    if m and (m.group(1) or m.group(2)):
+        try:
+            if m.group(1):
+                start = int(m.group(1))
+                end = int(m.group(2)) if m.group(2) else size - 1
+            else:  # پسوندی: N بایت آخر
+                start = max(0, size - int(m.group(2)))
+                end = size - 1
+        except ValueError:
+            start, end = 0, size - 1
+        if start >= size:
+            return _web.Response(status=416, headers={"Content-Range": f"bytes */{size}"})
+        start, end = max(0, start), min(end, size - 1)
+        if start > end:
+            start, end, status = 0, size - 1, 200
+        else:
+            status = 206
+    length = end - start + 1
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": info["content_type"],
+        "Content-Disposition": f'inline; filename="{hdr_name}"',
+        "Cache-Control": "no-store",
+    }
+    if status == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    resp = _web.StreamResponse(status=status, headers=headers)
+    resp.content_length = length
+    await resp.prepare(request)
+    remaining = length
+    try:
+        with open(path, "rb") as f:
+            f.seek(start)
+            while remaining > 0:
+                chunk = f.read(min(512 * 1024, remaining))
+                if not chunk:
+                    break
+                await resp.write(chunk)
+                remaining -= len(chunk)
+        await resp.write_eof()
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass  # پلیر وسط پخش قطع شد — طبیعیه
+    except Exception as e:
+        logger.warning(f"[FileExplorer] vlc stream error: {e}")
+    return resp
+
+
+async def _start_vlc_web_server():
+    """راه‌اندازی یک‌باره‌ی سرور HTTP خودمیزبان (تا خاموشی ربات زنده می‌مونه)."""
+    try:
+        from aiohttp import web as web_mod
+    except Exception as e:
+        logger.warning(f"[FileExplorer] aiohttp.web unavailable: {e}")
+        return
+    try:
+        os.makedirs(_VLC_STREAM_DIR, exist_ok=True)
+        app = web_mod.Application()
+        app.router.add_get("/vlc_health", _vlc_health_handler)
+        app.router.add_get("/vlc/{token}", _vlc_web_handler)
+        app.router.add_get("/vlc/{token}/{name}", _vlc_web_handler)
+        runner = web_mod.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web_mod.TCPSite(runner, "0.0.0.0", VLC_SELF_PORT, reuse_address=True)
+        await site.start()
+        _VLC_WEB_READY.set()
+        logger.info(f"[FileExplorer] VLC self-host HTTP server on 0.0.0.0:{VLC_SELF_PORT}")
+        while True:
+            await asyncio.sleep(3600)
+    except Exception as e:
+        logger.warning(
+            f"[FileExplorer] VLC self-host could not bind :{VLC_SELF_PORT} ({e}) "
+            "→ از زنجیره حذف شد؛ VLC_PORT دیگه‌ای تو .env تنظیم کن"
+        )
+
+
+async def _detect_public_base() -> Optional[str]:
+    """IP عمومی سرور رو از سرویس‌های echo می‌گیره (برای لینک self-host)."""
+    if aiohttp is None:
+        return None
+    timeout = aiohttp.ClientTimeout(total=10, sock_connect=8)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            for u in ("https://api.ipify.org/", "https://ifconfig.me/ip"):
+                try:
+                    async with s.get(u, headers={"User-Agent": FILEBIN_UA}) as r:
+                        if r.status == 200:
+                            t = (await r.text()).strip()
+                            if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", t):
+                                return f"http://{t}:{VLC_SELF_PORT}"
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+async def _ensure_vlc_web_server() -> Optional[str]:
+    """مطمئن میشه سرور خودمیزبان بالاست و از مسیر عمومی هم قابل دسترسی‌ست.
+
+    خروجی: base URL سالم (مثل http://5.6.7.8:8099) یا None (پورت بسته/غیرفعال).
+    نتیجه‌ی سالم ۱۰ دقیقه کش میشه که هر کلیک چک مجدد نشه."""
+    global _VLC_SERVER_TASK, _VLC_SERVER_BASE, _VLC_SERVER_CHECKED_AT
+    if not VLC_SELF_ENABLED or aiohttp is None or _web is None:
+        return None
+    now = time.time()
+    if _VLC_SERVER_BASE and (now - _VLC_SERVER_CHECKED_AT) < 600:
+        return _VLC_SERVER_BASE
+    if _VLC_SERVER_TASK is None or _VLC_SERVER_TASK.done():
+        _VLC_SERVER_TASK = asyncio.ensure_future(_start_vlc_web_server())
+        try:
+            await asyncio.wait_for(_VLC_WEB_READY.wait(), timeout=5)
+        except Exception:
+            pass  # بند نشد — health check پایین هم به‌هرحال رد می‌کنه
+    base = VLC_PUBLIC_BASE or await _detect_public_base()
+    if not base:
+        logger.warning("[FileExplorer] VLC self-host: آدرس عمومی تشخیص داده نشد")
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=12, sock_connect=8)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(f"{base.rstrip('/')}/vlc_health") as r:
+                if r.status == 200 and (await r.text()).strip() == "ok":
+                    _VLC_SERVER_BASE = base.rstrip("/")
+                    _VLC_SERVER_CHECKED_AT = now
+                    logger.info(f"[FileExplorer] VLC self-host healthy: {_VLC_SERVER_BASE}")
+                    return _VLC_SERVER_BASE
+    except Exception as e:
+        logger.warning(f"[FileExplorer] VLC self-host health check failed ({base}): {e}")
+    return None
+
+
+async def _selfhost_upload(remote_name: str, local_path: str, prog) -> dict:
+    """⭐ راه‌حل همیشگی — فایل روی HTTP سرور خودِ ربات سرو میشه.
+
+    نه آپلود بیرونی لازمه (لینک فوریه)، نه ثبت‌نام، نه سقف حجم؛ و هیچ
+    هاست ثالثی هم نمی‌تونه بلاکش کنه. فایل به پوشه‌ی سرو منتقل (move)
+    میشه و ۶ ساعت قابل پخشه."""
+    base = await _ensure_vlc_web_server()
+    if not base:
+        raise _FeError(
+            "سرور VLC خودِ ربات در دسترس نیست — پورت <code>"
+            f"{VLC_SELF_PORT}</code> تو فایروال سرور بسته‌ست "
+            "(یا تو <code>.env</code> بذار <code>VLC_SELF_HOST=0</code> تا کلاً رد بشه)"
+        )
+    _vlc_sweep_expired()
+    token = secrets.token_hex(10)
+    safe = _safe_disk_name(remote_name) or "file.bin"
+    os.makedirs(_VLC_STREAM_DIR, exist_ok=True)
+    dest = os.path.join(_VLC_STREAM_DIR, f"{token}_{safe}")
+    shutil.move(local_path, dest)   # cross-device هم خودش کپی+پاک می‌کنه
+    _VLC_WEB_FILES[token] = {
+        "path": dest,
+        "name": safe,
+        "size": os.path.getsize(dest),
+        "content_type": _vlc_guess_type(safe),
+        "expires_at": time.time() + VLC_SELF_TTL,
+    }
+    url = f"{base}/vlc/{token}/{quote(safe)}"
+    prog.cb(1, 1)
+    logger.info(f"[FileExplorer] vlc self-host: {safe} → {url}")
+    return {
+        "name": remote_name,
+        "play_url": url,
+        "dl_url": url,
+        "page_url": "",
+        "host_fa": "سرور خود ربات",
+        "expires_fa": "۶ ساعت (تا ری‌استارت ربات)",
+    }
+
+
+# ═══════ سلامت‌سنجی + حافظه‌ی هاست‌ها + زنجیره‌ی فالباک ═══════
+
+
+class _NoopProg:
+    """پیشرفت ساختگی برای آپلودهای سلامت‌سنج (canary)."""
+
+    def cb(self, current: int, total: int):
+        pass
+
+
+def _vlc_canary_file() -> str:
+    """فایل ۶۴ کیلوبایتی ثابت برای canary — یک‌بار ساخته میشه."""
+    try:
+        if not os.path.exists(_VLC_CANARY_PATH) or os.path.getsize(_VLC_CANARY_PATH) != 65536:
+            with open(_VLC_CANARY_PATH, "wb") as f:
+                f.write(os.urandom(65536))
+    except Exception:
+        pass
+    return _VLC_CANARY_PATH
+
+
+async def _canary_ok(host_key: str) -> bool:
+    """سلامت‌سنجی ۶۴ کیلوبایتی هاست‌های ناشناس — تا برای هاست مرده چند
+    صد مگ آپلود و هدر نره. نتیجه‌ی موفق ۱۰ دقیقه کش میشه."""
+    if time.time() < _CANARY_OK_UNTIL.get(host_key, 0.0):
+        return True
+    path = _vlc_canary_file()
+    try:
+        if host_key == "litterbox":
+            await _litterbox_upload("canary.bin", path, _NoopProg(), ttl="1h")
+        elif host_key == "catbox":
+            await _catbox_upload("canary.bin", path, _NoopProg())
+        elif host_key == "zerox0":
+            await _zerox0_upload("canary.bin", path, _NoopProg())
+        else:
+            return True
+    except Exception as e:
+        logger.info(f"[FileExplorer] canary {host_key} failed: {e}")
+        return False
+    _CANARY_OK_UNTIL[host_key] = time.time() + 600
+    return True
+
+
+def _host_in_cooldown(key: str) -> bool:
+    return time.time() < _HOST_COOLDOWN_UNTIL.get(key, 0.0)
+
+
+def _host_fail(key: str):
+    """هاست شکست‌خورده رو یه مدت استراحت می‌ده (مدت‌ها تو _HOST_COOLDOWN_SECS)."""
+    secs = _HOST_COOLDOWN_SECS.get(key, 20 * 60)
+    _HOST_COOLDOWN_UNTIL[key] = time.time() + secs
+    logger.warning(f"[FileExplorer] host {key} failed → cooldown {secs // 60}m")
+
+
+def _host_ok(key: str):
+    _HOST_COOLDOWN_UNTIL.pop(key, None)
+
+
+def _vlc_chain(size: int, api_key: str):
+    """زنجیره‌ی هاست‌های VLC به ترتیب تلاش — بر اساس حجم/کلید/cooldown.
+
+    خروجی: لیستی از (key, نام‌فارسی, coroutine_factory) که coroutine_factory
+    امضای (remote_name, local_path, prog) داره."""
+    items = []
+    if VLC_SELF_ENABLED:
+        items.append(("selfhost", "سرور خود ربات", 1 << 60,
+                      lambda rn, p, pr: _selfhost_upload(rn, p, pr)))
+    if api_key:
+        items.append(("pixeldrain", "پیکسل‌درین", PIXDRAIN_MAX_BYTES,
+                      lambda rn, p, pr: _pixeldrain_upload(rn, p, pr, api_key)))
+    items.append(("litterbox", "Litterbox", LITTERBOX_MAX_BYTES,
+                  lambda rn, p, pr: _litterbox_upload(rn, p, pr)))
+    items.append(("catbox", "Catbox", CATBOX_MAX_BYTES,
+                  lambda rn, p, pr: _catbox_upload(rn, p, pr)))
+    items.append(("zerox0", "0x0.st", ZEROX0_MAX_BYTES,
+                  lambda rn, p, pr: _zerox0_upload(rn, p, pr)))
+    return [
+        (k, fa, mk)
+        for k, fa, mx, mk in items
+        if size <= mx and not _host_in_cooldown(k)
+    ]
 
 
 async def _safe_edit(event, text: str, rows=None) -> bool:
@@ -1626,11 +2071,15 @@ async def fe_filebin_cb(event):
 async def fe_vlc_cb(event):
     """دکمه 🎬 آپلود برای پخش در VLC: fvlc_<chat_id>_<msg_id>
 
-    فایل رو دانلود می‌کنه و روی هاستی می‌ذاره که لینکش بایت خام میده و
-    مستقیم تو VLC پلی میشه (برخلاف filebin که صفحه تأیید داره). هوشمند:
-    • اگه PIXDRAIN_API_KEY تو .env تنظیم شده باشه → Pixeldrain (تا ۲۰ گیگ)
-    • وگرنه برای فایل‌های تا ۱ گیگ → Litterbox (بدون ثبت‌نام، لینک ۷۲ ساعته)
-    • فایل بزرگ‌تر بدون کلید → راهنمای ساخت کلید رایگان Pixeldrain
+    فایل رو دانلود می‌کنه و روی اولین هاست سالمِ «لینک مستقیم» می‌ذاره که
+    بایت خام میده و مستقیم تو VLC پلی میشه (برخلاف filebin که صفحه تأیید
+    داره). زنجیره‌ی فالباک (به ترتیب تلاش):
+    • سرور خود ربات (بدون آپلود، بدون سقف — پورت VLC_PORT؛ پیش‌فرض 8099)
+    • Pixeldrain اگه PIXDRAIN_API_KEY تو .env تنظیم شده باشه (تا ۲۰ گیگ)
+    • Litterbox (تا ۱ گیگ، لینک ۷۲ ساعته)
+    • Catbox (تا ۲۰۰ مگ، دائمی) → 0x0.st (تا ۵۱۲ مگ، ۳۰ روز)
+    هر هاست ناشناس اول با آپلود ۶۴ کیلوبایتی سلامت‌سنجی میشه و هاست
+    خراب cooldown می‌گیره تا دفعات بعد خودکار رد بشه.
     """
     chat_id = msg_id = None
     work_dir = None
@@ -1661,34 +2110,30 @@ async def fe_vlc_cb(event):
         fname = _doc_filename(doc) or f"file_{msg_id}"
         size = getattr(doc, "size", 0) or 0
 
-        # انتخاب هوشمند هاست — کلید پیکسل‌درین اختیاریه (تا ۲۰ گیگ)
+        # 🆕 انتخاب هوشمند هاست — زنجیره‌ی فالباک چند‌هاسته
         api_key = (os.environ.get("PIXDRAIN_API_KEY") or "").strip()
-        if api_key:
-            provider = "pixeldrain"
-            if size > PIXDRAIN_MAX_BYTES:
-                await event.answer(
-                    f"⚠️ فایل {_fmt_size(size)} هست — از سقف ۲۰ گیگ پیکسل‌درین بزرگ‌تره",
-                    alert=True,
-                )
-                return
-        elif size <= LITTERBOX_MAX_BYTES:
-            provider = "litterbox"
-        else:
-            # فایل بزرگ بدون کلید → راهنمای ساخت کلید رایگان + برگشت منو
+        chain = _vlc_chain(size, api_key)
+        if not chain:
+            # فقط وقتی سرور خودمیزبان خاموشه، کلید هم نیست و حجم از سقف
+            # همه‌ی هاست‌های ناشناس (۱ گیگ) بزرگ‌تره
             try:
-                await event.answer("⚠️ برای فایل بزرگ‌تر از ۱ گیگ کلید Pixeldrain لازمه", alert=True)
+                await event.answer("⚠️ برای این حجم تنظیمات لازمه", alert=True)
             except Exception:
                 pass
             await _safe_edit(
                 event,
                 "⚠️ حجم فایل <b>" + _esc(_fmt_size(size)) + "</b> هست و بدون تنظیمات، "
-                "سقف آپلودِ لینکِ قابل‌پخش (VLC) برای فایل‌ها <b>۱ گیگ</b>ه.\n\n"
-                "برای فایل‌های بزرگ‌تر (تا <b>۲۰ گیگ</b>):\n"
+                "سقف لینکِ قابل‌پخش (VLC) برای فایل‌ها <b>۱ گیگ</b>ه. دو راه داری:\n\n"
+                "راه ۱ — فایل‌های تا <b>۲۰ گیگ</b> با پیکسل‌درین:\n"
                 "۱️⃣ تو سایت pixeldrain.com یه اکانت رایگان بساز\n"
                 "۲️⃣ از بخش تنظیمات اکانت، API Key رو کپی کن\n"
-                "۳️⃣ تو فایل <code>.env</code> ربات این خط رو اضافه کن:\n"
+                "۳️⃣ تو فایل <code>.env</code> ربات این خط رو اضافه کن: "
                 "<code>PIXDRAIN_API_KEY=کلید-شما</code>\n"
-                "۴️⃣ ربات رو ری‌استارت کن و دوباره دکمه رو بزن",
+                "۴️⃣ ربات رو ری‌استارت کن\n\n"
+                "راه ۲ — بدون محدودیت با سرور خود ربات:\n"
+                "پورت <code>VLC_PORT</code> (پیش‌فرض 8099) رو تو فایروال سرور باز کن "
+                "(یا آدرس عمومی رو تو <code>.env</code> بذار: "
+                "<code>VLC_PUBLIC_BASE=http://IP-سرور:پورت</code>)",
                 _menu_rows(chat_id, msg_id),
             )
             return
@@ -1698,14 +2143,12 @@ async def fe_vlc_cb(event):
         except Exception:
             pass
 
-        prov_fa = "پیکسل‌درین" if provider == "pixeldrain" else "Litterbox"
-
         # 🆕 توکن یکتا برای دکمه لغو این عملیات
         abort_token = secrets.token_hex(6)
 
         await _safe_edit(
             event,
-            f"🎬 در حال دانلود <b>{_esc(fname)}</b> برای آپلود به {prov_fa}...",
+            f"🎬 در حال دانلود <b>{_esc(fname)}</b> برای آپلود...",
             _abort_rows(abort_token),
         )
 
@@ -1728,49 +2171,95 @@ async def fe_vlc_cb(event):
             return
 
         remote_name = _filebin_remote_name(fname)
-        # ⚠️ آپلود بدون توکن‌ریز در cb — لغو با کنسلِ تسک (بخش Filebin)
-        prog_up = _ProgEdit(btn_msg, "آپلود")
-        if provider == "pixeldrain":
-            res = await _run_upload_with_abort(
-                abort_token, _pixeldrain_upload(remote_name, got, prog_up, api_key)
-            )
-        else:
-            res = await _run_upload_with_abort(
-                abort_token, _litterbox_upload(remote_name, got, prog_up)
-            )
-
+        # ⚠️ حجم قبل از حلقه — هاست selfhost فایل رو move می‌کنه
         fsize = os.path.getsize(got)
+        # ⚠️ آپلود بدون توکن‌ریز در cb — لغو با کنسلِ تسک (بخش Filebin)
+
+        errors: list = []
+        res = None
+        used_host = ""
+        for host_key, host_fa, make_coro in chain:
+            # 🔎 سلامت‌سنجی هاست‌های ناشناس — هدررفت آپلود سنگین ممنوع
+            if host_key in _CANARY_HOSTS:
+                await _safe_edit(
+                    event,
+                    f"🔎 سلامت‌سنجی {host_fa}...",
+                    _abort_rows(abort_token),
+                )
+                try:
+                    alive = await _run_upload_with_abort(abort_token, _canary_ok(host_key))
+                except _UploadAborted:
+                    raise
+                except Exception:
+                    alive = False
+                if not alive:
+                    _host_fail(host_key)
+                    errors.append(f"{host_fa}: فعلاً پاسخگو نیست (سلامت‌سنجی رد شد)")
+                    logger.info(f"[FileExplorer] vlc: {host_key} canary failed → skip")
+                    continue
+            await _safe_edit(
+                event,
+                f"⬆️ آپلود <b>{_esc(fname)}</b> به {host_fa}...",
+                _abort_rows(abort_token),
+            )
+            prog_up = _ProgEdit(btn_msg, f"آپلود {host_fa}")
+            try:
+                res = await _run_upload_with_abort(
+                    abort_token, make_coro(remote_name, got, prog_up)
+                )
+                used_host = host_fa
+                _host_ok(host_key)
+                break
+            except _UploadAborted:
+                raise
+            except Exception as e:
+                _host_fail(host_key)
+                errors.append(f"{host_fa}: {_esc(str(e).splitlines()[0][:110])}")
+                logger.warning(f"[FileExplorer] vlc: host {host_key} failed → next", exc_info=True)
+                continue
+
+        if res is None:
+            err_block = "\n".join(f"  • {x}" for x in errors) or "  • خطای نامشخص"
+            await _safe_edit(
+                event,
+                "❌ <b>هیچ‌کدوم از هاست‌ها جواب ندادن:</b>\n"
+                f"{err_block}\n\n"
+                "💡 راه‌های دائمی:\n"
+                "• کلید رایگان پیکسل‌درین (تا ۲۰ گیگ): <code>PIXDRAIN_API_KEY</code> تو <code>.env</code>\n"
+                f"• سرور خود ربات (بدون سقف): باز کردن پورت <code>{VLC_SELF_PORT}</code> "
+                "تو فایروال (یا <code>VLC_PUBLIC_BASE</code> تو <code>.env</code>)",
+                _menu_rows(chat_id, msg_id),
+            )
+            return
+
         vlc_hint = "🎬 پخش تو VLC: Media → Open Network Stream (Ctrl+N) → لینک رو Paste کن"
-        if provider == "pixeldrain":
-            text = (
-                "✅ <b>آپلود به پیکسل‌درین انجام شد!</b>\n\n"
-                f"📄 فایل: <code>{_esc(res['name'])}</code>\n"
-                f"📏 حجم: {_fmt_size(fsize)}\n\n"
-                "▶️ لینک مستقیم پخش در VLC:\n"
-                f"{res['play_url']}\n\n"
-                "⬇️ لینک دانلود مستقیم:\n"
-                f"{res['dl_url']}\n\n"
-                "📄 لینک صفحه:\n"
-                f"{res['page_url']}\n\n"
-                f"{vlc_hint}"
-            )
-            rows = [
-                [Button.url("▶️ پخش در VLC", res["play_url"]), Button.url("⬇️ دانلود", res["dl_url"])],
-                [Button.url("📄 صفحه فایل", res["page_url"])],
-            ]
-        else:
-            text = (
-                "✅ <b>فایل برای پخش آماده شد! (Litterbox)</b>\n\n"
-                f"📄 فایل: <code>{_esc(res['name'])}</code>\n"
-                f"📏 حجم: {_fmt_size(fsize)}\n\n"
-                "▶️ لینک مستقیم پخش در VLC (برای دانلود مستقیم هم همینه):\n"
-                f"{res['play_url']}\n\n"
-                "⏳ اعتبار این لینک: ۷۲ ساعت\n"
-                f"{vlc_hint}"
-            )
-            rows = [
-                [Button.url("▶️ پخش در VLC", res["play_url"]), Button.url("⬇️ دانلود", res["play_url"])],
-            ]
+        fallback_note = (
+            "\n\nℹ️ هاست قبلی جواب نداده بود؛ از فالباک استفاده شد."
+            if errors
+            else ""
+        )
+        text = (
+            f"✅ <b>فایل برای پخش آماده شد! ({_esc(used_host)})</b>\n\n"
+            f"📄 فایل: <code>{_esc(res['name'])}</code>\n"
+            f"📏 حجم: {_fmt_size(fsize)}\n\n"
+            "▶️ لینک مستقیم پخش در VLC:\n"
+            f"{res['play_url']}\n\n"
+        )
+        if res["dl_url"] and res["dl_url"] != res["play_url"]:
+            text += f"⬇️ لینک دانلود مستقیم:\n{res['dl_url']}\n\n"
+        if res.get("page_url"):
+            text += f"📄 لینک صفحه:\n{res['page_url']}\n\n"
+        text += (
+            f"⏳ اعتبار این لینک: {res.get('expires_fa', 'موقت')}\n"
+            f"{vlc_hint}{fallback_note}"
+        )
+
+        btn_row = [Button.url("▶️ پخش در VLC", res["play_url"])]
+        if res["dl_url"] and res["dl_url"] != res["play_url"]:
+            btn_row.append(Button.url("⬇️ دانلود", res["dl_url"]))
+        rows = [btn_row]
+        if res.get("page_url"):
+            rows.append([Button.url("📄 صفحه فایل", res["page_url"])])
         await _safe_edit(event, text, rows)
     except _UploadAborted:
         # 🆕 کاربر دکمه لغو رو زده — پیام لغو + برگشت منو
@@ -1838,7 +2327,7 @@ def register_file_explorer_handlers(
     client.add_event_handler(fe_noop_cb, events.CallbackQuery(pattern=r"^fexnoop$"))
     # آپلود به Filebin
     client.add_event_handler(fe_filebin_cb, events.CallbackQuery(pattern=r"^fbin_-?\d+_\d+$"))
-    # آپلود برای پخش در VLC (Litterbox / Pixeldrain)
+    # آپلود برای پخش در VLC (زنجیره‌ی چند‌هاسته + سرور خودمیزبان)
     client.add_event_handler(fe_vlc_cb, events.CallbackQuery(pattern=r"^fvlc_-?\d+_\d+$"))
     # تغییر نام
     client.add_event_handler(fe_rename_cb, events.CallbackQuery(pattern=r"^fren_-?\d+_\d+$"))
