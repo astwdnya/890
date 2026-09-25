@@ -13923,6 +13923,21 @@ def _imdb_seasons_buttons(eps) -> list:
     return buttons
 
 
+def _imdb_generic_qualities() -> list:
+    """منوی عمومی کیفیت — وقتی سرورها لیست کیفیت ندادن.
+
+    به‌جای نمایش خطا، همیشه از کاربر کیفیت پرسیده میشه.
+    download_with_quality خودش نزدیک‌ترین کیفیت موجود رو پیدا می‌کنه
+    و اگه هیچ سرور اون کیفیت رو نداشت به Auto fallback می‌کنه
+    (سرورهای بعدی / دانلودر vidsrcme).
+    """
+    return [
+        {"label": lbl, "resolution": "", "bandwidth": 0, "url": "",
+         "is_auto": lbl == "Auto", "server": "fallback"}
+        for lbl in ("Auto", "1080p", "720p", "480p")
+    ]
+
+
 def _imdb_quality_buttons(qualities: list, is_episode: bool) -> list:
     buttons = []
     row = []
@@ -14000,9 +14015,21 @@ async def imdb_cb_title(event):
         imdb_states[user_id] = {"imdb_id": imdb_id, "info": info}
         await event.edit(f"{caption}\n\n⏳ در حال گرفتن لیست کیفیت‌ها...", parse_mode="md")
         qualities = await get_qualities(imdb_id)
+        quality_note = ""
         if not qualities:
-            await event.edit(f"{caption}\n\n❌ کیفیت‌ها در دسترس نیست.", parse_mode="md")
-            return
+            # سرورها نتونستن لیست کیفیت بدن — به‌جای خطا منوی عمومی نشون بده
+            # چون download_with_quality خودش fallback داره (سرور بعدی/vidsrcme)
+            logger.warning("[IMDB] no qualities for %s — showing generic menu", imdb_id)
+            qualities = _imdb_generic_qualities()
+            quality_note = "\n\n⚠ سرورها الان لیست دقیق ندادن؛ نزدیک‌ترین کیفیت موجود دانلود میشه."
+        elif len(qualities) <= 1:
+            # فقط یک گزینه (مثلاً Auto) — گزینه‌های عمومی هم اضافه کن تا
+            # کاربر انتخاب واقعی داشته باشه؛ لایه دانلود بین همه سرورها
+            # دنبال کیفیت خواسته‌شده می‌گرده و اگه نبود به Auto برمی‌گرده
+            _existing = {q["label"].lower() for q in qualities}
+            for _g in _imdb_generic_qualities():
+                if _g["label"].lower() not in _existing:
+                    qualities.append(_g)
         imdb_states[user_id]["qualities"] = qualities
         q_buttons = _imdb_quality_buttons(qualities, is_episode=False)
         cover = info.get("cover")
@@ -14011,14 +14038,14 @@ async def imdb_cb_title(event):
                 await event.delete()
                 await event.respond(
                     cover,
-                    text=f"{caption}\n\n🎯 کیفیت رو انتخاب کن:",
+                    text=f"{caption}{quality_note}\n\n🎯 کیفیت رو انتخاب کن:",
                     parse_mode="md",
                     buttons=q_buttons,
                 )
                 return
             except Exception:
                 pass
-        await event.edit(f"{caption}\n\n🎯 کیفیت رو انتخاب کن:", buttons=q_buttons, parse_mode="md")
+        await event.edit(f"{caption}{quality_note}\n\n🎯 کیفیت رو انتخاب کن:", buttons=q_buttons, parse_mode="md")
 
 
 async def imdb_cb_season(event):
@@ -14086,12 +14113,22 @@ async def imdb_cb_episode(event):
         parse_mode="md",
     )
     qualities = await get_qualities(imdb_id, season, episode)
+    quality_note = ""
     if not qualities:
-        await event.edit("❌ کیفیت‌ها در دسترس نیست.")
-        return
+        # سرورها نتونستن لیست کیفیت بدن — به‌جای خطا منوی عمومی نشون بده
+        logger.warning("[IMDB] no qualities for %s S%dE%d — showing generic menu",
+                       imdb_id, season, episode)
+        qualities = _imdb_generic_qualities()
+        quality_note = "\n\n⚠ سرورها الان لیست دقیق ندادن؛ نزدیک‌ترین کیفیت موجود دانلود میشه."
+    elif len(qualities) <= 1:
+        # فقط یک گزینه — گزینه‌های عمومی هم اضافه کن تا انتخاب واقعی باشه
+        _existing = {q["label"].lower() for q in qualities}
+        for _g in _imdb_generic_qualities():
+            if _g["label"].lower() not in _existing:
+                qualities.append(_g)
     state["qualities"] = qualities
     await event.edit(
-        f"🎬 **{title}** - S{season:02d}E{episode:02d}\n\n🎯 کیفیت رو انتخاب کن:",
+        f"🎬 **{title}** - S{season:02d}E{episode:02d}{quality_note}\n\n🎯 کیفیت رو انتخاب کن:",
         buttons=_imdb_quality_buttons(qualities, is_episode=True),
         parse_mode="md",
     )

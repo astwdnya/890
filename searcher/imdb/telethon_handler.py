@@ -45,6 +45,20 @@ import videotext_burn
 
 logger = logging.getLogger("TelethonHandler")
 
+
+def _generic_qualities() -> list:
+    """منوی عمومی کیفیت — وقتی سرورها لیست کیفیت ندادن.
+
+    به‌جای نمایش خطا، همیشه از کاربر کیفیت پرسیده میشه.
+    download_with_quality خودش نزدیک‌ترین کیفیت موجود رو پیدا می‌کنه
+    و اگه هیچ سرور اون کیفیت رو نداشت به Auto fallback می‌کنه.
+    """
+    return [
+        {"label": lbl, "resolution": "", "bandwidth": 0, "url": "",
+         "is_auto": lbl == "Auto", "server": "fallback"}
+        for lbl in ("Auto", "1080p", "720p", "480p")
+    ]
+
 # ─── State management ───────────────────────────────────────
 # نگهداری وضعیت کاربر در حین انتخاب
 # user_id -> {"imdb_id": ..., "info": ..., "eps": ..., "season": ..., "quality": ...}
@@ -304,9 +318,18 @@ def register_handlers(client: TelegramClient):
 
             # گرفتن لیست کیفیت‌ها
             qualities = await vidsrc_extras.get_qualities(imdb_id)
+            quality_note = ""
             if not qualities:
-                await event.edit(f"{caption}\n\n❌ کیفیت‌ها در دسترس نیست.", parse_mode="md")
-                return
+                # سرورها نتونستن لیست کیفیت بدن — به‌جای خطا منوی عمومی نشون بده
+                logger.warning("[IMDB] no qualities for %s — showing generic menu", imdb_id)
+                qualities = _generic_qualities()
+                quality_note = "\n\n⚠ سرورها الان لیست دقیق ندادن؛ نزدیک‌ترین کیفیت موجود دانلود میشه."
+            elif len(qualities) <= 1:
+                # فقط یک گزینه — گزینه‌های عمومی هم اضافه کن تا انتخاب واقعی باشه
+                _existing = {q["label"].lower() for q in qualities}
+                for _g in _generic_qualities():
+                    if _g["label"].lower() not in _existing:
+                        qualities.append(_g)
 
             # دکمه‌های کیفیت
             q_buttons = []
@@ -333,14 +356,14 @@ def register_handlers(client: TelegramClient):
                     await event.delete()
                     await event.respond(
                         cover,
-                        text=f"{caption}\n\n🎯 کیفیت رو انتخاب کن:",
+                        text=f"{caption}{quality_note}\n\n🎯 کیفیت رو انتخاب کن:",
                         parse_mode="md",
                         buttons=q_buttons,
                     )
                     return
                 except Exception:
                     pass
-            await event.edit(f"{caption}\n\n🎯 کیفیت رو انتخاب کن:", buttons=q_buttons, parse_mode="md")
+            await event.edit(f"{caption}{quality_note}\n\n🎯 کیفیت رو انتخاب کن:", buttons=q_buttons, parse_mode="md")
 
     # ─── Callback: select season ───────────────────────────
 
@@ -434,9 +457,19 @@ def register_handlers(client: TelegramClient):
 
         # گرفتن کیفیت‌ها برای این قسمت
         qualities = await vidsrc_extras.get_qualities(imdb_id, season, episode)
+        quality_note = ""
         if not qualities:
-            await event.edit("❌ کیفیت‌ها در دسترس نیست.")
-            return
+            # سرورها نتونستن لیست کیفیت بدن — به‌جای خطا منوی عمومی نشون بده
+            logger.warning("[IMDB] no qualities for %s S%dE%d — showing generic menu",
+                           imdb_id, season, episode)
+            qualities = _generic_qualities()
+            quality_note = "\n\n⚠ سرورها الان لیست دقیق ندادن؛ نزدیک‌ترین کیفیت موجود دانلود میشه."
+        elif len(qualities) <= 1:
+            # فقط یک گزینه — گزینه‌های عمومی هم اضافه کن تا انتخاب واقعی باشه
+            _existing = {q["label"].lower() for q in qualities}
+            for _g in _generic_qualities():
+                if _g["label"].lower() not in _existing:
+                    qualities.append(_g)
 
         # دکمه‌های کیفیت
         q_buttons = []
@@ -456,7 +489,7 @@ def register_handlers(client: TelegramClient):
 
         state["qualities"] = qualities
         await event.edit(
-            f"🎬 **{title}** - S{season:02d}E{episode:02d}\n\n🎯 کیفیت رو انتخاب کن:",
+            f"🎬 **{title}** - S{season:02d}E{episode:02d}{quality_note}\n\n🎯 کیفیت رو انتخاب کن:",
             buttons=q_buttons,
             parse_mode="md",
         )
