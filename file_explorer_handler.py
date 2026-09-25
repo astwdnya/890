@@ -631,19 +631,33 @@ async def _start_vlc_web_server():
 
 
 async def _detect_public_base() -> Optional[str]:
-    """IP عمومی سرور رو از سرویس‌های echo می‌گیره (برای لینک self-host)."""
+    """IP عمومی سرور رو از سرویس‌های echo می‌گیره (برای لینک self-host).
+
+    چند سرویس پشت‌سرهم امتحان می‌شه که اگه یکی DOWN بود بقیه جواب بدن
+    (لینک خودمیزبان همیشه باید «پابلیک» باشه). IPv6 هم پشتیبانی می‌شه
+    (توی URL براکت‌دار میشه: http://[2001:db8::1]:8099)."""
     if aiohttp is None:
         return None
     timeout = aiohttp.ClientTimeout(total=10, sock_connect=8)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            for u in ("https://api.ipify.org/", "https://ifconfig.me/ip"):
+            for u in (
+                "https://api.ipify.org/",
+                "https://ifconfig.me/ip",
+                "https://icanhazip.com/",
+                "https://checkip.amazonaws.com/",
+                "https://ident.me/",
+            ):
                 try:
                     async with s.get(u, headers={"User-Agent": FILEBIN_UA}) as r:
-                        if r.status == 200:
-                            t = (await r.text()).strip()
-                            if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", t):
-                                return f"http://{t}:{VLC_SELF_PORT}"
+                        if r.status != 200:
+                            continue
+                        t = (await r.text()).strip()
+                        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", t):
+                            return f"http://{t}:{VLC_SELF_PORT}"
+                        # IPv6 خالص (شامل حداقل یک دونقطه، بدون کاراکتر غیرمجاز)
+                        if ":" in t and re.fullmatch(r"[0-9a-fA-F:]{2,45}", t):
+                            return f"http://[{t}]:{VLC_SELF_PORT}"
                 except Exception:
                     continue
     except Exception:

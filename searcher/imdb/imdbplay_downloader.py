@@ -1536,6 +1536,133 @@ async def _probe_variants(stream: dict) -> List[Tuple[str, int, str]]:
 
 
 # ═══════════════════════════════════════════════════════════
+#   Public API: get_server_qualities  (پروب سروربه‌سرور + کش)
+# ═══════════════════════════════════════════════════════════
+
+
+_SERVER_PROBE_CACHE: Dict[tuple, tuple] = {}   # (imdb, season, ep) → (expires, result)
+_SERVER_PROBE_TTL = 600                        # ۱۰ دقیقه — منوی کیفیت و منوی سرور روی همین کش کار می‌کنن
+
+
+async def get_server_qualities(
+    imdb_id: str,
+    season: Optional[int] = None,
+    episode: Optional[int] = None,
+) -> List[dict]:
+    """
+    پروب «سروربه‌سرور»: برای هر سرورِ موجود، کیفیت‌های واقعی اون فیلم/قسمت
+    جمع می‌شه (هم لیست خود سرور، هم probe کردن master.m3u8) تا UI بتونه
+    منوی «انتخاب سرور» بسازه — کاربر ببینه کدوم سرور دقیقاً 480p داره.
+
+    خروجی (به ترتیب اولویت _SERVERS) لیستی از:
+      {
+        "server": "CastleTV",
+        "stream_type": "hls" | "mp4",
+        "auto_url": آدرس استریم پایه (برای MP4 هم همون URL مستقیمه),
+        "qualities": {label_lower: {"label","url","resolution","bandwidth"}},
+        "quality_list": [همون values، مرتب‌شده نزولی],
+      }
+
+    نتیجه ۱۰ دقیقه کش می‌شه (کلید: imdb+season+episode) که منوی کیفیت و
+    بعدش منوی انتخاب سرور دوبار پروب سنگین نزنن. سروری که جواب نداده هم
+    با لیست خالی ثبت می‌شه تا UI بتونه نشون بده «فعلاً در دسترس نیست».
+    """
+    if not imdb_id:
+        return []
+    if not imdb_id.startswith("tt"):
+        imdb_id = f"tt{imdb_id}"
+
+    key = (imdb_id, season or 0, episode or 0)
+    now = time.time()
+    cached = _SERVER_PROBE_CACHE.get(key)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    tmdb_id = await _get_tmdb_id(imdb_id)
+    if not tmdb_id:
+        logger.error("Cannot resolve tmdb_id for %s", imdb_id)
+        return []
+
+    result: List[dict] = []
+    for server in _SERVERS:
+        entry = {
+            "server": server["name"],
+            "stream_type": "hls",
+            "auto_url": "",
+            "qualities": {},
+            "quality_list": [],
+        }
+        try:
+            stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+        except Exception as e:
+            logger.warning("[IMDBPlay] get_server_qualities: %s exception: %s", server["name"], e)
+            stream = None
+        if not stream or not stream.get("url"):
+            result.append(entry)      # سرور جواب نداد — با لیست خالی ثبت می‌شه
+            continue
+
+        entry["server"] = stream.get("server", server["name"])
+        entry["auto_url"] = stream["url"]
+
+        # ۱) لیست کیفیت خود سرور (مثل Videasy/Vidking) — لیبل Auto جمع نمی‌شه
+        for q in stream.get("qualities") or []:
+            label = str(q.get("label", q.get("quality", ""))).strip()
+            if not label or label.lower() == "auto":
+                continue
+            if q.get("url") and label.lower() not in entry["qualities"]:
+                entry["qualities"][label.lower()] = {
+                    "label": label, "url": q["url"],
+                    "resolution": "", "bandwidth": 0,
+                }
+
+        # ۲) سرورهای MP4 انتخاب کیفیت ندارن
+        if stream.get("type", "hls") != "hls":
+            entry["stream_type"] = "mp4"
+            result.append(entry)
+            continue
+
+        # ۳) probe کردن master.m3u8 برای variantهای واقعی
+        base_url = stream["url"]
+        for vurl, bw, res in await _probe_variants(stream):
+            label = _resolution_to_label(res, bw)
+            if label.lower() in entry["qualities"]:
+                continue
+            entry["qualities"][label.lower()] = {
+                "label": label, "url": _make_absolute(base_url, vurl),
+                "resolution": res, "bandwidth": bw,
+            }
+        result.append(entry)
+
+    # مرتب‌سازی کیفیت‌های هر سرور نزولی (بر اساس height واقعی)
+    for entry in result:
+        entry["quality_list"] = sorted(
+            entry["qualities"].values(),
+            key=lambda q: -_height_of(q["resolution"], q["bandwidth"]),
+        )
+
+    _SERVER_PROBE_CACHE[key] = (now + _SERVER_PROBE_TTL, result)
+    if len(_SERVER_PROBE_CACHE) > 64:                       # جلوگیری از رشد بی‌نهایت
+        try:
+            oldest = min(_SERVER_PROBE_CACHE, key=lambda k: _SERVER_PROBE_CACHE[k][0])
+            _SERVER_PROBE_CACHE.pop(oldest, None)
+        except Exception:
+            pass
+    logger.info("get_server_qualities %s S%sE%s -> %d server(s) probed",
+                imdb_id, season, episode, len(result))
+    return result
+
+
+def clear_server_qualities_cache(imdb_id: str = "") -> None:
+    """پاک کردن کش پروب سرورها (برای تست یا refresh دستی)."""
+    if not imdb_id:
+        _SERVER_PROBE_CACHE.clear()
+        return
+    norm = imdb_id if imdb_id.startswith("tt") else f"tt{imdb_id}"
+    for k in [k for k in _SERVER_PROBE_CACHE if k[0] == norm]:
+        _SERVER_PROBE_CACHE.pop(k, None)
+
+
+# ═══════════════════════════════════════════════════════════
 #   Public API: get_qualities
 # ═══════════════════════════════════════════════════════════
 
@@ -1558,80 +1685,42 @@ async def get_qualities(imdb_id: str, season: Optional[int] = None, episode: Opt
     """
     گرفتن لیست کیفیت‌های موجود برای یک فیلم یا قسمت سریال.
 
-    برخلاف نسخه قبلی که فقط از «اولین» سروری که جواب می‌داد لیست می‌گرفت،
+    برخلاف نسخه قبلی که فقط از «اولین» سروری که جواب می‌داد لیست می‌گرفت,
     اینجا از «همه» سرورها کیفیت‌های واقعی جمع میشه (با probe کردن master.m3u8)
     تا کاربر گزینه‌های واقعی ببینه — مثلاً 480p/360p که فقط روی یکی از سرورها هست.
 
-    Returns:
-        لیست dict با فیلدهای:
-        - label, bandwidth, resolution, url, server, is_auto
-        مرتب‌شده از بهترین به پایین‌ترین + Auto در ابتدا.
+    پیاده‌سازی: روی get_server_qualities سوار شده (همون پروب، کش مشترک) —
+    بعدش فقط تجمیع سروربه‌سرور به لیست کلی با سمانتیک قبلی:
+    اولین سرورِ دارای هر لیبل اولویت داره + Auto = اولین استریم موفق.
     """
     if not imdb_id:
         return []
     if not imdb_id.startswith("tt"):
         imdb_id = f"tt{imdb_id}"
 
-    tmdb_id = await _get_tmdb_id(imdb_id)
-    if not tmdb_id:
-        logger.error("Cannot resolve tmdb_id for %s", imdb_id)
-        return []
+    per_server = await get_server_qualities(imdb_id, season, episode)
 
     collected = {}          # label.lower() → Quality dict (اولین سرور اولویت داره)
     auto_url = None
     auto_server = ""
 
-    for server in _SERVERS:
-        try:
-            stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
-        except Exception as e:
-            logger.warning("[IMDBPlay] get_qualities: server %s exception: %s", server["name"], e)
-            continue
-        if not stream or not stream.get("url"):
-            continue
-
+    for entry in per_server:
         # اولین استریم موفق = مبنای Auto
-        if not auto_url:
-            auto_url = stream["url"]
-            auto_server = stream.get("server", server["name"])
+        if entry.get("auto_url") and not auto_url:
+            auto_url = entry["auto_url"]
+            auto_server = entry["server"]
 
-        server_name = stream.get("server", server["name"])
-
-        # ۱) اگه سرور خودش لیست کیفیت داده (مثل Videasy/Vidking)
-        if stream.get("qualities"):
-            for q in stream["qualities"]:
-                label = str(q.get("label", q.get("quality", ""))).strip()
-                # Auto رو از لیست سرورها جمع نمی‌کنیم — آخر به‌عنوان
-                # بهترین استریم موفق جداگانه اضافه میشه
-                if not label or label.lower() == "auto":
-                    continue
-                if q.get("url") and label.lower() not in collected:
-                    collected[label.lower()] = Quality(
-                        label=label, bandwidth=0, resolution="", url=q["url"],
-                        server=server_name, is_auto=False,
-                    ).to_dict()
-            # اینجا continue نمی‌کنیم — لیست خود سرور ممکنه ناقص باشه
-            # (مثلاً 2Embed فقط «auto» می‌ده)؛ master.m3u8 رو هم probe می‌کنیم
-
-        # ۲) سرورهای MP4 کیفیت مشخصی ندارن
-        if stream.get("type", "hls") != "hls":
-            continue
-
-        # ۳) probe کردن master.m3u8 برای variantهای واقعی
-        variants = await _probe_variants(stream)
-        base_url = stream["url"]
-        for vurl, bw, res in variants:
-            label = _resolution_to_label(res, bw)
-            if label.lower() in collected:
+        for label_lower, q in (entry.get("qualities") or {}).items():
+            if label_lower in collected:
                 continue
-            collected[label.lower()] = Quality(
-                label=label, bandwidth=bw, resolution=res,
-                url=_make_absolute(base_url, vurl),
-                server=server_name, is_auto=False,
+            collected[label_lower] = Quality(
+                label=q["label"], bandwidth=q.get("bandwidth", 0),
+                resolution=q.get("resolution", ""), url=q["url"],
+                server=entry["server"], is_auto=False,
             ).to_dict()
 
     if not auto_url:
-        logger.error("No working stream found for %s (tmdb=%s)", imdb_id, tmdb_id)
+        logger.error("No working stream found for %s", imdb_id)
         return []
 
     # مرتب‌سازی نزولی بر اساس height واقعی
@@ -1661,6 +1750,7 @@ async def download_with_quality(
     season: Optional[int] = None,
     episode: Optional[int] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    preferred_server: Optional[str] = None,
 ) -> Optional[str]:
     """
     دانلود فیلم یا قسمت سریال با کیفیت انتخابی.
@@ -1671,6 +1761,9 @@ async def download_with_quality(
         out_dir: مسیر خروجی
         season, episode: برای سریال
         progress_cb: callback(done, total)
+        preferred_server: نام سرور انتخابی کاربر (مثل "CastleTV") — این سرور
+            اول امتحان می‌شه (با همون سمانتیک strict کیفیت) و اگه شکست خورد
+            زنجیره‌ی عادی فالباک ادامه پیدا می‌کنه تا فایل به‌هر حال برسه.
 
     رفتار برای کیفیت خاص (مثلاً 480p):
       1. همه سرورها probe میشن؛ سروری که دقیقاً 480p داره اولویت داره.
@@ -1699,8 +1792,25 @@ async def download_with_quality(
     target_quality = quality_label.lower() if quality_label else "auto"
 
     if target_quality == "auto":
-        # ─── مسیر Auto: اولین سرور موفق ───
-        stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
+        # ─── مسیر Auto: اول سرور انتخابی کاربر، بعد اولین سرور موفق ───
+        stream = None
+        if preferred_server:
+            _pref = preferred_server.strip().lower()
+            for server in _SERVERS:
+                if server["name"].strip().lower() != _pref:
+                    continue
+                try:
+                    cand = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+                    if cand and cand.get("url"):
+                        stream = cand
+                        logger.info("[IMDBPlay] Auto: using preferred server %s", preferred_server)
+                        break
+                except Exception as e:
+                    logger.warning("[IMDBPlay] Auto: preferred %s failed: %s", preferred_server, e)
+            if not stream:
+                logger.info("[IMDBPlay] Auto: preferred %s unavailable → normal order", preferred_server)
+        if not stream:
+            stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
         if not stream:
             raise RuntimeError(f"No working stream found for {imdb_id}")
 
@@ -1790,6 +1900,13 @@ async def download_with_quality(
         ranked.append((rank, delta, order, server, cand))
 
     ranked.sort(key=lambda x: (x[0], x[1], x[2]))
+    # 🖰 سرور انتخابی کاربر به صدر می‌ره (سمانتیک strict کیفیت دست نمی‌خوره؛
+    # فقط ترتیب امتحان عوض می‌شه و بقیه سرورها فالباک خودکار می‌مونن)
+    if preferred_server:
+        _pref = preferred_server.strip().lower()
+        ranked.sort(key=lambda r: 0 if str(r[3]["name"]).strip().lower() == _pref else 1)
+        logger.info("[IMDBPlay] preferred server %s moved to front of %d candidate(s)",
+                    preferred_server, len(ranked))
 
     async def _try_candidate(cand: dict, allow_upgrade: bool) -> str:
         return await _download_hls_stream(

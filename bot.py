@@ -81,7 +81,7 @@ _searcher_imdb_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
 if _searcher_imdb_dir not in _sys.path:
     _sys.path.insert(0, _searcher_imdb_dir)
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
-from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle, get_server_info, embed_subtitle_soft
+from searcher.imdb.vidsrc_extras import get_qualities, get_server_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle, get_server_info, embed_subtitle_soft
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -14134,6 +14134,118 @@ async def imdb_cb_episode(event):
     )
 
 
+def _imdb_server_menu_tail(is_episode: bool) -> list:
+    """ردیف‌های ثابت منوی انتخاب سرور (خودکار / تغییر کیفیت / بستن)."""
+    return [
+        [Button.inline("⏭ خودکار (بهترین سرور)", "imd_esrvauto" if is_episode else "imd_srvauto")],
+        [Button.inline("⬅️ تغییر کیفیت", "imd_eqback" if is_episode else "imd_qback")],
+        [Button.inline("🚫 بستن", "imd_close")],
+    ]
+
+
+def _imdb_server_buttons(entries: list, qkey: str, is_episode: bool) -> list:
+    """منوی انتخاب سرور — فقط سرورهایی که «دقیقاً» کیفیت انتخابی رو دارن.
+
+    کنار نام هر سرور تعداد کل کیفیت‌های واقعیش (از پروب) نشون داده می‌شه
+    تا کاربر بفهمه مثلاً CastleTV کاتالوگ چندکیفیتی داره یا سرور تک‌MP4 است.
+    """
+    buttons, row = [], []
+    for i, ent in enumerate(entries):
+        if qkey not in (ent.get("qualities") or {}):
+            continue
+        n_q = len(ent.get("qualities") or {})
+        label = f"🖥 {ent['server']}"
+        if ent.get("stream_type") == "mp4":
+            label += " (MP4)"
+        elif n_q > 1:
+            label += f" ({n_q} کیفیت)"
+        row.append(Button.inline(label, f"imd_esrv_{i}" if is_episode else f"imd_srv_{i}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.extend(_imdb_server_menu_tail(is_episode))
+    return buttons
+
+
+async def _imdb_show_server_menu(event, user_id: int, is_episode: bool):
+    """بعد از انتخاب کیفیت: پروب سروربه‌سرور + منوی «کدوم سرور؟».
+
+    فقط سرورهایی که دقیقاً همون لیبل کیفیت رو دارن دکمه‌ی قابل‌کلیک می‌گیرن؛
+    سرورهای بدون این کیفیت فقط تو متن نامشون میاد. کاربر می‌تونه «خودکار»
+    رو بزنه که مثل قبل بهترین سرور خودش رو انتخاب کنه.
+    """
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
+        return
+    quality_label = state.get("quality", "Auto")
+    imdb_id = state["imdb_id"]
+    season = state.get("selected_season")
+    episode = state.get("selected_episode")
+    await event.edit(
+        f"✅ کیفیت: **{quality_label}**\n\n🖥 در حال بررسی سرورها (چند ثانیه)...",
+        parse_mode="md",
+    )
+    try:
+        entries = await get_server_qualities(imdb_id, season, episode)
+    except Exception as e:
+        logger.warning(f"[IMDB] get_server_qualities failed for {imdb_id}: {e}")
+        entries = []
+    state["server_entries"] = entries
+    state["server"] = None
+
+    qkey = (quality_label or "auto").lower()
+    with_q = [ent for ent in entries if qkey in (ent.get("qualities") or {})]
+    active_names = [ent["server"] for ent in entries if ent.get("auto_url")]
+    with_names = {ent["server"] for ent in with_q}
+    without_names = [n for n in active_names if n not in with_names]
+
+    head = f"✅ کیفیت: **{quality_label}**\n\n"
+    if with_q:
+        text = head + "🖥 سرورهایی که دقیقاً این کیفیت رو دارن — یکی رو انتخاب کن:"
+        buttons = _imdb_server_buttons(entries, qkey, is_episode)
+    else:
+        text = (
+            head + f"⚠ هیچ سروری دقیقاً **{quality_label}** نداره.\n\n"
+            "«خودکار» نزدیک‌ترین کیفیت مجاز (پایین‌تر) رو از بهترین سرور "
+            "می‌گیره — هیچ‌وقت بالاتر آپگرید نمی‌شه."
+        )
+        if without_names:
+            text += "\n\n📡 سرورهای فعال این عنوان (بدون این کیفیت): " + "، ".join(without_names)
+        buttons = _imdb_server_menu_tail(is_episode)
+    await event.edit(text, buttons=buttons, parse_mode="md")
+
+
+async def _imdb_pick_sub(event, user_id: int, is_episode: bool):
+    """مرحله‌ی مشترک بعد از انتخاب کیفیت/سرور: جستجوی زیرنویس فارسی."""
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
+        return
+    quality_label = state.get("quality", "Auto")
+    srv = state.get("server")
+    head = f"✅ کیفیت: **{quality_label}**"
+    if srv:
+        head += f" | 🖥 سرور: **{srv}**"
+    imdb_id = state["imdb_id"]
+    season = state.get("selected_season")
+    episode = state.get("selected_episode")
+    await event.edit(f"{head}\n\n🔍 در حال جستجوی زیرنویس فارسی...", parse_mode="md")
+    if is_episode:
+        subs = await search_subtitles(imdb_id, "per", season, episode)
+    else:
+        subs = await search_subtitles(imdb_id, "per")
+    state["subs"] = subs
+    sub_count_text = f"📄 {len(subs)} زیرنویس پیدا شد:" if subs else "❌ زیرنویسی پیدا نشد"
+    await event.edit(
+        f"{head}\n\n📝 زیرنویس فارسی:\n{sub_count_text}",
+        buttons=_imdb_sub_buttons(subs, is_episode=is_episode),
+        parse_mode="md",
+    )
+
+
 async def imdb_cb_quality(event):
     data = event.data.decode()
     quality_label = data.replace("imd_q_", "")
@@ -14143,17 +14255,12 @@ async def imdb_cb_quality(event):
         await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
         return
     state["quality"] = quality_label
-    await event.edit(f"✅ کیفیت: **{quality_label}**\n\n🔍 در حال جستجوی زیرنویس فارسی...")
-    imdb_id = state["imdb_id"]
-    # Search Persian subtitles from OpenSubtitles
-    subs = await search_subtitles(imdb_id, "per")
-    state["subs"] = subs
-    sub_count_text = f"📄 {len(subs)} زیرنویس پیدا شد:" if subs else "❌ زیرنویسی پیدا نشد"
-    await event.edit(
-        f"✅ کیفیت: **{quality_label}**\n\n📝 زیرنویس فارسی:\n{sub_count_text}",
-        buttons=_imdb_sub_buttons(subs, is_episode=False),
-        parse_mode="md",
-    )
+    state["server"] = None      # هر انتخاب کیفیت جدید، سرور قبلی رو باطل می‌کنه
+    if quality_label.lower() == "auto":
+        # برای Auto انتخاب سرور بی‌معنیه — مستقیم زیرنویس
+        await _imdb_pick_sub(event, user_id, is_episode=False)
+        return
+    await _imdb_show_server_menu(event, user_id, is_episode=False)
 
 
 async def _check_persian_subtitle_available(imdb_id, season=None, episode=None):
@@ -14191,17 +14298,79 @@ async def imdb_cb_equality(event):
         await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
         return
     state["quality"] = quality_label
-    season = state.get("selected_season")
-    episode = state.get("selected_episode")
-    await event.edit(f"✅ کیفیت: **{quality_label}**\n\n🔍 در حال جستجوی زیرنویس فارسی...")
-    imdb_id = state["imdb_id"]
-    # Search Persian subtitles from OpenSubtitles
-    subs = await search_subtitles(imdb_id, "per", season, episode)
-    state["subs"] = subs
-    sub_count_text = f"📄 {len(subs)} زیرنویس پیدا شد:" if subs else "❌ زیرنویسی پیدا نشد"
+    state["server"] = None      # هر انتخاب کیفیت جدید، سرور قبلی رو باطل می‌کنه
+    if quality_label.lower() == "auto":
+        await _imdb_pick_sub(event, user_id, is_episode=True)
+        return
+    await _imdb_show_server_menu(event, user_id, is_episode=True)
+
+
+async def imdb_cb_server(event):
+    """انتخاب سرور — imd_srv_<idx> (فیلم) / imd_esrv_<idx> (قسمت سریال).
+
+    اندیس به state["server_entries"] اشاره می‌کنه (همون پروب مشترک کش‌شده).
+    """
+    data = event.data.decode()
+    is_episode = data.startswith("imd_esrv_")
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
+        return
+    try:
+        idx = int(data.split("_")[-1])
+    except ValueError:
+        await event.answer("داده نامعتبر", alert=True)
+        return
+    entries = state.get("server_entries") or []
+    if idx < 0 or idx >= len(entries):
+        await event.answer("⚠ فهرست سرورها عوض شده — کیفیت رو دوباره انتخاب کن", alert=True)
+        return
+    ent = entries[idx]
+    state["server"] = ent["server"]
+    try:
+        await event.answer(f"🖥 {ent['server']}", alert=False)
+    except Exception:
+        pass
+    await _imdb_pick_sub(event, user_id, is_episode=is_episode)
+
+
+async def imdb_cb_server_auto(event):
+    """دکمه «خودکار» در منوی سرور — بدون سرور خاص ادامه بده."""
+    data = event.data.decode()
+    is_episode = data.startswith("imd_esrv")
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
+        return
+    state["server"] = None
+    try:
+        await event.answer("⏭ خودکار", alert=False)
+    except Exception:
+        pass
+    await _imdb_pick_sub(event, user_id, is_episode=is_episode)
+
+
+async def imdb_cb_qback(event):
+    """دکمه «تغییر کیفیت» در منوی سرور — برگشت به منوی کیفیت."""
+    data = event.data.decode()
+    is_episode = data.startswith("imd_eqback")
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
+        return
+    state["server"] = None
+    state.pop("server_entries", None)
+    qualities = state.get("qualities") or _imdb_generic_qualities()
+    try:
+        await event.answer()
+    except Exception:
+        pass
     await event.edit(
-        f"✅ کیفیت: **{quality_label}**\n\n📝 زیرنویس فارسی:\n{sub_count_text}",
-        buttons=_imdb_sub_buttons(subs, is_episode=True),
+        "🎯 کیفیت رو انتخاب کن:",
+        buttons=_imdb_quality_buttons(qualities, is_episode=is_episode),
         parse_mode="md",
     )
 
@@ -14322,6 +14491,7 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
     info = state["info"]
     title = info.get("title", "Unknown")
     quality = state.get("quality", "Auto")
+    preferred_server = state.get("server")     # 🖰 سرور انتخابی کاربر در منوی سرور
     season = state.get("selected_season")
     episode = state.get("selected_episode")
 
@@ -14356,15 +14526,20 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
         # Get server info before download to show in status
         server_info_text = ""
         server_info = None
-        try:
-            server_info = await get_server_info(imdb_id, season, episode)
-            if server_info:
-                srv_name = server_info.get("server", "Unknown")
-                srv_method = server_info.get("method", "Unknown")
-                srv_type = server_info.get("stream_type", "unknown").upper()
-                server_info_text = f"\n🖥 سرور: {srv_name} | 🔧 متد: {srv_method} | 📡 نوع: {srv_type}"
-        except Exception:
-            pass
+        if preferred_server:
+            # سرور دستی انتخاب شده — نیازی به پروب اضافه نیست
+            server_info = {"server": preferred_server, "method": "انتخاب دستی", "stream_type": "hls"}
+            server_info_text = f"\n🖥 سرور: {preferred_server} (انتخاب دستی) | 🎯 کیفیت: {quality}"
+        else:
+            try:
+                server_info = await get_server_info(imdb_id, season, episode)
+                if server_info:
+                    srv_name = server_info.get("server", "Unknown")
+                    srv_method = server_info.get("method", "Unknown")
+                    srv_type = server_info.get("stream_type", "unknown").upper()
+                    server_info_text = f"\n🖥 سرور: {srv_name} | 🔧 متد: {srv_method} | 📡 نوع: {srv_type}"
+            except Exception:
+                pass
         await status_msg.edit(f"📥 دانلود {label} با کیفیت {quality}{server_info_text}", buttons=cancel_btn)
 
         sub_name = None
@@ -14404,7 +14579,8 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
 
         try:
             video_path = await download_with_quality(
-                imdb_id, quality, out_dir, season, episode, progress_cb=vid_progress
+                imdb_id, quality, out_dir, season, episode, progress_cb=vid_progress,
+                preferred_server=preferred_server,
             )
         except Exception as dl_err:
             logger.error(f"[IMDB] video download error: {dl_err}", exc_info=True)
@@ -22425,6 +22601,13 @@ async def main():
     client.add_event_handler(imdb_cb_close, events.CallbackQuery(pattern=r"imd_close$"))
     client.add_event_handler(imdb_cb_quality, events.CallbackQuery(pattern=r"imd_q_"))
     client.add_event_handler(imdb_cb_equality, events.CallbackQuery(pattern=r"imd_eq_"))
+    # 🖰 منوی انتخاب سرور — بعد از انتخاب کیفیت
+    client.add_event_handler(imdb_cb_server, events.CallbackQuery(pattern=r"^imd_srv_"))
+    client.add_event_handler(imdb_cb_server, events.CallbackQuery(pattern=r"^imd_esrv_"))
+    client.add_event_handler(imdb_cb_server_auto, events.CallbackQuery(pattern=r"^imd_srvauto$"))
+    client.add_event_handler(imdb_cb_server_auto, events.CallbackQuery(pattern=r"^imd_esrvauto$"))
+    client.add_event_handler(imdb_cb_qback, events.CallbackQuery(pattern=r"^imd_qback$"))
+    client.add_event_handler(imdb_cb_qback, events.CallbackQuery(pattern=r"^imd_eqback$"))
     client.add_event_handler(imdb_cb_sub, events.CallbackQuery(pattern=r"imd_sub_"))
     client.add_event_handler(imdb_cb_esub, events.CallbackQuery(pattern=r"imd_esub_"))
     client.add_event_handler(imdb_cb_sub, events.CallbackQuery(pattern=r"imd_withsub$"))

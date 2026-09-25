@@ -48,6 +48,30 @@ _USER_AGENT = (
 # ═══════════════════════════════════════════════════════════
 
 
+async def get_server_qualities(
+    imdb_id: str,
+    season: Optional[int] = None,
+    episode: Optional[int] = None,
+) -> List[dict]:
+    """
+    پروب «سروربه‌سرور» — برای منوی انتخاب سرور.
+
+    خروجی: لیستی (به ترتیب اولویت سرورها) از dict:
+      - server: نام سرور
+      - stream_type: "hls" یا "mp4"
+      - auto_url: استریم پایه
+      - qualities: {label_lower: {"label","url","resolution","bandwidth"}}
+      - quality_list: همون مقادیر مرتب‌شده نزولی
+    نتیجه ۱۰ دقیقه کش می‌شه (مشترک با get_qualities).
+    """
+    try:
+        from imdbplay_downloader import get_server_qualities as _new_srvq
+        return await _new_srvq(imdb_id, season, episode)
+    except Exception as e:
+        logger.error("get_server_qualities via imdbplay failed: %s", e)
+        return []
+
+
 async def get_qualities(
     imdb_id: str,
     season: Optional[int] = None,
@@ -95,12 +119,15 @@ async def download_with_quality(
     season: Optional[int] = None,
     episode: Optional[int] = None,
     progress_cb=None,
+    preferred_server: Optional[str] = None,
 ) -> Optional[str]:
     """
     دانلود ویدیو با کیفیت مشخص از سرورهای imdbplay.tech.
 
     quality_label="Auto" → بهترین کیفیت
     quality_label="720p" → کیفیت 720p (اگه نباشه، نزدیک‌ترین)
+    preferred_server → سرور انتخابی کاربر (مثل "CastleTV") اول امتحان می‌شه؛
+    اگه شکست خورد زنجیره عادی فالباک ادامه پیدا می‌کنه.
 
     لایه‌های fallback:
       1. سرورهای imdbplay (Vidzee, Videasy, Vidking, 2Embed, GarageBand)
@@ -111,7 +138,8 @@ async def download_with_quality(
     try:
         from imdbplay_downloader import download_with_quality as _new_download
         result = await _new_download(
-            imdb_id, quality_label, out_dir, season, episode, progress_cb=progress_cb
+            imdb_id, quality_label, out_dir, season, episode,
+            progress_cb=progress_cb, preferred_server=preferred_server,
         )
         if result:
             return result
