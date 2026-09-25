@@ -17,18 +17,27 @@
 #     نتیجه سه تا لینک میده: ⚡️ لینک دانلود مستقیم واقعی (URL امضاشده
 #     S3 — ربات قدم تأیید کوکی رو خودکار انجام میده؛ حدود ۱۵ دقیقه
 #     اعتبار داره) + 📄 لینک صفحه فایل + 🗃 لینک صفحه باکس.
-# ۴) 🎬 آپلود برای پخش در VLC (زنجیره‌ی فالباک چند‌هاسته):
-#     فایل رو روی اولین هاستِ سالمِ «لینک مستقیم» می‌ذاره که لینکش بایت
-#     خام میده و مستقیم تو VLC پلی میشه (برخلاف Filebin که صفحه تأیید
-#     داره). ترتیب زنجیره:
-#       • سرور خود ربات (بدون آپلود، بدون سقف — راه‌حل همیشگی؛ پورت
-#         VLC_PORT پیش‌فرض 8099، یا VLC_PUBLIC_BASE تو .env)
-#       • Pixeldrain اگه PIXDRAIN_API_KEY تو .env باشه (تا ۲۰ گیگ)
-#       • Litterbox (تا ۱ گیگ، لینک ۷۲ ساعته)
-#       • Catbox (تا ۲۰۰ مگ، دائمی) → 0x0.st (تا ۵۱۲ مگ، ۳۰ روز)
-#     هر هاست ناشناس اول با یه آپلود ۶۴ کیلوبایتی «سلامت‌سنجی» میشه تا
-#     برای هاست خراب چند صد مگ هدر نره؛ هاست شکست‌خورده هم ۲۰ تا ۴۵
-#     دقیقه cooldown می‌گیره و دفعات بعد خودکار رد میشه.
+# ۴) 🎬 آپلود برای پخش در VLC:
+#     فایل رو روی هاستِ «لینک مستقیم» می‌ذاره که لینکش بایت خام میده و
+#     مستقیم تو VLC و بقیه پلیرها پلی میشه (برخلاف Filebin که صفحه
+#     تأیید داره).
+#     🆕 زنجیره‌ی fallback خودکار — اگه هاستی شکست بخوره (مثل خطای 500
+#     لیترباکس) بدون دخالت کاربر سراغ بعدی میره:
+#       ۱. سرور خودم (PUBLIC_BASE_URL + file_server.py → لینک پابلیک
+#          با Range، بدون آپلود شبکه‌ای، ۶ ساعت اعتبار)
+#       ۲. Pixeldrain (اگه PIXDRAIN_API_KEY ست باشه — تا ۲۰ گیگ،
+#          لینک پخش + دانلود + صفحه)
+#       ۳. Litterbox (بدون ثبت‌نام، تا ۱ گیگ، ۷۲ ساعته)
+#       ۴. Catbox (بدون ثبت‌نام، تا ۲۰۰ مگ، دائمی)
+#       ۵. Uguu (بدون ثبت‌نام، تا ۱۲۸ مگ، ۳ ساعته — بایت خام + Range)
+#       ۶. Gofile (با GOFILE_API_KEY → directLink واقعی؛ بدون کلید فقط
+#          صفحه‌ی دانلود — آخرِ خط)
+#     هر هاست حداکثر ۲ تلاش میشه (خطای احراز هویت استثنا — مستقیم بعدی).
+#  ۴.۵ 🧹 حذف خودکار + دستور /clean:
+#     فایل‌های «سرور خودمون» بعد از SELF_EXPIRY_HOURS (۶ ساعت) و فایل‌های
+#     پیکسل‌درین بعد از PIXELDRAIN_AUTO_DELETE_HOURS (۶ ساعت) خودکار پاک
+#     میشن. دستور /clean هم منوی پاکسازی دستی میده: پیکسل‌درین / گوفایل /
+#     سرور خودمون → لیست فایل‌ها → حذف همه یا یکی‌یکی.
 #  ۵) ❌ لغو (در همه مراحل):
 #     منوی اصلی دکمه «بستن» داره؛ آپلودهای Filebin/VLC و عملیات تغییر نام
 #     هم موقع دانلود/آپلود دکمه «لغو» دارن که همون لحظه عملیات رو قطع
@@ -58,13 +67,11 @@ from telethon.tl.types import (
     DocumentAttributeVideo,
 )
 
-# aiohttp — برای آپلود به Filebin/VLC + سرور HTTP خودمیزبان VLC
+# aiohttp — برای آپلود به Filebin (تو requirements.txt هست)
 try:
     import aiohttp  # type: ignore
-    from aiohttp import web as _web  # type: ignore
 except Exception:
     aiohttp = None
-    _web = None
 
 # کتابخانه‌های اختیاری — اگه نصب نباشن فقط فرمت مربوطه غیرفعال میشه
 try:
@@ -116,55 +123,41 @@ FILEBIN_UA = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# ───── VLC: زنجیره‌ی هاست‌های «لینک مستقیم» + فالباک خودکار ─────
+# ───────── VLC: Pixeldrain / Litterbox (لینک مستقیم قابل پخش) ─────────
 # برخلاف filebin (که برای دانلود صفحه تأیید HTML میده)، لینک این‌ها بایت
-# خام + Accept-Ranges میده و مستقیم تو VLC پلی میشه. نتایج تست تجربی
-# (۲۰۲۶-۰۹ از IP دیتاسنتر):
+# خام + Accept-Ranges میده و مستقیم تو VLC پلی میشه. تست تجربی:
 #   • litterbox: POST multipart به api.php → لینک https://litter.catbox.moe/xx.ext
-#     (سقف ۱ گیگ، ۷۲ ساعت، Range → 206 ✓) — گاهی 403/500 میده (بلاک IP
-#     دیتاسنتر یا اورلود بک‌اند) → همون لحظه میریم سراغ فالباک بعدی
+#     (بدون ثبت‌نام، سقف ۱ گیگ، ۷۲ ساعت، Range → 206 ✓)
 #   • pixeldrain: PUT /api/file/{name} با BasicAuth (پسورد = API Key
-#     اکانت رایگان) → سقف ۲۰ گیگ، لینک /api/file/{id} تو VLC پلی میشه؛
-#     بدون کلید «authentication_required» میده → فقط با کلید
-#   • catbox: هم‌خانواده‌ی litterbox — لینک دائمی ولی سقف ۲۰۰ مگ
-#   • 0x0.st: POST multipart → لینک مستقیم (سقف ۵۱۲ مگ، ۳۰+ روز)
-#   • gofile (لینک مستقیم فقط پرمیوم)، temp.sh (بایت خام فقط با POST
-#     که VLC پشتیبانی نمی‌کنه)، bashupload/pomf/oshi/transfer.sh (مرده)،
-#     tmpfiles (ریدایرکت به صفحه) → همگی تست و از زنجیره حذف شدن
+#     اکانت رایگان) → سقف ۲۰ گیگ، لینک /api/file/{id} تو VLC پلی میشه
 PIXDRAIN_BASE = os.environ.get("PIXDRAIN_BASE", "https://pixeldrain.com").rstrip("/")
-PIXDRAIN_MAX_BYTES = 20 * 1024 * 1024 * 1024        # 20GB — سقف اکانت رایگان
+PIXDRAIN_MAX_BYTES = 10 * 1024 * 1024 * 1024        # 10GB — سقف اکانت رایگان (GET /api/user)
 LITTERBOX_BASE = os.environ.get("LITTERBOX_BASE", "https://litterbox.catbox.moe").rstrip("/")
 LITTERBOX_MAX_BYTES = 1000 * 1024 * 1024            # ۱ گیگ — سقف بدون ثبت‌نام
-CATBOX_BASE = "https://catbox.moe"
-CATBOX_MAX_BYTES = 200 * 1024 * 1024                # ۲۰۰ مگ — سقف بدون ثبت‌نام
-ZEROX0_BASE = os.environ.get("ZEROX0_BASE", "https://0x0.st").rstrip("/")
-ZEROX0_MAX_BYTES = 512 * 1024 * 1024                # ۵۱۲ مگ
 
-# ⭐ سرور خودمیزبان VLC — «راه حل همیشگی»: فایل از خود سرور ربات با
-# پشتیبانی Range سرو میشه؛ نه آپلود بیرونی می‌خواد نه ثبت‌نام و نه سقف
-# حجمی، و هیچ هاست ثالثی هم نمی‌تونه بلاکش کنه. تنظیمات (همه اختیاری):
-#   VLC_PORT        پورت HTTP سرور (پیش‌فرض 8099)
-#   VLC_PUBLIC_BASE آدرس عمومی اگه دامنه/پورت‌فوروارد خاصی داری
-#                   (مثلاً https://vlc.example.com یا http://5.6.7.8:9000)
-#   VLC_SELF_HOST   بذار 0 تا کلاً غیرفعال بشه
-VLC_SELF_PORT = int(os.environ.get("VLC_PORT", "8099") or "8099")
-VLC_PUBLIC_BASE = os.environ.get("VLC_PUBLIC_BASE", "").strip().rstrip("/")
-VLC_SELF_ENABLED = os.environ.get("VLC_SELF_HOST", "1").strip().lower() not in {"0", "false", "no", "off"}
-VLC_SELF_TTL = 6 * 3600                             # فایل ۶ ساعت سرو میشه
-_VLC_STREAM_DIR = "/tmp/vlc_streams"
-_VLC_WEB_FILES: Dict[str, dict] = {}                # token → اطلاعات فایل
-_VLC_WEB_READY = asyncio.Event()
-_VLC_SERVER_TASK: Optional[asyncio.Task] = None
-_VLC_SERVER_BASE: Optional[str] = None              # وقتی سالم شد ست میشه
-_VLC_SERVER_CHECKED_AT = 0.0
-_VLC_CANARY_PATH = "/tmp/.vlc_canary_64k.bin"
+# ── 🆕 سرور خودم (Railway) — لینک پابلیک برای VLC ──
+# تو Railway Variables بذار: PUBLIC_BASE_URL = دامنه‌ای که Generate Domain میده
+# (مثل https://890-production-xxxx.up.railway.app). file_server.py فایل رو با
+# توکن ثبت می‌کنه و Flask (keep-alive) با پشتیبانی Range سروش میده.
+SELF_MAX_BYTES = int(os.environ.get("SELF_MAX_MB", "10000")) * 1024 * 1024
+SELF_EXPIRY_HOURS = float(os.environ.get("SELF_EXPIRY_HOURS", "6"))
+CATBOX_MAX_BYTES = 200 * 1024 * 1024                # سقف catbox.moe (دائمی)
+UGUU_BASE = os.environ.get("UGUU_BASE", "https://uguu.se/upload")
+UGUU_MAX_BYTES = 128 * 1024 * 1024                  # سقف uguu.se (۳ ساعت)
 
-# 🧠 حافظه‌ی سلامت هاست‌ها — هاستی که شکست بخوره تا این‌دیگر امتحان
-# نمیشه (که هر بار چند صد مگ برای هاست مرده آپلود و هدر نشه)
-_HOST_COOLDOWN_UNTIL: Dict[str, float] = {}         # host_key → زمان رفع محرومیت
-_HOST_COOLDOWN_SECS = {"litterbox": 45 * 60, "catbox": 20 * 60, "zerox0": 20 * 60}
-_CANARY_HOSTS = {"litterbox", "catbox", "zerox0"}
-_CANARY_OK_UNTIL: Dict[str, float] = {}             # نتیجه‌ی canary ۱۰ دقیقه‌ای کش میشه
+# ── 🆕 حذف خودکار فایل‌ها بعد از چند ساعت (دیفالت روشن) ──
+# سرور خودم: file_server بعد از SELF_EXPIRY_HOURS خودش پاک می‌کنه.
+# پیکسل‌درین: شناسه‌ی هر آپلود تو فایل state ثبت میشه و یه تاسک پس‌زمینه
+#   هر ۱۰ دقیقه فایل‌های قدیمی‌تر از PIXELDRAIN_AUTO_DELETE_HOURS رو با
+#   DELETE /api/file/{id} پاک می‌کنه. 0 = غیرفعال.
+#   ⚠️ برای امنیت، دیفالت فقط فایل‌هایی که خود ربات آپلود کرده پاک میشن؛
+#   اگه می‌خوای هر فایل قدیمی اکانت (حتی دستی) هم پاک بشه:
+#   PIXELDRAIN_DELETE_ALL_OLD="1"
+PIXELDRAIN_AUTO_DELETE_HOURS = float(os.environ.get("PIXELDRAIN_AUTO_DELETE_HOURS", "6"))
+PIXELDRAIN_DELETE_ALL_OLD = os.environ.get("PIXELDRAIN_DELETE_ALL_OLD", "0") == "1"
+# گوفایل: دیفالت خاموش (خودش بعد از ۱۰ روز بی‌دانلود پاک می‌کنه)؛
+# اگه خواستی ساعت‌محور پاک بشه مثلاً GOFILE_AUTO_DELETE_HOURS="6" بذار.
+GOFILE_AUTO_DELETE_HOURS = float(os.environ.get("GOFILE_AUTO_DELETE_HOURS", "0"))
 
 # ⚠️ FIX: ReplyInlineMarkup(rows=[]) روی سرور تلگرام نامعتبره و خطای
 # ReplyMarkupInvalidError میده. برای «غیرفعال کردن» دکمه‌های قبلی موقع ادیت
@@ -355,18 +348,26 @@ async def _pixeldrain_upload(remote_name: str, local_path: str, prog, api_key: s
                     data = {}
                 if resp.status == 200 and data.get("success") and data.get("id"):
                     fid = str(data["id"])
+                    # 🆕 ثبت برای حذف خودکار بعد از PIXELDRAIN_AUTO_DELETE_HOURS
+                    _pd_track_upload(fid, remote_name)
                     return {
                         "name": remote_name,
                         "play_url": f"{PIXDRAIN_BASE}/api/file/{fid}",
                         "dl_url": f"{PIXDRAIN_BASE}/api/file/{fid}?download",
                         "page_url": f"{PIXDRAIN_BASE}/u/{fid}",
-                        "host_fa": "پیکسل‌درین",
-                        "expires_fa": "تا ۳۰ روز بی‌فعالیت",
                     }
                 if resp.status == 401:
-                    raise _FeError(
+                    raise _FeAuthError(
                         "کلید API پیکسل‌درین معتبر نیست — مقدار "
                         "<code>PIXDRAIN_API_KEY</code> رو تو <code>.env</code> چک کن"
+                    )
+                # 🆕 اکانت با ایمیل تأییدنشده اجازه‌ی آپلود نداره (تست تجربی 403)
+                # — مثل خطای کلید، بدون ری‌تای مستقیم هاست بعدی
+                if resp.status == 403 and "verify" in body.lower():
+                    raise _FeAuthError(
+                        "اکانت پیکسل‌درین ایمیل‌ش رو تأیید نکرده — وارد "
+                        f"<code>{PIXDRAIN_BASE}</code> شو، ایمیل mamadjavad900 رو "
+                        "verify کن تا آپلود فعال بشه"
                     )
                 msg = str(data.get("message") or body[:120])
                 raise _FeError(
@@ -378,19 +379,18 @@ async def _pixeldrain_upload(remote_name: str, local_path: str, prog, api_key: s
         raise _FeError(f"خطای اتصال به پیکسل‌درین:\n<code>{_esc(str(e)[:120])}</code>")
 
 
-async def _litterbox_upload(remote_name: str, local_path: str, prog, ttl: str = "72h") -> dict:
+async def _litterbox_upload(remote_name: str, local_path: str, prog) -> dict:
     """آپلود استریمی به litterbox.catbox.moe — بدون ثبت‌نام (سقف ۱ گیگ، ۷۲ ساعت).
 
-    POST multipart به api.php با فیلدهای reqtype=fileupload / time / 
+    POST multipart به api.php با فیلدهای reqtype=fileupload / time=72h /
     fileToUpload → جواب: متن ساده‌ی لینک مستقیم (بایت خام + Range → VLC ✓)
-    خروجی: dict با play_url (همون لینک مستقیم برای پخش و دانلود).
-    ttl برای canary سلامت‌سنجی «1h» میشه (کم‌هزینه‌ترین گزینه)."""
+    خروجی: dict با play_url (همون لینک مستقیم برای پخش و دانلود)."""
     url = f"{LITTERBOX_BASE}/resources/internals/api.php"
     total = os.path.getsize(local_path)
     payload = _ProgressFilePayload(local_path, prog, total)
     form = aiohttp.FormData()
     form.add_field("reqtype", "fileupload")
-    form.add_field("time", ttl)
+    form.add_field("time", "72h")
     form.add_field("fileToUpload", payload, filename=remote_name or "file.bin")
     headers = {"Accept": "*/*", "User-Agent": FILEBIN_UA}
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
@@ -400,14 +400,7 @@ async def _litterbox_upload(remote_name: str, local_path: str, prog, ttl: str = 
                 body = (await resp.text(errors="ignore")).strip()
                 if resp.status == 200 and body.startswith("http"):
                     link = body.split()[0][:300]
-                    return {
-                        "name": remote_name,
-                        "play_url": link,
-                        "dl_url": link,
-                        "page_url": "",
-                        "host_fa": "Litterbox",
-                        "expires_fa": "۷۲ ساعت" if ttl == "72h" else ttl,
-                    }
+                    return {"name": remote_name, "play_url": link, "dl_url": link, "page_url": ""}
                 raise _FeError(
                     f"Litterbox آپلود رو قبول نکرد (کد {resp.status}):\n"
                     f"<code>{_esc(body[:120])}</code>"
@@ -418,12 +411,37 @@ async def _litterbox_upload(remote_name: str, local_path: str, prog, ttl: str = 
         raise _FeError(f"خطای اتصال به Litterbox:\n<code>{_esc(str(e)[:120])}</code>")
 
 
-async def _catbox_upload(remote_name: str, local_path: str, prog) -> dict:
-    """آپلود استریمی به catbox.moe — هم‌خانواده‌ی litterbox ولی لینکش دائمی‌ست (سقف ۲۰۰ مگ).
+# ───────── 🆕 سرور خودم (PUBLIC_BASE_URL) — لینک پابلیک بدون آپلود شبکه‌ای ─────────
+def _self_server_base() -> str:
+    """دامنه‌ی عمومی سرور خودم — از PUBLIC_BASE_URL؛ خالی/نامعتبر → "".
 
-    POST multipart به user/api.php با reqtype=fileupload → جواب: متن ساده‌ی
-    لینک https://files.catbox.moe/xx.ext (بایت خام + Range → VLC ✓)"""
-    url = f"{CATBOX_BASE}/user/api.php"
+    تو Railway Variables بذار: PUBLIC_BASE_URL=https://<دامنه‌ی Generate Domain>"""
+    base = (os.environ.get("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    return base if base.startswith(("http://", "https://")) else ""
+
+
+def _self_upload(remote_name: str, local_path: str, prog) -> dict:
+    """ثبت فایل روی file_server → لینک پابلیک از دامنه‌ی خودم (سرور خودت).
+
+    بدون آپلود شبکه‌ای — فقط symlink + توکن (فوری). Flask مسیر /f/<token>
+    رو با پشتیبانی Range سرو می‌کنه (همون چیزی که VLC برای Seek لازم داره).
+    فایل بعد از SELF_EXPIRY_HOURS (پیش‌فرض ۶ ساعت) خودکار پاک میشه."""
+    from file_server import serve_file
+    info = serve_file(
+        local_path,
+        title=remote_name,
+        expires_in_hours=SELF_EXPIRY_HOURS,
+        public_base_url=_self_server_base(),
+    )
+    return {"name": remote_name, "play_url": info["url"], "dl_url": info["url"], "page_url": ""}
+
+
+async def _catbox_upload(remote_name: str, local_path: str, prog) -> dict:
+    """آپلود استریمی به catbox.moe — دائمی (سقف ۲۰۰ مگ)، همون API لیترباکس.
+
+    POST multipart به user/api.php با reqtype=fileupload → متن لینک
+    https://files.catbox.moe/xx.ext (بایت خام + Range → VLC ✓)"""
+    url = "https://catbox.moe/user/api.php"
     total = os.path.getsize(local_path)
     payload = _ProgressFilePayload(local_path, prog, total)
     form = aiohttp.FormData()
@@ -437,14 +455,7 @@ async def _catbox_upload(remote_name: str, local_path: str, prog) -> dict:
                 body = (await resp.text(errors="ignore")).strip()
                 if resp.status == 200 and body.startswith("http"):
                     link = body.split()[0][:300]
-                    return {
-                        "name": remote_name,
-                        "play_url": link,
-                        "dl_url": link,
-                        "page_url": "",
-                        "host_fa": "Catbox",
-                        "expires_fa": "دائمی",
-                    }
+                    return {"name": remote_name, "play_url": link, "dl_url": link, "page_url": ""}
                 raise _FeError(
                     f"Catbox آپلود رو قبول نکرد (کد {resp.status}):\n"
                     f"<code>{_esc(body[:120])}</code>"
@@ -455,371 +466,769 @@ async def _catbox_upload(remote_name: str, local_path: str, prog) -> dict:
         raise _FeError(f"خطای اتصال به Catbox:\n<code>{_esc(str(e)[:120])}</code>")
 
 
-async def _zerox0_upload(remote_name: str, local_path: str, prog) -> dict:
-    """آپلود استریمی به 0x0.st — بدون ثبت‌نام (سقف ۵۱۲ مگ، نگهداری ۳۰+ روز).
+async def _gofile_upload(remote_name: str, local_path: str, prog) -> dict:
+    """آپلود به gofile.io — اگه GOFILE_API_KEY ست باشه با اکانت آپلود میشه
+    و directLink واقعی (بایت خام) می‌گیره که تو VLC پخش میشه.
 
-    POST multipart با فیلد file → جواب: متن ساده‌ی لینک مستقیم.
-    ⚠️ بعضی IPهای دیتاسنتری رو بلاک می‌کنه — فقط یه فالباک ارزونه."""
-    url = ZEROX0_BASE
+    بدون کلید: فقط downloadPage میده (HTML) — پخش مستقیم نداره.
+    ۱) GET api.gofile.io/servers → اسم سرور  ۲) POST multipart به
+    {server}.gofile.io/contents/uploadfile  ۳) با توکن: GET
+    /contents/{fileId} → directLink"""
     total = os.path.getsize(local_path)
-    payload = _ProgressFilePayload(local_path, prog, total)
-    form = aiohttp.FormData()
-    form.add_field("file", payload, filename=remote_name or "file.bin")
-    headers = {"Accept": "*/*", "User-Agent": FILEBIN_UA}
+    token = _gofile_token()
+    headers = {"Accept": "application/json, */*", "User-Agent": FILEBIN_UA}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, data=form, headers=headers) as resp:
-                body = (await resp.text(errors="ignore")).strip()
-                if resp.status == 200 and body.startswith("http"):
-                    link = body.split()[0][:300]
+            # قدم ۱ — انتخاب سرور فعال
+            async with session.get("https://api.gofile.io/servers", headers=headers) as r1:
+                if r1.status == 401:
+                    raise _FeAuthError(
+                        "کلید گوفایل معتبر نیست — <code>GOFILE_API_KEY</code> رو چک کن"
+                    )
+                js = await r1.json(content_type=None)
+            data = js.get("data") if isinstance(js, dict) else None
+            servers = (data or {}).get("servers") or []
+            names = [s.get("name") for s in servers if isinstance(s, dict) and s.get("name")]
+            if not names:
+                raise _FeError("Gofile لیست سرورها رو نداد — احتمالاً سرویسش در دسترس نیست")
+            # قدم ۲ — آپلود استریمی با نوار پیشرفت
+            payload = _ProgressFilePayload(local_path, prog, total)
+            form = aiohttp.FormData()
+            form.add_field("file", payload, filename=remote_name or "file.bin")
+            async with session.post(
+                f"https://{names[0]}.gofile.io/contents/uploadfile",
+                data=form, headers=headers,
+            ) as resp:
+                if resp.status == 401:
+                    raise _FeAuthError(
+                        "کلید گوفایل معتبر نیست — <code>GOFILE_API_KEY</code> رو چک کن"
+                    )
+                body = (await resp.text(errors="ignore"))[:800]
+                try:
+                    js2 = json.loads(body)
+                except Exception:
+                    js2 = {}
+                d = (js2.get("data") or {}) if isinstance(js2, dict) else {}
+                page = d.get("downloadPage") or ""
+                fid = d.get("fileId") or d.get("id") or ""
+                # فقط اگر directLink واقعی از API اومد پخش مستقیم حساب میشه
+                # (ساخت دستی URL بدون directLink → صفحه HTML میده، نه بایت خام)
+                direct = d.get("directLink") or ""
+                # 🆕 با توکن اکانت — directLink رو از API محتوا بگیر
+                if token and fid and not direct:
+                    try:
+                        async with session.get(
+                            f"https://api.gofile.io/contents/{fid}",
+                            headers=_gofile_auth_headers(token),
+                        ) as r3:
+                            js3 = await r3.json(content_type=None)
+                        d3 = (js3.get("data") or {}) if isinstance(js3, dict) else {}
+                        direct = str(d3.get("directLink") or "")
+                    except Exception:
+                        direct = ""
+                # 🆕 ثبت برای حذف خودکار اختیاری (GOFILE_AUTO_DELETE_HOURS)
+                # + ذخیره‌ی rootFolder برای لیست‌کردن اکانت در /clean
+                if fid:
+                    _gofile_track_upload(fid, remote_name, str(d.get("parentFolder") or ""))
+                if isinstance(js2, dict) and js2.get("status") == "ok" and (direct or page):
                     return {
                         "name": remote_name,
-                        "play_url": link,
-                        "dl_url": link,
-                        "page_url": "",
-                        "host_fa": "0x0.st",
-                        "expires_fa": "حداقل ۳۰ روز",
+                        "play_url": direct,
+                        "dl_url": direct or page,
+                        "page_url": page,
                     }
                 raise _FeError(
-                    f"0x0.st آپلود رو قبول نکرد (کد {resp.status}):\n"
-                    f"<code>{_esc(body[:120])}</code>"
+                    f"Gofile آپلود رو قبول نکرد (کد {resp.status}):\n<code>{_esc(body[:120])}</code>"
                 )
     except _FeError:
         raise
     except Exception as e:
-        raise _FeError(f"خطای اتصال به 0x0.st:\n<code>{_esc(str(e)[:120])}</code>")
+        raise _FeError(f"خطای اتصال به Gofile:\n<code>{_esc(str(e)[:120])}</code>")
 
 
-# ═══════ سرور خودمیزبان VLC — راه‌حل همیشگی بدون هاست ثالث ═══════
-# یه HTTP server کوچیک با aiohttp.web که فایل رو با پشتیبانی کامل Range
-# (برای seek در VLC) سرو می‌کنه. فقط یک‌بار راه می‌افته و تا خاموشی ربات
-# زنده می‌مونه. دسترسی عمومی با self-check تأیید میشه (اگه پورت بسته باشه
-# خودکار از زنجیره حذف میشه و بقیه هاست‌ها امتحان میشن).
+async def _uguu_upload(remote_name: str, local_path: str, prog) -> dict:
+    """آپلود استریمی به uguu.se — بدون ثبت‌نام (سقف ۱۲۸ مگ، ۳ ساعت).
 
-
-def _vlc_guess_type(name: str) -> str:
-    """تشخیص content-type برای سرو ویدیو/صدا/بقیه."""
-    ext = os.path.splitext(name)[1].lower()
-    return {
-        ".mp4": "video/mp4", ".m4v": "video/mp4", ".mkv": "video/x-matroska",
-        ".webm": "video/webm", ".avi": "video/x-msvideo", ".mov": "video/quicktime",
-        ".wmv": "video/x-msvideo", ".flv": "video/x-flv", ".ts": "video/mp2t",
-        ".mpg": "video/mpeg", ".mpeg": "video/mpeg", ".3gp": "video/3gpp",
-        ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".flac": "audio/flac",
-        ".ogg": "audio/ogg", ".wav": "audio/wav", ".opus": "audio/opus",
-        ".srt": "application/x-subrip", ".vtt": "text/vtt",
-        ".pdf": "application/pdf", ".zip": "application/zip",
-    }.get(ext, "application/octet-stream")
-
-
-def _vlc_sweep_expired():
-    """پاکسازی فایل‌های منقضی‌شده‌ی سرور خودمیزبان."""
-    now = time.time()
-    expired = [t for t, v in _VLC_WEB_FILES.items() if v["expires_at"] < now]
-    for t in expired:
-        v = _VLC_WEB_FILES.pop(t)
-        try:
-            if os.path.islink(v["path"]) or os.path.exists(v["path"]):
-                os.unlink(v["path"])
-        except Exception:
-            pass
-
-
-async def _vlc_health_handler(request):
-    """GET /vlc_health — برای self-check دسترسی عمومی."""
-    return _web.Response(text="ok")
-
-
-async def _vlc_web_handler(request):
-    """GET /vlc/{token}[/{name}] — بایت خام + پشتیبانی کامل Range (206).
-
-    فرم‌های Range پشتیبانی‌شده: bytes=start-end / bytes=start- / bytes=-suffix
-    (همون چیزی که VLC و بقیه پلیرها برای seek می‌فرستن)."""
-    token = request.match_info.get("token", "")
-    info = _VLC_WEB_FILES.get(token)
-    if not info:
-        return _web.Response(status=404, text="not found")
-    if time.time() > info["expires_at"]:
-        _VLC_WEB_FILES.pop(token, None)
-        try:
-            if os.path.islink(info["path"]) or os.path.exists(info["path"]):
-                os.unlink(info["path"])
-        except Exception:
-            pass
-        return _web.Response(status=410, text="expired")
-    path = info["path"]
-    if not os.path.exists(path):
-        return _web.Response(status=404, text="file gone")
-    size = info["size"]
-    hdr_name = re.sub(r"[^A-Za-z0-9._()\[\]-]", "_", info["name"]) or "file.bin"
-    start, end, status = 0, size - 1, 200
-    m = re.match(r"^bytes=(\d*)-(\d*)$", (request.headers.get("Range") or "").strip())
-    if m and (m.group(1) or m.group(2)):
-        try:
-            if m.group(1):
-                start = int(m.group(1))
-                end = int(m.group(2)) if m.group(2) else size - 1
-            else:  # پسوندی: N بایت آخر
-                start = max(0, size - int(m.group(2)))
-                end = size - 1
-        except ValueError:
-            start, end = 0, size - 1
-        if start >= size:
-            return _web.Response(status=416, headers={"Content-Range": f"bytes */{size}"})
-        start, end = max(0, start), min(end, size - 1)
-        if start > end:
-            start, end, status = 0, size - 1, 200
-        else:
-            status = 206
-    length = end - start + 1
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Type": info["content_type"],
-        "Content-Disposition": f'inline; filename="{hdr_name}"',
-        "Cache-Control": "no-store",
-    }
-    if status == 206:
-        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-    resp = _web.StreamResponse(status=status, headers=headers)
-    resp.content_length = length
-    await resp.prepare(request)
-    remaining = length
+    POST multipart به /upload با فیلد files[] → JSON با url مستقیم؛
+    تست تجربی: بایت خام + Range → 206 ✓ (VLC پخش و Seek اوکیه)."""
+    total = os.path.getsize(local_path)
+    payload = _ProgressFilePayload(local_path, prog, total)
+    form = aiohttp.FormData()
+    form.add_field("files[]", payload, filename=remote_name or "file.bin")
+    headers = {"Accept": "application/json, */*", "User-Agent": FILEBIN_UA}
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
     try:
-        with open(path, "rb") as f:
-            f.seek(start)
-            while remaining > 0:
-                chunk = f.read(min(512 * 1024, remaining))
-                if not chunk:
-                    break
-                await resp.write(chunk)
-                remaining -= len(chunk)
-        await resp.write_eof()
-    except (ConnectionResetError, asyncio.CancelledError):
-        pass  # پلیر وسط پخش قطع شد — طبیعیه
-    except Exception as e:
-        logger.warning(f"[FileExplorer] vlc stream error: {e}")
-    return resp
-
-
-async def _start_vlc_web_server():
-    """راه‌اندازی یک‌باره‌ی سرور HTTP خودمیزبان (تا خاموشی ربات زنده می‌مونه)."""
-    try:
-        from aiohttp import web as web_mod
-    except Exception as e:
-        logger.warning(f"[FileExplorer] aiohttp.web unavailable: {e}")
-        return
-    try:
-        os.makedirs(_VLC_STREAM_DIR, exist_ok=True)
-        app = web_mod.Application()
-        app.router.add_get("/vlc_health", _vlc_health_handler)
-        app.router.add_get("/vlc/{token}", _vlc_web_handler)
-        app.router.add_get("/vlc/{token}/{name}", _vlc_web_handler)
-        runner = web_mod.AppRunner(app, access_log=None)
-        await runner.setup()
-        site = web_mod.TCPSite(runner, "0.0.0.0", VLC_SELF_PORT, reuse_address=True)
-        await site.start()
-        _VLC_WEB_READY.set()
-        logger.info(f"[FileExplorer] VLC self-host HTTP server on 0.0.0.0:{VLC_SELF_PORT}")
-        while True:
-            await asyncio.sleep(3600)
-    except Exception as e:
-        logger.warning(
-            f"[FileExplorer] VLC self-host could not bind :{VLC_SELF_PORT} ({e}) "
-            "→ از زنجیره حذف شد؛ VLC_PORT دیگه‌ای تو .env تنظیم کن"
-        )
-
-
-async def _detect_public_base() -> Optional[str]:
-    """IP عمومی سرور رو از سرویس‌های echo می‌گیره (برای لینک self-host).
-
-    چند سرویس پشت‌سرهم امتحان می‌شه که اگه یکی DOWN بود بقیه جواب بدن
-    (لینک خودمیزبان همیشه باید «پابلیک» باشه). IPv6 هم پشتیبانی می‌شه
-    (توی URL براکت‌دار میشه: http://[2001:db8::1]:8099)."""
-    if aiohttp is None:
-        return None
-    timeout = aiohttp.ClientTimeout(total=10, sock_connect=8)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            for u in (
-                "https://api.ipify.org/",
-                "https://ifconfig.me/ip",
-                "https://icanhazip.com/",
-                "https://checkip.amazonaws.com/",
-                "https://ident.me/",
-            ):
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(UGUU_BASE, data=form, headers=headers) as resp:
+                body = (await resp.text(errors="ignore"))[:600]
                 try:
-                    async with s.get(u, headers={"User-Agent": FILEBIN_UA}) as r:
-                        if r.status != 200:
-                            continue
-                        t = (await r.text()).strip()
-                        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", t):
-                            return f"http://{t}:{VLC_SELF_PORT}"
-                        # IPv6 خالص (شامل حداقل یک دونقطه، بدون کاراکتر غیرمجاز)
-                        if ":" in t and re.fullmatch(r"[0-9a-fA-F:]{2,45}", t):
-                            return f"http://[{t}]:{VLC_SELF_PORT}"
+                    js = json.loads(body)
                 except Exception:
-                    continue
-    except Exception:
-        pass
-    return None
+                    js = {}
+                files = (js or {}).get("files") or []
+                url = (files[0].get("url") or "") if files else ""
+                if js.get("success") and url:
+                    return {"name": remote_name, "play_url": url, "dl_url": url, "page_url": ""}
+                raise _FeError(
+                    f"Uguu آپلود رو قبول نکرد (کد {resp.status}):\n<code>{_esc(body[:120])}</code>"
+                )
+    except _FeError:
+        raise
+    except Exception as e:
+        raise _FeError(f"خطای اتصال به Uguu:\n<code>{_esc(str(e)[:120])}</code>")
 
 
-async def _ensure_vlc_web_server() -> Optional[str]:
-    """مطمئن میشه سرور خودمیزبان بالاست و از مسیر عمومی هم قابل دسترسی‌ست.
+# ═══════════ 🆕 حذف خودکار ابری (پیکسل‌درین / گوفایل) + لیست/حذف API ═══════════
+# state آپلودهای پیکسل‌درین — برای اینکه حتی بعد از ری‌استارت هم بدونیم
+# کدوم فایل‌ها مالِ رباته و کی آپلود شدن. (گوفایل لیست اکانت داره، state
+# فقط به‌عنوان پشتیبان نگه میشه.)
 
-    خروجی: base URL سالم (مثل http://5.6.7.8:8099) یا None (پورت بسته/غیرفعال).
-    نتیجه‌ی سالم ۱۰ دقیقه کش میشه که هر کلیک چک مجدد نشه."""
-    global _VLC_SERVER_TASK, _VLC_SERVER_BASE, _VLC_SERVER_CHECKED_AT
-    if not VLC_SELF_ENABLED or aiohttp is None or _web is None:
-        return None
-    now = time.time()
-    if _VLC_SERVER_BASE and (now - _VLC_SERVER_CHECKED_AT) < 600:
-        return _VLC_SERVER_BASE
-    if _VLC_SERVER_TASK is None or _VLC_SERVER_TASK.done():
-        _VLC_SERVER_TASK = asyncio.ensure_future(_start_vlc_web_server())
+def _state_path(kind: str) -> str:
+    """مسیر فایل state — اول پوشه‌ی جاری، اگه نوشتن نشد /tmp."""
+    name = f"{kind}_uploads.json"
+    for base in (os.getcwd(), "/tmp"):
         try:
-            await asyncio.wait_for(_VLC_WEB_READY.wait(), timeout=5)
+            p = os.path.join(base, name)
+            with open(p, "a", encoding="utf-8"):
+                pass
+            return p
         except Exception:
-            pass  # بند نشد — health check پایین هم به‌هرحال رد می‌کنه
-    base = VLC_PUBLIC_BASE or await _detect_public_base()
-    if not base:
-        logger.warning("[FileExplorer] VLC self-host: آدرس عمومی تشخیص داده نشد")
-        return None
+            continue
+    return os.path.join("/tmp", name)
+
+
+def _load_state(kind: str) -> list:
     try:
-        timeout = aiohttp.ClientTimeout(total=12, sock_connect=8)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(f"{base.rstrip('/')}/vlc_health") as r:
-                if r.status == 200 and (await r.text()).strip() == "ok":
-                    _VLC_SERVER_BASE = base.rstrip("/")
-                    _VLC_SERVER_CHECKED_AT = now
-                    logger.info(f"[FileExplorer] VLC self-host healthy: {_VLC_SERVER_BASE}")
-                    return _VLC_SERVER_BASE
+        with open(_state_path(kind), "r", encoding="utf-8") as f:
+            js = json.load(f)
+        return js.get("uploads") or [] if isinstance(js, dict) else []
+    except Exception:
+        return []
+
+
+def _save_state(kind: str, items: list) -> None:
+    try:
+        with open(_state_path(kind), "w", encoding="utf-8") as f:
+            json.dump({"uploads": items[-2000:]}, f, ensure_ascii=False)
     except Exception as e:
-        logger.warning(f"[FileExplorer] VLC self-host health check failed ({base}): {e}")
-    return None
+        logger.warning(f"[AutoDel] state save failed ({kind}): {e}")
 
 
-async def _selfhost_upload(remote_name: str, local_path: str, prog) -> dict:
-    """⭐ راه‌حل همیشگی — فایل روی HTTP سرور خودِ ربات سرو میشه.
-
-    نه آپلود بیرونی لازمه (لینک فوریه)، نه ثبت‌نام، نه سقف حجم؛ و هیچ
-    هاست ثالثی هم نمی‌تونه بلاکش کنه. فایل به پوشه‌ی سرو منتقل (move)
-    میشه و ۶ ساعت قابل پخشه."""
-    base = await _ensure_vlc_web_server()
-    if not base:
-        raise _FeError(
-            "سرور VLC خودِ ربات در دسترس نیست — پورت <code>"
-            f"{VLC_SELF_PORT}</code> تو فایروال سرور بسته‌ست "
-            "(یا تو <code>.env</code> بذار <code>VLC_SELF_HOST=0</code> تا کلاً رد بشه)"
-        )
-    _vlc_sweep_expired()
-    token = secrets.token_hex(10)
-    safe = _safe_disk_name(remote_name) or "file.bin"
-    os.makedirs(_VLC_STREAM_DIR, exist_ok=True)
-    dest = os.path.join(_VLC_STREAM_DIR, f"{token}_{safe}")
-    shutil.move(local_path, dest)   # cross-device هم خودش کپی+پاک می‌کنه
-    _VLC_WEB_FILES[token] = {
-        "path": dest,
-        "name": safe,
-        "size": os.path.getsize(dest),
-        "content_type": _vlc_guess_type(safe),
-        "expires_at": time.time() + VLC_SELF_TTL,
-    }
-    url = f"{base}/vlc/{token}/{quote(safe)}"
-    prog.cb(1, 1)
-    logger.info(f"[FileExplorer] vlc self-host: {safe} → {url}")
-    return {
-        "name": remote_name,
-        "play_url": url,
-        "dl_url": url,
-        "page_url": "",
-        "host_fa": "سرور خود ربات",
-        "expires_fa": "۶ ساعت (تا ری‌استارت ربات)",
-    }
+def _pd_track_upload(fid: str, name: str) -> None:
+    """ثبت آپلود پیکسل‌درین در state (برای حذف خودکار ساعت‌محور)."""
+    if not fid:
+        return
+    items = _load_state("pixeldrain")
+    items.append({"id": str(fid), "name": name or "", "ts": time.time()})
+    _save_state("pixeldrain", items)
 
 
-# ═══════ سلامت‌سنجی + حافظه‌ی هاست‌ها + زنجیره‌ی فالباک ═══════
+def _gofile_track_upload(fid: str, name: str, root_folder: str = "") -> None:
+    if not fid:
+        return
+    items = _load_state("gofile")
+    # rootFolder اکانت رو هم ذخیره کن — برای لیست‌کردن محتوا لازمه
+    if root_folder and not any(x.get("id") == "__root__" for x in items):
+        items.append({"id": "__root__", "root": root_folder, "ts": 0})
+    items.append({"id": str(fid), "name": name or "", "ts": time.time()})
+    _save_state("gofile", items)
 
 
-class _NoopProg:
-    """پیشرفت ساختگی برای آپلودهای سلامت‌سنج (canary)."""
+def _gofile_root() -> str:
+    """ایدی پوشه‌ی ریشه‌ی اکانت گوفایل — از آپلودهای قبلی ذخیره شده."""
+    for x in _load_state("gofile"):
+        if x.get("id") == "__root__":
+            return str(x.get("root") or "")
+    return ""
 
-    def cb(self, current: int, total: int):
-        pass
+
+def _gofile_state_files() -> list:
+    """فایل‌های ثبت‌شده در state (آپلودهای خود ربات) — وقتی API لیست نمی‌ده."""
+    return [
+        {
+            "id": str(x.get("id") or ""),
+            "name": str(x.get("name") or x.get("id") or ""),
+            "size": int(x.get("size") or 0),
+            "created_ts": float(x.get("ts") or 0),
+            "direct_link": "",
+        }
+        for x in _load_state("gofile")
+        if x.get("id") and x.get("id") != "__root__"
+    ]
 
 
-def _vlc_canary_file() -> str:
-    """فایل ۶۴ کیلوبایتی ثابت برای canary — یک‌بار ساخته میشه."""
+def _parse_ts(v) -> float:
+    """تبدیل timestamp به unix — عدد یا ISO 8601 (پیکسل‌درین ISO میده)."""
+    if v is None:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
     try:
-        if not os.path.exists(_VLC_CANARY_PATH) or os.path.getsize(_VLC_CANARY_PATH) != 65536:
-            with open(_VLC_CANARY_PATH, "wb") as f:
-                f.write(os.urandom(65536))
+        return float(s)
     except Exception:
         pass
-    return _VLC_CANARY_PATH
-
-
-async def _canary_ok(host_key: str) -> bool:
-    """سلامت‌سنجی ۶۴ کیلوبایتی هاست‌های ناشناس — تا برای هاست مرده چند
-    صد مگ آپلود و هدر نره. نتیجه‌ی موفق ۱۰ دقیقه کش میشه."""
-    if time.time() < _CANARY_OK_UNTIL.get(host_key, 0.0):
-        return True
-    path = _vlc_canary_file()
     try:
-        if host_key == "litterbox":
-            await _litterbox_upload("canary.bin", path, _NoopProg(), ttl="1h")
-        elif host_key == "catbox":
-            await _catbox_upload("canary.bin", path, _NoopProg())
-        elif host_key == "zerox0":
-            await _zerox0_upload("canary.bin", path, _NoopProg())
-        else:
-            return True
-    except Exception as e:
-        logger.info(f"[FileExplorer] canary {host_key} failed: {e}")
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _gofile_token() -> str:
+    return (os.environ.get("GOFILE_API_KEY") or "").strip()
+
+
+def _gofile_auth_headers(token: str) -> dict:
+    h = {"Accept": "application/json", "User-Agent": FILEBIN_UA}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+
+async def _pd_list_files(api_key: str) -> list:
+    """لیست همه‌ی فایل‌های اکانت پیکسل‌درین — GET /api/user/files (BasicAuth).
+
+    ⚠️ تست تجربی: /api/files وجود نداره (404) — مسیر درست /api/user/files.
+    خروجی: [{id, name, size, created_ts}]"""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as s:
+        async with s.get(
+            f"{PIXDRAIN_BASE}/api/user/files",
+            auth=aiohttp.BasicAuth("", api_key),
+            headers={"Accept": "application/json", "User-Agent": FILEBIN_UA},
+        ) as r:
+            if r.status == 401:
+                raise _FeAuthError(
+                    "کلید API پیکسل‌درین معتبر نیست — "
+                    "<code>PIXDRAIN_API_KEY</code> رو چک کن"
+                )
+            try:
+                js = await r.json(content_type=None)
+            except Exception:
+                js = {}
+    files = (js.get("files") or []) if isinstance(js, dict) else []
+    out = []
+    for f in files:
+        if not isinstance(f, dict) or not f.get("id"):
+            continue
+        out.append({
+            "id": str(f["id"]),
+            "name": str(f.get("name") or f["id"]),
+            "size": int(f.get("size") or 0),
+            "created_ts": _parse_ts(f.get("date_created") or f.get("dateCreated")),
+        })
+    return out
+
+
+async def _pd_api_delete(session, api_key: str, fid: str) -> bool:
+    """DELETE /api/file/{id} — حذف فایل از اکانت پیکسل‌درین."""
+    try:
+        async with session.delete(
+            f"{PIXDRAIN_BASE}/api/file/{fid}",
+            auth=aiohttp.BasicAuth("", api_key),
+            headers={"Accept": "application/json", "User-Agent": FILEBIN_UA},
+        ) as r:
+            return r.status in (200, 204)
+    except Exception:
         return False
-    _CANARY_OK_UNTIL[host_key] = time.time() + 600
-    return True
 
 
-def _host_in_cooldown(key: str) -> bool:
-    return time.time() < _HOST_COOLDOWN_UNTIL.get(key, 0.0)
+async def _gofile_list_files(token: str) -> list:
+    """لیست فایل‌های اکانت گوفایل برای /clean.
+
+    ⚠️ تست تجربی (اکانت رایگان):
+      • GET /contents/{rootFolder} → 401 error-notPremium (لیستِ محتوا پرمیومه)
+      • directLink هم پرمیومه — لینک download/web/ فقط به صفحه‌ی HTML ریدایرکت می‌کنه
+    پس برای اکانت رایگان از state محلی (آپلودهای خودِ ربات) استفاده می‌شه؛
+    اگه اکانت پرمیوم بشه، لیست واقعی API برمی‌گرده.
+    خروجی: [{id, name, size, created_ts, direct_link}]"""
+    root = _gofile_root()
+    url = f"https://api.gofile.io/contents/{root}" if root else "https://api.gofile.io/contents"
+    js = {}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+            async with s.get(url, headers=_gofile_auth_headers(token)) as r:
+                body = await r.text(errors="ignore")
+                low = body.lower()
+                if "notpremium" in low:
+                    return _gofile_state_files()
+                if r.status == 401 or "wrongtoken" in low or "error-token" in low:
+                    raise _FeAuthError(
+                        "کلید گوفایل معتبر نیست — <code>GOFILE_API_KEY</code> رو چک کن"
+                    )
+                try:
+                    js = json.loads(body)
+                except Exception:
+                    js = {}
+    except _FeAuthError:
+        raise
+    except Exception:
+        # timeout / قطع شبکه و ... → state محلی بهتر از شکستن /clean است
+        return _gofile_state_files()
+    if not (isinstance(js, dict) and js.get("status") == "ok"):
+        # API لیست نداد (مثلاً error-notFound قبل از اولین آپلود) → state محلی
+        return _gofile_state_files()
+    d = js.get("data") or {}
+    children = d.get("children") or []
+    if isinstance(children, dict):
+        children = list(children.values())
+    out = []
+    for c in children:
+        if not isinstance(c, dict) or not c.get("id") or c.get("type") == "folder":
+            continue
+        out.append({
+            "id": str(c["id"]),
+            "name": str(c.get("name") or c["id"]),
+            "size": int(c.get("size") or 0),
+            "created_ts": _parse_ts(c.get("createTime")),
+            "direct_link": str(c.get("directLink") or ""),
+        })
+    return out
 
 
-def _host_fail(key: str):
-    """هاست شکست‌خورده رو یه مدت استراحت می‌ده (مدت‌ها تو _HOST_COOLDOWN_SECS)."""
-    secs = _HOST_COOLDOWN_SECS.get(key, 20 * 60)
-    _HOST_COOLDOWN_UNTIL[key] = time.time() + secs
-    logger.warning(f"[FileExplorer] host {key} failed → cooldown {secs // 60}m")
+async def _gofile_delete_contents(token: str, ids: list) -> bool:
+    """DELETE api.gofile.io/contents — حذف یک یا چند محتوا از اکانت گوفایل."""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as s:
+            async with s.delete(
+                "https://api.gofile.io/contents",
+                headers=_gofile_auth_headers(token),
+                json={"contentsId": [str(i) for i in ids]},
+            ) as r:
+                try:
+                    js = await r.json(content_type=None)
+                except Exception:
+                    js = {}
+                return isinstance(js, dict) and js.get("status") == "ok"
+    except Exception:
+        return False
 
 
-def _host_ok(key: str):
-    _HOST_COOLDOWN_UNTIL.pop(key, None)
+async def _pd_autodel_sweep() -> tuple:
+    """حذف خودکار فایل‌های قدیمی پیکسل‌درین — (deleted, failed).
+
+    مرجع اصلی: لیست اکانت (GET /api/user/files) — حتی اگه state ری‌استارت شده
+    باشه، فایل‌های ردیابی‌شده قدیمی پاک میشن. اگه لیست اکانت در دسترس نبود،
+    از state محلی استفاده میشه. دیفالت فقط فایل‌های خودِ ربات (state)."""
+    hours = PIXELDRAIN_AUTO_DELETE_HOURS
+    api_key = (os.environ.get("PIXDRAIN_API_KEY") or "").strip()
+    if hours <= 0 or not api_key or aiohttp is None:
+        return (0, 0)
+    cutoff = time.time() - hours * 3600
+    deleted = failed = 0
+    entries = []
+    try:
+        entries = await _pd_list_files(api_key)
+    except Exception as e:
+        logger.warning(f"[AutoDel] pixeldrain list failed: {e}")
+
+    if entries:
+        live_ids = {f["id"] for f in entries}
+        tracked = {x.get("id") for x in _load_state("pixeldrain")}
+        # فایل‌های خود ربات (ردیابی‌شده) قدیمی‌تر از cutoff → پاک
+        # (+ همه‌ی فایل‌های قدیمی اکانت اگه PIXELDRAIN_DELETE_ALL_OLD=1)
+        victims = [
+            f for f in entries
+            if f["created_ts"] > 0 and f["created_ts"] < cutoff
+            and (f["id"] in tracked or PIXELDRAIN_DELETE_ALL_OLD)
+        ]
+        if victims:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as s:
+                for f in victims:
+                    if await _pd_api_delete(s, api_key, f["id"]):
+                        deleted += 1
+                    else:
+                        failed += 1
+                    await asyncio.sleep(0.3)
+            if deleted:
+                logger.info("[AutoDel] pixeldrain: %d expired file(s) deleted", deleted)
+        # sync state — اونی که تو اکانت نیست یعنی قبلاً پاک شده
+        _save_state("pixeldrain", [x for x in _load_state("pixeldrain") if x.get("id") in live_ids])
+    else:
+        # لیست اکانت نشد → state محلی
+        st = _load_state("pixeldrain")
+        victims = [x for x in st if float(x.get("ts") or 0) > 0 and float(x.get("ts") or 0) < cutoff]
+        if victims:
+            vid = {x["id"] for x in victims}
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as s:
+                for x in victims:
+                    if await _pd_api_delete(s, api_key, x["id"]):
+                        deleted += 1
+                    else:
+                        failed += 1
+                    await asyncio.sleep(0.3)
+            if deleted:
+                logger.info("[AutoDel] pixeldrain(state): %d expired file(s) deleted", deleted)
+            _save_state("pixeldrain", [x for x in st if x.get("id") not in vid])
+    return (deleted, failed)
 
 
-def _vlc_chain(size: int, api_key: str):
-    """زنجیره‌ی هاست‌های VLC به ترتیب تلاش — بر اساس حجم/کلید/cooldown.
+async def _gofile_autodel_sweep() -> tuple:
+    """حذف خودکار گوفایل — فقط اگه GOFILE_AUTO_DELETE_HOURS > 0 (دیفالت خاموش)."""
+    hours = GOFILE_AUTO_DELETE_HOURS
+    token = _gofile_token()
+    if hours <= 0 or not token or aiohttp is None:
+        return (0, 0)
+    cutoff = time.time() - hours * 3600
+    try:
+        files = await _gofile_list_files(token)
+    except Exception as e:
+        logger.warning(f"[AutoDel] gofile list failed: {e}")
+        return (0, 0)
+    victims = [f["id"] for f in files if f["created_ts"] > 0 and f["created_ts"] < cutoff]
+    deleted = failed = 0
+    for i in range(0, len(victims), 50):
+        chunk = victims[i:i + 50]
+        if await _gofile_delete_contents(token, chunk):
+            deleted += len(chunk)
+        else:
+            failed += len(chunk)
+        await asyncio.sleep(0.5)
+    if deleted:
+        logger.info("[AutoDel] gofile: %d expired file(s) deleted", deleted)
+    return (deleted, failed)
 
-    خروجی: لیستی از (key, نام‌فارسی, coroutine_factory) که coroutine_factory
-    امضای (remote_name, local_path, prog) داره."""
-    items = []
-    if VLC_SELF_ENABLED:
-        items.append(("selfhost", "سرور خود ربات", 1 << 60,
-                      lambda rn, p, pr: _selfhost_upload(rn, p, pr)))
-    if api_key:
-        items.append(("pixeldrain", "پیکسل‌درین", PIXDRAIN_MAX_BYTES,
-                      lambda rn, p, pr: _pixeldrain_upload(rn, p, pr, api_key)))
-    items.append(("litterbox", "Litterbox", LITTERBOX_MAX_BYTES,
-                  lambda rn, p, pr: _litterbox_upload(rn, p, pr)))
-    items.append(("catbox", "Catbox", CATBOX_MAX_BYTES,
-                  lambda rn, p, pr: _catbox_upload(rn, p, pr)))
-    items.append(("zerox0", "0x0.st", ZEROX0_MAX_BYTES,
-                  lambda rn, p, pr: _zerox0_upload(rn, p, pr)))
+
+# ═══════════ 🆕 دستور /clean — پاکسازی دستی: پیکسل‌درین / گوفایل / سرور خودم ═══════════
+_CLEAN_SESSIONS: dict = {}          # sid → {"host","files","ts","chat"}
+_CLEAN_TTL = 30 * 60                # عمر سشن /clean
+_CLEAN_HOSTS = {
+    "pd": {"title": "پیکسل‌درین", "emoji": "🟣"},
+    "go": {"title": "گوفایل", "emoji": "🟢"},
+    "self": {"title": "سرور خودمون", "emoji": "🖥"},
+}
+_CLEAN_SHOW = 20                    # حداکثر دکمه‌ی فایل در هر لیست
+_CLEAN_MAX_FILES = 200              # سقف فایل‌های لودشده در هر سشن
+
+
+def _clean_host_rows():
     return [
-        (k, fa, mk)
-        for k, fa, mx, mk in items
-        if size <= mx and not _host_in_cooldown(k)
+        [Button.inline("🟣 پیکسل‌درین", "fclnh_pd")],
+        [Button.inline("🟢 گوفایل", "fclnh_go")],
+        [Button.inline("🖥 سرور خودمون", "fclnh_self")],
+        [Button.inline("❌ بستن", "fclnx_none")],
     ]
+
+
+def _clean_gc() -> None:
+    now = time.time()
+    stale = [k for k, v in _CLEAN_SESSIONS.items() if now - v.get("ts", 0) > _CLEAN_TTL]
+    for k in stale:
+        _CLEAN_SESSIONS.pop(k, None)
+
+
+async def _clean_fetch(host: str) -> list:
+    """لیست فایل‌های هاست انتخابی — برای /clean."""
+    if host == "pd":
+        api_key = (os.environ.get("PIXDRAIN_API_KEY") or "").strip()
+        if not api_key:
+            raise _FeError("کلید <code>PIXDRAIN_API_KEY</code> تو env تنظیم نیست")
+        files = await _pd_list_files(api_key)
+        files.sort(key=lambda x: x.get("created_ts") or 0, reverse=True)
+        return files[:_CLEAN_MAX_FILES]
+    if host == "go":
+        token = _gofile_token()
+        if not token:
+            raise _FeError("کلید <code>GOFILE_API_KEY</code> تو env تنظیم نیست")
+        files = await _gofile_list_files(token)
+        files.sort(key=lambda x: x.get("created_ts") or 0, reverse=True)
+        return files[:_CLEAN_MAX_FILES]
+    if host == "self":
+        from file_server import list_files
+        out = []
+        for f in list_files()[:_CLEAN_MAX_FILES]:
+            out.append({
+                "id": f["token"],
+                "name": f["name"],
+                "size": f["size"],
+                "created_ts": 0,
+                "expires_at": f["expires_at"],
+            })
+        return out
+    return []
+
+
+def _clean_remaining_secs(f: dict, host: str) -> str:
+    """برچسب زمانی کوچک برای هر فایل."""
+    if host == "self":
+        left = int(f.get("expires_at", 0) - time.time())
+        if left > 0:
+            h = left // 3600
+            m = (left % 3600) // 60
+            return f"{h}س {m}د" if h else f"{m} دقیقه"
+        return "منقضی"
+    if host == "pd" and f.get("created_ts"):
+        age_h = (time.time() - f["created_ts"]) / 3600
+        if age_h >= 1:
+            return f"{int(age_h)} ساعت پیش"
+        return f"{int(age_h * 60)} دقیقه پیش"
+    return ""
+
+
+def _clean_render(sess: dict) -> tuple:
+    """رندر لیست فایل‌ها برای /clean → (text, rows)."""
+    host, sid = sess["host"], sess["sid"]
+    files = sess["files"]
+    meta = _CLEAN_HOSTS[host]
+    shown = files[:_CLEAN_SHOW]
+    lines = [
+        f"{meta['emoji']} <b>فایل‌های {meta['title']}</b>",
+        f"📄 تعداد کل: <b>{len(files)}</b>",
+    ]
+    if host == "self":
+        lines.append(f"⏳ این فایل‌ها بعد از {SELF_EXPIRY_HOURS:g} ساعت خودکار پاک میشن")
+    elif host == "pd" and PIXELDRAIN_AUTO_DELETE_HOURS > 0:
+        lines.append(f"⏳ فایل‌های ربات بعد از {PIXELDRAIN_AUTO_DELETE_HOURS:g} ساعت خودکار پاک میشن")
+    lines.append("")
+    for f in shown:
+        tag = _clean_remaining_secs(f, host)
+        lines.append(
+            f"• <code>{_esc(_short(f['name'], 34))}</code> ({_fmt_size(f.get('size', 0))})"
+            + (f" — {tag}" if tag else "")
+        )
+    if len(files) > len(shown):
+        lines.append(f"… و {len(files) - len(shown)} فایل دیگه")
+    rows = []
+    for i, f in enumerate(shown):
+        rows.append([Button.inline(
+            f"🗑 {_short(f['name'], 24)} ({_fmt_size(f.get('size', 0))})",
+            f"fclnd_{sid}_{i}",
+        )])
+    rows.append([Button.inline(f"☢️ حذف همه ({len(files)})", f"fclnda_{sid}")])
+    rows.append([
+        Button.inline("🔄 بروزرسانی", f"fclnr_{sid}"),
+        Button.inline("⬅️ هاست‌ها", f"fclnm_{sid}"),
+    ])
+    rows.append([Button.inline("❌ بستن", f"fclnx_{sid}")])
+    return "\n".join(lines), rows
+
+
+async def _clean_delete_one(host: str, f: dict) -> bool:
+    """حذف یک فایل از هاست مربوطه."""
+    try:
+        if host == "self":
+            from file_server import delete_file
+            return bool(delete_file(f["id"]))
+        if host == "pd":
+            api_key = (os.environ.get("PIXDRAIN_API_KEY") or "").strip()
+            if not api_key:
+                return False
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as s:
+                return await _pd_api_delete(s, api_key, f["id"])
+        if host == "go":
+            token = _gofile_token()
+            if not token:
+                return False
+            return await _gofile_delete_contents(token, [f["id"]])
+    except Exception:
+        return False
+    return False
+
+
+async def fe_clean_cmd(event):
+    """دستور /clean — منوی انتخاب هاست برای پاکسازی."""
+    try:
+        if not _is_authorized(event.sender_id):
+            return  # غیرمجاز — بی‌صدا نادیده
+    except Exception:
+        pass
+    _clean_gc()
+    await event.respond(
+        "🧹 <b>پاکسازی فایل‌های ابری</b>\n\n"
+        "فایل‌های کدوم هاست رو می‌خوای ببینی و پاک کنی؟",
+        buttons=_clean_host_rows(),
+        parse_mode="html",
+    )
+
+
+async def fe_clean_cb(event):
+    """دکمه‌های /clean — fclnh/fclnd/fclnda/fclnda2/fclnr/fclnm/fclnx."""
+    sid = None
+    try:
+        if not _is_authorized(event.sender_id):
+            await event.answer("⛔️ اجازه نداری", alert=True)
+            return
+        data = event.data.decode("utf-8", "ignore")
+        parts = data.split("_")
+        action = parts[0]
+        _clean_gc()
+
+        # ── انتخاب هاست ──
+        if action == "fclnh" and len(parts) == 2:
+            host = parts[1]
+            if host not in _CLEAN_HOSTS:
+                await event.answer("هاست نامعتبره", alert=True)
+                return
+            await event.answer("🔄 در حال گرفتن لیست...")
+            await _safe_edit(event, "⏳ در حال گرفتن لیست فایل‌ها...", _idle_rows("⏳ صبر کن..."))
+            files = await _clean_fetch(host)
+            sid = secrets.token_hex(5)
+            _CLEAN_SESSIONS[sid] = {"host": host, "files": files, "sid": sid, "ts": time.time()}
+            text, rows = _clean_render(_CLEAN_SESSIONS[sid])
+            await _safe_edit(event, text, rows)
+            return
+
+        if len(parts) < 2:
+            await event.answer("داده نامعتبره", alert=True)
+            return
+        sid = parts[1]
+        sess = _CLEAN_SESSIONS.get(sid)
+
+        # ── بستن ──
+        if action == "fclnx":
+            if sid in _CLEAN_SESSIONS:
+                _CLEAN_SESSIONS.pop(sid, None)
+            await event.answer("بسته شد")
+            await _safe_edit(event, "🧹 پاکسازی بسته شد.", _idle_rows("✖️ بسته شد — دوباره /clean بزن"))
+            return
+
+        if sess is None:
+            await event.answer("⌛️ این منو منقضی شده — دوباره /clean بزن", alert=True)
+            await _safe_edit(event, "⌛️ این منو منقضی شد — دوباره <code>/clean</code> بزن.", None)
+            return
+        sess["ts"] = time.time()
+        host = sess["host"]
+        meta = _CLEAN_HOSTS[host]
+
+        # ── حذف تکی ──
+        if action == "fclnd" and len(parts) == 3:
+            idx = int(parts[2])
+            if idx >= len(sess["files"]):
+                await event.answer("این فایل دیگه تو لیست نیست — بروزرسانی کن", alert=True)
+                return
+            f = sess["files"][idx]
+            await event.answer("🗑 در حال حذف...")
+            ok = await _clean_delete_one(host, f)
+            if ok:
+                sess["files"].pop(idx)
+                text, rows = _clean_render(sess)
+                await _safe_edit(event, f"✅ حذف شد: <code>{_esc(_short(f['name'], 30))}</code>\n\n" + text, rows)
+            else:
+                await event.answer("❌ حذف ناموفق — دوباره امتحان کن", alert=True)
+            return
+
+        # ── حذف همه — مرحله تأیید ──
+        if action == "fclnda":
+            n = len(sess["files"])
+            if n == 0:
+                await event.answer("لیست خالیه", alert=True)
+                return
+            await event.answer()
+            await _safe_edit(
+                event,
+                f"⚠️ <b>مطمئنی؟</b>\n\nهمه‌ی <b>{n}</b> فایل از {meta['emoji']} <b>{meta['title']}</b> "
+                "برای همیشه پاک بشن؟ این عمل برگشت‌پذیر نیست!",
+                [
+                    [Button.inline(f"☢️ آره، همه‌ی {n} تا رو پاک کن", f"fclnda2_{sid}")],
+                    [Button.inline("⬅️ برگشت", f"fclnr_{sid}")],
+                ],
+            )
+            return
+
+        # ── حذف همه — اجرا ──
+        if action == "fclnda2":
+            files = list(sess["files"])
+            n = len(files)
+            if n == 0:
+                await event.answer("لیست خالیه", alert=True)
+                return
+            await _safe_edit(event, f"🧹 در حال حذف {n} فایل از {meta['title']}...", _idle_rows("⏳ در حال حذف..."))
+            deleted = failed = 0
+            if host == "go":
+                token = _gofile_token()
+                for i in range(0, n, 50):
+                    chunk = [f["id"] for f in files[i:i + 50]]
+                    if await _gofile_delete_contents(token, chunk):
+                        deleted += len(chunk)
+                    else:
+                        failed += len(chunk)
+                    await asyncio.sleep(0.4)
+            else:
+                for f in files:
+                    if await _clean_delete_one(host, f):
+                        deleted += 1
+                    else:
+                        failed += 1
+                    if (deleted + failed) % 10 == 0:
+                        await _safe_edit(event, f"🧹 {deleted + failed}/{n} فایل پردازش شد...", None)
+                    await asyncio.sleep(0.25)
+            sess["files"] = []
+            text, rows = _clean_render(sess)
+            result = f"🧹 <b>تمیزکاری تموم شد!</b>\n✅ حذف شد: {deleted}   ❌ ناموفق: {failed}\n\n"
+            await _safe_edit(event, result + text, rows)
+            return
+
+        # ── بروزرسانی لیست ──
+        if action == "fclnr":
+            await event.answer("🔄 در حال بروزرسانی...")
+            await _safe_edit(event, "⏳ در حال گرفتن لیست تازه...", _idle_rows("⏳ صبر کن..."))
+            sess["files"] = await _clean_fetch(host)
+            text, rows = _clean_render(sess)
+            await _safe_edit(event, text, rows)
+            return
+
+        # ── برگشت به منوی هاست‌ها ──
+        if action == "fclnm":
+            if sid in _CLEAN_SESSIONS:
+                _CLEAN_SESSIONS.pop(sid, None)
+            await event.answer()
+            await _safe_edit(
+                event,
+                "🧹 <b>پاکسازی فایل‌های ابری</b>\n\nفایل‌های کدوم هاست رو می‌خوای ببینی و پاک کنی؟",
+                _clean_host_rows(),
+            )
+            return
+
+        await event.answer("دستور ناشناخته", alert=True)
+    except _FeAuthError as e:
+        try:
+            await event.answer("🔑 کلید API مشکل داره", alert=True)
+            await _safe_edit(event, f"❌ {e}", _clean_host_rows())
+        except Exception:
+            pass
+    except _FeError as e:
+        try:
+            await event.answer("❌ خطا", alert=True)
+            await _safe_edit(event, f"❌ {e}", _clean_host_rows())
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[FileExplorer] clean cb error: {e}", exc_info=True)
+        try:
+            await event.answer("❌ خطای غیرمنتظره", alert=True)
+        except Exception:
+            pass
+
+
+async def _cloud_gc_loop():
+    """تاسک پس‌زمینه: حذف خودکار پیکسل‌درین/گوفایل + گاربیج‌کالکتور /clean.
+
+    اولین اجرا ۲ دقیقه بعد از بوت؛ بعدش هر ۱۰ دقیقه."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            d, f = await _pd_autodel_sweep()
+            if d or f:
+                logger.info("[AutoDel] pixeldrain sweep: deleted=%d failed=%d", d, f)
+        except Exception as e:
+            logger.warning(f"[AutoDel] pixeldrain sweep error: {e}")
+        try:
+            d, f = await _gofile_autodel_sweep()
+            if d or f:
+                logger.info("[AutoDel] gofile sweep: deleted=%d failed=%d", d, f)
+        except Exception as e:
+            logger.warning(f"[AutoDel] gofile sweep error: {e}")
+        try:
+            _clean_gc()
+        except Exception:
+            pass
+        await asyncio.sleep(600)
 
 
 async def _safe_edit(event, text: str, rows=None) -> bool:
@@ -967,6 +1376,11 @@ def _fix_zip_name(info) -> str:
 
 class _FeError(Exception):
     """خطای دوستانه — متنش مستقیم به کاربر نشون داده میشه."""
+
+
+class _FeAuthError(_FeError):
+    """🆕 خطای احراز هویت (مثل کلید نامعتبر پیکسل‌درین) — ری‌تای بی‌فایده‌ست،
+    زنجیره‌ی fallback مستقیم میره سراغ هاست بعدی."""
 
 
 # ═══════════════════════ ساخت درخت آرشیو ═══════════════════════
@@ -2085,15 +2499,16 @@ async def fe_filebin_cb(event):
 async def fe_vlc_cb(event):
     """دکمه 🎬 آپلود برای پخش در VLC: fvlc_<chat_id>_<msg_id>
 
-    فایل رو دانلود می‌کنه و روی اولین هاست سالمِ «لینک مستقیم» می‌ذاره که
-    بایت خام میده و مستقیم تو VLC پلی میشه (برخلاف filebin که صفحه تأیید
-    داره). زنجیره‌ی فالباک (به ترتیب تلاش):
-    • سرور خود ربات (بدون آپلود، بدون سقف — پورت VLC_PORT؛ پیش‌فرض 8099)
-    • Pixeldrain اگه PIXDRAIN_API_KEY تو .env تنظیم شده باشه (تا ۲۰ گیگ)
-    • Litterbox (تا ۱ گیگ، لینک ۷۲ ساعته)
-    • Catbox (تا ۲۰۰ مگ، دائمی) → 0x0.st (تا ۵۱۲ مگ، ۳۰ روز)
-    هر هاست ناشناس اول با آپلود ۶۴ کیلوبایتی سلامت‌سنجی میشه و هاست
-    خراب cooldown می‌گیره تا دفعات بعد خودکار رد بشه.
+    فایل رو دانلود می‌کنه و روی هاستی می‌ذاره که لینکش بایت خام میده و
+    مستقیم تو VLC پلی میشه (برخلاف filebin که صفحه تأیید داره).
+    🆕 زنجیره‌ی fallback خودکار (اولین هاستی که جواب داد برنده‌ست):
+    ۱. سرور خودم (اگه PUBLIC_BASE_URL ست باشه) — لینک پابلیک با Range، فوری
+    ۲. Pixeldrain (اگه PIXDRAIN_API_KEY ست باشه) — تا ۲۰ گیگ
+    ۳. Litterbox — تا ۱ گیگ، ۷۲ ساعته
+    ۴. Catbox — تا ۲۰۰ مگ، دائمی
+    ۵. Uguu — تا ۱۲۸ مگ، ۳ ساعته (بایت خام + Range)
+    ۶. Gofile — با کلید اکانت directLink میده؛ بدون کلید فقط صفحه‌ی دانلود
+    هر هاست حداکثر ۲ تلاش؛ کلید نامعتبر (401) → بدون ری‌تای هاست بعدی.
     """
     chat_id = msg_id = None
     work_dir = None
@@ -2124,33 +2539,22 @@ async def fe_vlc_cb(event):
         fname = _doc_filename(doc) or f"file_{msg_id}"
         size = getattr(doc, "size", 0) or 0
 
-        # 🆕 انتخاب هوشمند هاست — زنجیره‌ی فالباک چند‌هاسته
+        # 🆕 ساخت زنجیره‌ی هاست‌ها — fallback خودکار:
+        # سرور خودم → پیکسل‌درین → Litterbox → Catbox → Uguu → Gofile
+        # (هاست‌هایی که سقف‌شون کمتر از حجم فایله حذف میشن)
         api_key = (os.environ.get("PIXDRAIN_API_KEY") or "").strip()
-        chain = _vlc_chain(size, api_key)
-        if not chain:
-            # فقط وقتی سرور خودمیزبان خاموشه، کلید هم نیست و حجم از سقف
-            # همه‌ی هاست‌های ناشناس (۱ گیگ) بزرگ‌تره
-            try:
-                await event.answer("⚠️ برای این حجم تنظیمات لازمه", alert=True)
-            except Exception:
-                pass
-            await _safe_edit(
-                event,
-                "⚠️ حجم فایل <b>" + _esc(_fmt_size(size)) + "</b> هست و بدون تنظیمات، "
-                "سقف لینکِ قابل‌پخش (VLC) برای فایل‌ها <b>۱ گیگ</b>ه. دو راه داری:\n\n"
-                "راه ۱ — فایل‌های تا <b>۲۰ گیگ</b> با پیکسل‌درین:\n"
-                "۱️⃣ تو سایت pixeldrain.com یه اکانت رایگان بساز\n"
-                "۲️⃣ از بخش تنظیمات اکانت، API Key رو کپی کن\n"
-                "۳️⃣ تو فایل <code>.env</code> ربات این خط رو اضافه کن: "
-                "<code>PIXDRAIN_API_KEY=کلید-شما</code>\n"
-                "۴️⃣ ربات رو ری‌استارت کن\n\n"
-                "راه ۲ — بدون محدودیت با سرور خود ربات:\n"
-                "پورت <code>VLC_PORT</code> (پیش‌فرض 8099) رو تو فایروال سرور باز کن "
-                "(یا آدرس عمومی رو تو <code>.env</code> بذار: "
-                "<code>VLC_PUBLIC_BASE=http://IP-سرور:پورت</code>)",
-                _menu_rows(chat_id, msg_id),
-            )
-            return
+        chain: list = []
+        if _self_server_base() and size <= SELF_MAX_BYTES:
+            chain.append("self")
+        if api_key and size <= PIXDRAIN_MAX_BYTES:
+            chain.append("pixeldrain")
+        if size <= LITTERBOX_MAX_BYTES:
+            chain.append("litterbox")
+        if size <= CATBOX_MAX_BYTES:
+            chain.append("catbox")
+        if size <= UGUU_MAX_BYTES:
+            chain.append("uguu")
+        chain.append("gofile")  # بی‌سقف عملی — همیشه آخرین امید (فقط صفحه)
 
         try:
             await event.answer("🎬 شروع آماده‌سازی لینک پخش...")
@@ -2162,7 +2566,7 @@ async def fe_vlc_cb(event):
 
         await _safe_edit(
             event,
-            f"🎬 در حال دانلود <b>{_esc(fname)}</b> برای آپلود...",
+            f"🎬 در حال دانلود <b>{_esc(fname)}</b> برای آماده‌سازی لینک پخش...",
             _abort_rows(abort_token),
         )
 
@@ -2185,95 +2589,133 @@ async def fe_vlc_cb(event):
             return
 
         remote_name = _filebin_remote_name(fname)
-        # ⚠️ حجم قبل از حلقه — هاست selfhost فایل رو move می‌کنه
-        fsize = os.path.getsize(got)
-        # ⚠️ آپلود بدون توکن‌ریز در cb — لغو با کنسلِ تسک (بخش Filebin)
-
-        errors: list = []
+        # 🆕 حلقه‌ی زنجیره‌ی آپلود — هر هاست حداکثر ۲ تلاش، شکست → هاست بعدی
+        prov_fa = {
+            "self": "سرور خودت",
+            "pixeldrain": "پیکسل‌درین",
+            "litterbox": "Litterbox",
+            "catbox": "Catbox",
+            "uguu": "Uguu",
+            "gofile": "Gofile",
+        }
         res = None
-        used_host = ""
-        for host_key, host_fa, make_coro in chain:
-            # 🔎 سلامت‌سنجی هاست‌های ناشناس — هدررفت آپلود سنگین ممنوع
-            if host_key in _CANARY_HOSTS:
+        used_prov = None
+        err_lines: list = []
+        for prov in chain:
+            fa = prov_fa[prov]
+            attempts = 1 if prov == "self" else 2
+            for att in range(1, attempts + 1):
+                label = fa if attempts == 1 else f"{fa} (تلاش {att}/{attempts})"
                 await _safe_edit(
                     event,
-                    f"🔎 سلامت‌سنجی {host_fa}...",
+                    f"⬆️ در حال آپلود به <b>{_esc(label)}</b>...",
                     _abort_rows(abort_token),
                 )
+                # ⚠️ آپلود بدون توکن‌ریز در cb — لغو با کنسلِ تسک (بخش Filebin)
+                prog_up = _ProgEdit(btn_msg, "آپلود")
                 try:
-                    alive = await _run_upload_with_abort(abort_token, _canary_ok(host_key))
+                    if prov == "self":
+                        try:
+                            res = _self_upload(remote_name, got, prog_up)
+                        except Exception as e:
+                            raise _FeError(
+                                f"ثبت روی سرور خودم ناموفق: {_esc(str(e)[:150])}"
+                            ) from e
+                    else:
+                        if prov == "pixeldrain":
+                            coro = _pixeldrain_upload(remote_name, got, prog_up, api_key)
+                        elif prov == "litterbox":
+                            coro = _litterbox_upload(remote_name, got, prog_up)
+                        elif prov == "catbox":
+                            coro = _catbox_upload(remote_name, got, prog_up)
+                        elif prov == "uguu":
+                            coro = _uguu_upload(remote_name, got, prog_up)
+                        else:
+                            coro = _gofile_upload(remote_name, got, prog_up)
+                        res = await _run_upload_with_abort(abort_token, coro)
+                    used_prov = prov
+                    break
                 except _UploadAborted:
                     raise
-                except Exception:
-                    alive = False
-                if not alive:
-                    _host_fail(host_key)
-                    errors.append(f"{host_fa}: فعلاً پاسخگو نیست (سلامت‌سنجی رد شد)")
-                    logger.info(f"[FileExplorer] vlc: {host_key} canary failed → skip")
-                    continue
-            await _safe_edit(
-                event,
-                f"⬆️ آپلود <b>{_esc(fname)}</b> به {host_fa}...",
-                _abort_rows(abort_token),
-            )
-            prog_up = _ProgEdit(btn_msg, f"آپلود {host_fa}")
-            try:
-                res = await _run_upload_with_abort(
-                    abort_token, make_coro(remote_name, got, prog_up)
-                )
-                used_host = host_fa
-                _host_ok(host_key)
+                except _FeAuthError as e:
+                    # کلید نامعتبره — ری‌تای بی‌فایده؛ مستقیم هاست بعدی
+                    err_lines.append(f"• {fa}: {e}")
+                    break
+                except _FeError as e:
+                    err_lines.append(f"• {fa} (تلاش {att}): {e}")
+                    if att < attempts:
+                        await asyncio.sleep(2)
+            if res:
                 break
-            except _UploadAborted:
-                raise
-            except Exception as e:
-                _host_fail(host_key)
-                errors.append(f"{host_fa}: {_esc(str(e).splitlines()[0][:110])}")
-                logger.warning(f"[FileExplorer] vlc: host {host_key} failed → next", exc_info=True)
-                continue
-
-        if res is None:
-            err_block = "\n".join(f"  • {x}" for x in errors) or "  • خطای نامشخص"
-            await _safe_edit(
-                event,
-                "❌ <b>هیچ‌کدوم از هاست‌ها جواب ندادن:</b>\n"
-                f"{err_block}\n\n"
-                "💡 راه‌های دائمی:\n"
-                "• کلید رایگان پیکسل‌درین (تا ۲۰ گیگ): <code>PIXDRAIN_API_KEY</code> تو <code>.env</code>\n"
-                f"• سرور خود ربات (بدون سقف): باز کردن پورت <code>{VLC_SELF_PORT}</code> "
-                "تو فایروال (یا <code>VLC_PUBLIC_BASE</code> تو <code>.env</code>)",
-                _menu_rows(chat_id, msg_id),
+        if not res:
+            hint = (
+                "\n\n💡 برای پایداری بیشتر، کلید رایگان پیکسل‌درین (تا ۲۰ گیگ) رو تو "
+                "<code>PIXDRAIN_API_KEY</code> بذار و دامنه‌ی سرور خودت رو تو "
+                "<code>PUBLIC_BASE_URL</code>."
+                if "pixeldrain" not in chain else ""
             )
-            return
+            raise _FeError(
+                "همه‌ی هاست‌ها شکست خوردن:\n" + "\n".join(err_lines[-4:]) + hint
+            )
 
+        fsize = os.path.getsize(got)
         vlc_hint = "🎬 پخش تو VLC: Media → Open Network Stream (Ctrl+N) → لینک رو Paste کن"
-        fallback_note = (
-            "\n\nℹ️ هاست قبلی جواب نداده بود؛ از فالباک استفاده شد."
-            if errors
-            else ""
-        )
-        text = (
-            f"✅ <b>فایل برای پخش آماده شد! ({_esc(used_host)})</b>\n\n"
-            f"📄 فایل: <code>{_esc(res['name'])}</code>\n"
-            f"📏 حجم: {_fmt_size(fsize)}\n\n"
-            "▶️ لینک مستقیم پخش در VLC:\n"
-            f"{res['play_url']}\n\n"
-        )
-        if res["dl_url"] and res["dl_url"] != res["play_url"]:
-            text += f"⬇️ لینک دانلود مستقیم:\n{res['dl_url']}\n\n"
-        if res.get("page_url"):
-            text += f"📄 لینک صفحه:\n{res['page_url']}\n\n"
-        text += (
-            f"⏳ اعتبار این لینک: {res.get('expires_fa', 'موقت')}\n"
-            f"{vlc_hint}{fallback_note}"
-        )
-
-        btn_row = [Button.url("▶️ پخش در VLC", res["play_url"])]
-        if res["dl_url"] and res["dl_url"] != res["play_url"]:
-            btn_row.append(Button.url("⬇️ دانلود", res["dl_url"]))
-        rows = [btn_row]
-        if res.get("page_url"):
-            rows.append([Button.url("📄 صفحه فایل", res["page_url"])])
+        # 🆕 پیام موفقیت یکسان برای همه‌ی هاست‌ها + نکته‌ی اعتبار لینک
+        exp_note = {
+            "self": f"⏳ اعتبار لینک: {SELF_EXPIRY_HOURS:g} ساعت (هاست: سرور خودت — لینک پابلیک)",
+            # 🆕 پیکسل‌درین هم دیفالت بعد از چند ساعت خودکار پاک میشه
+            "pixeldrain": (
+                f"⏳ اعتبار لینک: {PIXELDRAIN_AUTO_DELETE_HOURS:g} ساعت (بعدش خودکار از پیکسل‌درین پاک میشه)"
+                if PIXELDRAIN_AUTO_DELETE_HOURS > 0
+                else "♾ این لینک تا وقتی فایل رو از پیکسل‌درین پاک نکنی معتبره"
+            ),
+            "litterbox": "⏳ اعتبار این لینک: ۷۲ ساعت",
+            "catbox": "♾ این لینک دائمیـه",
+            "uguu": "⏳ اعتبار این لینک: ۳ ساعت",
+            "gofile": (
+                f"⏳ اعتبار لینک: {GOFILE_AUTO_DELETE_HOURS:g} ساعت (خودکار پاک میشه)"
+                if GOFILE_AUTO_DELETE_HOURS > 0
+                else "♾ تا وقتی اکانت فعال باشه معتبره (اگه ۱۰ روز دانلود نشه گوفایل پاکش می‌کنه)"
+            ),
+        }[used_prov]
+        if res["play_url"]:
+            # ✅ هاست لینک پخش مستقیم (بایت خام) داد
+            text = (
+                f"✅ <b>آپلود با موفقیت انجام شد! ({_esc(prov_fa[used_prov])})</b>\n\n"
+                f"📄 فایل: <code>{_esc(res['name'])}</code>\n"
+                f"📏 حجم: {_fmt_size(fsize)}\n\n"
+                "▶️ لینک مستقیم پخش در VLC:\n"
+                f"{res['play_url']}\n\n"
+                + (
+                    f"⬇️ لینک دانلود مستقیم:\n{res['dl_url']}\n\n"
+                    if res["dl_url"] and res["dl_url"] != res["play_url"] else ""
+                )
+                + (
+                    f"📄 لینک صفحه:\n{res['page_url']}\n\n"
+                    if res.get("page_url") else ""
+                )
+                + f"{exp_note}\n\n{vlc_hint}"
+            )
+            rows = [
+                [Button.url("▶️ پخش در VLC", res["play_url"]),
+                 Button.url("⬇️ دانلود", res["dl_url"] or res["play_url"])],
+            ]
+            if res.get("page_url"):
+                rows.append([Button.url("📄 صفحه فایل", res["page_url"])])
+        else:
+            # ⚠️ فقط صفحه‌ی دانلود داد (گوفایل بدون directLink) — صادقانه بگو
+            text = (
+                f"⚠️ <b>آپلود انجام شد ولی پخش مستقیم نداد ({_esc(prov_fa[used_prov])})</b>\n\n"
+                f"📄 فایل: <code>{_esc(res['name'])}</code>\n"
+                f"📏 حجم: {_fmt_size(fsize)}\n\n"
+                "⬇️ لینک دانلود (صفحه‌ی فایل — تو VLC پخش نمیشه):\n"
+                f"{res['dl_url']}\n\n"
+                f"{exp_note}\n\n"
+                "💡 برای لینک پخش مستقیم، کلید پیکسل‌درین یا دامنه‌ی سرور خودت رو تنظیم کن."
+            )
+            rows = [
+                [Button.url("⬇️ صفحه‌ی دانلود", res["dl_url"])],
+            ]
         await _safe_edit(event, text, rows)
     except _UploadAborted:
         # 🆕 کاربر دکمه لغو رو زده — پیام لغو + برگشت منو
@@ -2341,7 +2783,7 @@ def register_file_explorer_handlers(
     client.add_event_handler(fe_noop_cb, events.CallbackQuery(pattern=r"^fexnoop$"))
     # آپلود به Filebin
     client.add_event_handler(fe_filebin_cb, events.CallbackQuery(pattern=r"^fbin_-?\d+_\d+$"))
-    # آپلود برای پخش در VLC (زنجیره‌ی چند‌هاسته + سرور خودمیزبان)
+    # آپلود برای پخش در VLC (Litterbox / Pixeldrain)
     client.add_event_handler(fe_vlc_cb, events.CallbackQuery(pattern=r"^fvlc_-?\d+_\d+$"))
     # تغییر نام
     client.add_event_handler(fe_rename_cb, events.CallbackQuery(pattern=r"^fren_-?\d+_\d+$"))
@@ -2350,6 +2792,11 @@ def register_file_explorer_handlers(
     # 🆕 بستن منوی اصلی + لغو عملیات‌ها
     client.add_event_handler(fe_dismiss_cb, events.CallbackQuery(pattern=r"^fexdism_-?\d+_\d+$"))
     client.add_event_handler(fe_abort_cb, events.CallbackQuery(pattern=r"^fexab_[0-9a-f]+$"))
+    # 🆕 دستور /clean — پاکسازی پیکسل‌درین / گوفایل / سرور خودمون
+    client.add_event_handler(fe_clean_cmd, events.NewMessage(pattern=r"^/clean(@\w+)?\s*$"))
+    client.add_event_handler(fe_clean_cb, events.CallbackQuery(pattern=r"^fcln[a-z0-9_]*$"))
 
     asyncio.ensure_future(_session_gc_loop())
-    logger.info("[FileExplorer] handlers registered (zip/apk/tar/7z/rar + rename + filebin + vlc + cancel)")
+    # 🆕 حلقه‌ی حذف خودکار ابری (پیکسل‌درین/گوفایل) + گاربیج سشن /clean
+    asyncio.ensure_future(_cloud_gc_loop())
+    logger.info("[FileExplorer] handlers registered (zip/apk/tar/7z/rar + rename + filebin + vlc + cancel + /clean + autodel)")

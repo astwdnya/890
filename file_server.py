@@ -212,6 +212,28 @@ def get_file_info(token: str) -> Optional[dict]:
         }
 
 
+def list_files() -> list:
+    """لیست همه‌ی فایل‌های فعال (هنوز منقضی نشده) — برای دستور /clean.
+
+    خروجی: [{token, name, title, size, expires_at}]"""
+    now = time.time()
+    with _LOCK:
+        out = []
+        for t, v in _FILES.items():
+            if v["expires_at"] < now:
+                continue
+            out.append({
+                "token": t,
+                "name": v["original_name"] or v["title"],
+                "title": v["title"],
+                "size": v["size"],
+                "expires_at": v["expires_at"],
+            })
+    # جدیدترین‌ها اول
+    out.sort(key=lambda x: x["expires_at"], reverse=True)
+    return out
+
+
 def delete_file(token: str) -> bool:
     """حذف دستی فایل قبل از انقضا."""
     with _LOCK:

@@ -190,59 +190,25 @@ def _parse_variant_m3u8(text: str) -> List[Tuple[str, float]]:
     return segments
 
 
-def _variant_height(v: Tuple[str, int, str]) -> int:
-    """حدس زدن height از variant (res=1280x720 → 720، وگرنه از bandwidth)."""
-    res = v[2]
-    if res and "x" in res:
-        try:
-            return int(res.split("x")[-1])
-        except (ValueError, IndexError):
-            pass
-    bw = v[1]
-    if bw >= 8_000_000: return 1080
-    if bw >= 4_000_000: return 720
-    if bw >= 2_000_000: return 480
-    if bw >= 1_000_000: return 360
-    return 0
-
-
 def _pick_variant(variants: List[Tuple[str, int, str]], quality: str = "720p") -> Tuple[str, int, str]:
-    """انتخاب variant با توجه به quality درخواستی.
-
-    اولویت: تطابق دقیق height → نزدیک‌ترین پایین‌تر → نزدیک‌ترین بالاتر.
-    قبلاً «480p» بی‌سروصدا پایین‌ترین variant (حتی 360) رو برمی‌گردوند؛
-    الان دقیق‌تر عمل می‌کنه.
-    """
+    """انتخاب variant با توجه به quality درخواستی"""
     if not variants:
         raise ValueError("No variants")
-
-    q = (quality or "best").lower().strip()
-    entries = sorted(((_variant_height(v), v) for v in variants), key=lambda x: -x[0])
-
-    if q in ("worst",):
-        return entries[-1][1]
-
-    height_map = {"2160p": 2160, "4k": 2160, "1080p": 1080, "720p": 720,
-                  "480p": 480, "360p": 360, "240p": 240}
-    target = height_map.get(q, 0)
-
-    if target:
-        # ۱) تطابق دقیق height
-        for h, v in entries:
-            if h == target:
-                return v
-        # ۲) نزدیک‌ترین پایین‌تر (بزرگ‌ترین height کمتر از هدف)
-        below = [(h, v) for h, v in entries if 0 < h < target]
-        if below:
-            return max(below, key=lambda x: x[0])[1]
-        # ۳) نزدیک‌ترین بالاتر (کوچک‌ترین height بیشتر از هدف)
-        above = [(h, v) for h, v in entries if h > target]
-        if above:
-            return min(above, key=lambda x: x[0])[1]
-        return entries[0][1]
-
-    # best / نامشخص → بهترین کیفیت
-    return entries[0][1]
+    # مرتب‌سازی بر اساس bandwidth نزولی
+    sorted_v = sorted(variants, key=lambda v: v[1], reverse=True)
+    # quality map: 1080p → بالاترین, 720p → متوسط, 480p → پایین
+    if quality == "1080p" or quality == "best":
+        return sorted_v[0]
+    if quality == "480p" or quality == "worst":
+        return sorted_v[-1]
+    # 720p: وسط
+    # پیدا کردن variant با ارتفاع ~720
+    for v in sorted_v:
+        res = v[2]  # "1280x720"
+        if "x720" in res or "x692" in res or "x688" in res:
+            return v
+    # fallback: متوسط
+    return sorted_v[len(sorted_v) // 2] if len(sorted_v) > 1 else sorted_v[0]
 
 
 # ─── Get stream info ────────────────────────────────────────

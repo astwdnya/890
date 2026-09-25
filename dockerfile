@@ -51,6 +51,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # کپی کد ربات
 COPY bot.py .
 COPY file_explorer_handler.py .
+COPY file_server.py .
 COPY FastTelethon.py .
 COPY github.py .
 COPY savep_handler.py .
@@ -70,7 +71,7 @@ COPY searcher/ searcher/
 # ایجاد پوشه خروجی با دسترسی کامل
 RUN mkdir -p output_files && chmod -R 777 output_files
 
-EXPOSE 10000
+EXPOSE 8099
 
 # اجرای ربات
 CMD ["python", "-u", "bot.py"]
