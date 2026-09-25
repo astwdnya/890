@@ -1329,6 +1329,69 @@ async def download_with_quality(
             else:
                 raise RuntimeError("MP4 download failed and no HLS fallback available")
 
+    # ─── HLS: دانلود با fallback بین سرورها (۲ دور تلاش) ───
+    # استریم انتخاب‌شده اول امتحان میشه؛ اگه fail شد (مثلاً variant HTTP 502
+    # یا CDN خراب)، سرورهای بعدی به ترتیب اولویت امتحان میشن.
+    # دور دوم با stream/seed تازه انجام میشه چون بعضی خطاها (502 گذرا،
+    # منقضی شدن seed) بعد از چند ثانیه خودشون درست میشن.
+    _last_err = None
+    for _round in range(2):
+        if _round > 0:
+            await asyncio.sleep(3)
+            logger.info("[IMDBPlay] HLS retry round %d: fetching fresh streams...", _round + 1)
+        candidate_streams = []
+        _tried = set()
+        if _round == 0:
+            candidate_streams.append(stream)
+            _tried.add(stream.get("server", ""))
+        for server in _SERVERS:
+            if server["name"] in _tried:
+                continue
+            _tried.add(server["name"])
+            try:
+                alt = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+            except Exception as e:
+                logger.warning("[IMDBPlay] fallback server %s exception: %s", server["name"], e)
+                continue
+            if alt and alt.get("url") and alt.get("type", "hls") == "hls":
+                candidate_streams.append(alt)
+        logger.info("[IMDBPlay] round %d: %d candidate HLS stream(s)", _round + 1, len(candidate_streams))
+
+        for _cand in candidate_streams:
+            try:
+                return await _download_hls_stream(
+                    _cand, quality_label, out_dir, progress_cb,
+                    tmdb_id, imdb_id, season, episode,
+                )
+            except Exception as e:
+                _last_err = e
+                logger.warning("[IMDBPlay] HLS download from %s failed: %s — trying next server",
+                               _cand.get("server", "?"), e)
+    raise RuntimeError(f"All HLS servers failed; last error: {_last_err}")
+
+
+async def _download_hls_stream(
+    stream: dict,
+    quality_label: str,
+    out_dir: str,
+    progress_cb: Optional[Callable[[int, int], None]],
+    tmdb_id: str,
+    imdb_id: str,
+    season: Optional[int],
+    episode: Optional[int],
+) -> str:
+    """دانلود HLS از یک استریم مشخص + fallback بین variantها.
+
+    - اگه master.m3u8 باشه، variantها به ترتیب اولویت (مطابق quality_label)
+      امتحان میشن تا اولین variant سالم پیدا بشه.
+    - برای خطاهای موقت CDN (مثل 502) هر variant دو بار تلاش میشه.
+    - اگه هیچ variant سالم نبود، RuntimeError بالا میده تا caller
+      سرور بعدی رو امتحان کنه.
+    """
+    m3u8_url = stream["url"]
+    headers = {"User-Agent": _USER_AGENT}
+    headers.update(stream.get("headers", {}))
+
     # برای HLS، fetch m3u8 — با retry و re-fetch stream اگه 401/429 گرفتیم
     text = None
     for m3u8_attempt in range(3):
@@ -1408,45 +1471,76 @@ async def download_with_quality(
         variants_with_h = [(v, _variant_height(v)) for v in variants]
         variants_with_h.sort(key=lambda x: -x[1])
 
-        chosen = None
+        # ─── ساخت لیست اولویت‌دار variantها ───
+        # اولین variant سالم استفاده میشه؛ بقیه به عنوان fallback.
+        chosen_list: List[tuple] = []
         if quality_label and quality_label.lower() != "auto" and target_height > 0:
-            # روش 1: تطابق دقیق label
+            # 1) تطابق دقیق label
             for v, h in variants_with_h:
-                url, bw, res = v
-                label = _resolution_to_label(res, bw)
+                label = _resolution_to_label(v[2], v[1])
                 if label.lower() == quality_label.lower():
-                    chosen = v
+                    chosen_list.append(v)
                     logger.info("✓ Quality match (exact): %s → height=%d", label, h)
                     break
-
-            # روش 2: تطابق بر اساس height (اگه label پیدا نشد)
-            if not chosen:
-                # نزدیک‌ترین height که ≤ target باشه
-                candidates_at_or_below = [(v, h) for v, h in variants_with_h if h <= target_height]
-                if candidates_at_or_below:
-                    chosen = candidates_at_or_below[0][0]
-                    logger.info("✓ Quality match (height ≤ %d): chose height=%d",
-                                target_height, candidates_at_or_below[0][1])
-                else:
-                    # اگر هیچ کدوم ≤ target نبود، پایین‌ترین رو بگیر (حداقل حجم)
-                    chosen = variants_with_h[-1][0]
-                    logger.info("✓ Quality fallback (no variant ≤ %d): chose lowest = height=%d",
-                                target_height, variants_with_h[-1][1])
+            # 2) نزدیک‌ترین height ≤ target (نزولی)
+            seen = {v[0] for v in chosen_list}
+            for v, h in variants_with_h:
+                if v[0] in seen:
+                    continue
+                if h <= target_height:
+                    chosen_list.append(v)
+                    seen.add(v[0])
+            # 3) بقیه کیفیت‌ها به عنوان fallback (نزولی)
+            for v, h in variants_with_h:
+                if v[0] not in seen:
+                    chosen_list.append(v)
+                    seen.add(v[0])
         else:
-            # Auto: بهترین کیفیت
-            chosen = variants_with_h[0][0]
+            # Auto: بهترین کیفیت اول، بعد بقیه
+            chosen_list = [v for v, _ in variants_with_h]
 
-        variant_url = _make_absolute(m3u8_url, chosen[0])
+        if not chosen_list:
+            raise RuntimeError("No candidate variants in master.m3u8")
+
+        # ─── fetch اولین variant سالم (با fallback روی بقیه variantها) ───
+        # خطای 502/5xx معمولاً گذراست؛ هر variant دو بار تلاش میشه و
+        # اگه نشد، variant بعدی امتحان میشه.
+        text = None
+        variant_url = None
+        last_v_err = None
+        chosen_v = None
+        for vi, v in enumerate(chosen_list):
+            v_url = _make_absolute(m3u8_url, v[0])
+            for attempt in range(2):
+                try:
+                    async with AsyncSession() as s:
+                        r = await s.get(v_url, impersonate=_BROWSER_IMPERSONATE, timeout=20, headers=headers)
+                    if r.status_code == 200:
+                        text = r.text
+                        variant_url = v_url
+                        chosen_v = v
+                        break
+                    last_v_err = RuntimeError(f"variant m3u8 HTTP {r.status_code}")
+                    logger.warning("variant %d/%d HTTP %d (attempt %d): %s",
+                                   vi + 1, len(chosen_list), r.status_code, attempt + 1, v_url[:80])
+                    if r.status_code < 500:
+                        break  # 4xx — retry همین variant بی‌فایده، برو سراغ بعدی
+                except Exception as e:
+                    last_v_err = e
+                    logger.warning("variant %d/%d fetch error (attempt %d): %s",
+                                   vi + 1, len(chosen_list), attempt + 1, e)
+                await asyncio.sleep(1)
+            if text:
+                break
+            logger.warning("variant %d/%d failed — trying next variant", vi + 1, len(chosen_list))
+
+        if not text or not variant_url or chosen_v is None:
+            raise RuntimeError(
+                f"variant m3u8 fetch failed: all {len(chosen_list)} variant(s) tried; "
+                f"last error: {last_v_err}"
+            )
         logger.info("Selected variant: %s (bandwidth=%d, resolution=%s)",
-                    variant_url[:80], chosen[1], chosen[2])
-        try:
-            async with AsyncSession() as s:
-                r = await s.get(variant_url, impersonate=_BROWSER_IMPERSONATE, timeout=20, headers=headers)
-                if r.status_code != 200:
-                    raise RuntimeError(f"variant m3u8 HTTP {r.status_code}")
-                text = r.text
-        except Exception as e:
-            raise RuntimeError(f"variant m3u8 fetch failed: {e}")
+                    variant_url[:80], chosen_v[1], chosen_v[2])
 
     segments, init_url = _parse_variant_m3u8(text)
     if not segments:

@@ -101,14 +101,41 @@ async def download_with_quality(
 
     quality_label="Auto" → بهترین کیفیت
     quality_label="720p" → کیفیت 720p (اگه نباشه، نزدیک‌ترین)
+
+    لایه‌های fallback:
+      1. سرورهای imdbplay (Vidzee, Videasy, Vidking, 2Embed, GarageBand)
+         + fallback داخلی بین variantها و ۲ دور تلاش
+      2. دانلودر مستقل vidsrcme.ru (vidsrc_downloader) — وقتی همه سرورهای
+         imdbplay از دسترس خارج باشن (مثلاً API 502 یا CDN خراب)
     """
     try:
         from imdbplay_downloader import download_with_quality as _new_download
-        return await _new_download(
+        result = await _new_download(
             imdb_id, quality_label, out_dir, season, episode, progress_cb=progress_cb
         )
+        if result:
+            return result
+        logger.warning("download_with_quality via imdbplay returned None — trying vidsrcme fallback")
     except Exception as e:
-        logger.error("download_with_quality via imdbplay failed: %s", e)
+        logger.warning("download_with_quality via imdbplay failed: %s — trying vidsrcme fallback", e)
+
+    # ─── Fallback: دانلودر مستقل vidsrcme.ru ───
+    try:
+        from vidsrc_downloader import download_episode as _vd_episode
+        from vidsrc_downloader import download_movie as _vd_movie
+        quality = "best" if (not quality_label or quality_label.lower() == "auto") else quality_label
+        logger.info("[VidsrcExtras] vidsrcme fallback: quality=%s season=%s episode=%s",
+                    quality, season, episode)
+        if season and episode:
+            return await _vd_episode(
+                imdb_id, season, episode,
+                out_dir=out_dir, quality=quality, progress_cb=progress_cb,
+            )
+        return await _vd_movie(
+            imdb_id, out_dir=out_dir, quality=quality, progress_cb=progress_cb,
+        )
+    except Exception as e:
+        logger.error("vidsrcme fallback also failed: %s", e)
         raise
 
 
