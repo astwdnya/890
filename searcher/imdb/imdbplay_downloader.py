@@ -9,6 +9,9 @@ imdbplay_downloader.py
   - s3 Vidking     (XOR cipher + seed) — همون API videasy
   - s9 2Embed      (vnest API) — کیفیت‌های MP4
   - s7 GarageBand  (vidsrcme + WASM) — IMDb-based
+  - s10 CastleTV   (AES-128-CBC + اپ هندی) — 480p/720p/1080p بومی
+  - s11 VaPlayer   (API مستقیم) — master مولتی‌کیفیت
+  - s12 VixSrc     (token embed) — master مولتی‌کیفیت
 
 سرورهای غیرفعال (مسدود یا نیازمند Playwright):
   - s4 Vidsrc.sbs  (مسدود از این IP)
@@ -89,6 +92,9 @@ _SERVERS = [
     {"id": "s3", "name": "Vidking",    "prefer_imdb": False, "quality_hint": "Auto (multi-quality)"},
     {"id": "s9", "name": "2Embed",     "prefer_imdb": True,  "quality_hint": "Auto (MP4)"},
     {"id": "s7", "name": "GarageBand", "prefer_imdb": True,  "quality_hint": "Auto"},
+    {"id": "s10", "name": "CastleTV",  "prefer_imdb": False, "quality_hint": "Auto (480/720/1080)"},
+    {"id": "s11", "name": "VaPlayer",  "prefer_imdb": True,  "quality_hint": "Auto (multi-quality)"},
+    {"id": "s12", "name": "VixSrc",    "prefer_imdb": False, "quality_hint": "Auto (multi-quality)"},
 ]
 
 
@@ -795,6 +801,434 @@ async def _garageband_get_stream(imdb_id: str, season: Optional[int], episode: O
 
 
 # ═══════════════════════════════════════════════════════════
+#   Servers 10-12: CastleTV / VaPlayer / VixSrc
+#   (اضافه‌شده برای کیفیت‌های پایین‌تر واقعی — بخصوص 480p)
+# ═══════════════════════════════════════════════════════════
+
+# ─── Server 10: CastleTV (api.hlowb.com — بک‌اند اپ اندروید) ───
+# کیفیت‌ها با «رزولوشن عددی» گرفته می‌شن: 1=480p، 2=720p، 3=1080p
+# یعنی 480p بومی داره (بقیه سرورها معمولاً 1080/720/360 می‌دن).
+# پاسخ API با AES-128-CBC رمزنگاری شده؛ کلید از getSecurityKey می‌آد.
+_CASTLE_BASE = "https://api.hlowb.com"
+_CASTLE_PKG = "com.external.castle"
+_CASTLE_CHANNEL = "IndiaA"
+_CASTLE_CLIENT = "1"
+_CASTLE_LANG = "en-US"
+_CASTLE_APK_SIGN_KEY = "ED0955EB04E67A1D9F3305B95454FED485261475"
+_CASTLE_API_HEADERS = {
+    "User-Agent": "okhttp/4.9.3",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "Keep-Alive",
+    "Referer": "https://api.hlowb.com",
+}
+_CASTLE_SUFFIX = b"T!BgJB"
+_CASTLE_RES_HEIGHT = {3: 1080, 2: 720, 1: 480}
+_CASTLE_KNOWN_HEIGHTS = {240, 360, 480, 540, 576, 720, 1080, 1440, 2160}
+
+try:  # cryptography از قبل در requirements.txt پروژه هست
+    from cryptography.hazmat.primitives.ciphers import Cipher as _CastleCipher
+    from cryptography.hazmat.primitives.ciphers import algorithms as _CastleAlgo
+    from cryptography.hazmat.primitives.ciphers import modes as _CastleMode
+    _CASTLE_CRYPTO_OK = True
+except Exception:
+    _CASTLE_CRYPTO_OK = False
+
+
+def _castle_derive_key(security_key_b64: str) -> bytes:
+    """کلید AES-128 از security key (base64) + پسوند ثابت."""
+    kb = base64.b64decode(security_key_b64)
+    combined = kb + _CASTLE_SUFFIX
+    if len(combined) < 16:
+        combined = combined + b"\x00" * (16 - len(combined))
+    return combined[:16]
+
+
+def _castle_decrypt(cipher_b64: str, key: bytes) -> str:
+    """AES-128-CBC (key=iv) + حذف padding PKCS7."""
+    raw = base64.b64decode(cipher_b64)
+    dec = _CastleCipher(_CastleAlgo.AES(key), _CastleMode.CBC(key)).decryptor()
+    out = dec.update(raw) + dec.finalize()
+    if out:
+        pad = out[-1]
+        if 1 <= pad <= 16:
+            out = out[:-pad]
+    return out.decode("utf-8", errors="replace")
+
+
+def _castle_extract_cipher(text: str) -> str:
+    """پاسخ ممکنه JSON با data یا متن خام cipher باشه (مثل extractCipher اصلی)."""
+    t = (text or "").strip()
+    if t.startswith("{"):
+        try:
+            j = json.loads(t)
+            if isinstance(j.get("data"), str) and j["data"].strip():
+                return j["data"].strip()
+        except Exception:
+            pass
+    return t
+
+
+def _castle_safe_parse(txt: str) -> dict:
+    """مثل castleSafeParse: اعداد ۱۶+ رقمی داخل JSON به رشته تبدیل می‌شن."""
+    safe = re.sub(r"([:{\[,]\s*)(\d{16,})", r'\1"\2"', txt)
+    return json.loads(safe)
+
+
+def _castle_year_of(date_str) -> Optional[int]:
+    try:
+        return int((date_str or "")[:4]) or None
+    except (ValueError, TypeError):
+        return None
+
+
+async def _get_tmdb_find_info(imdb_id: str) -> Optional[dict]:
+    """عنوان/سال/نوع از TMDB find — برای جستجوی CastleTV و تبدیل season/episode."""
+    if not imdb_id:
+        return None
+    if not imdb_id.startswith("tt"):
+        imdb_id = f"tt{imdb_id}"
+    url = (f"https://api.themoviedb.org/3/find/{imdb_id}"
+           f"?api_key={_TMDB_API_KEY}&external_source=imdb_id")
+    try:
+        async with AsyncSession() as s:
+            r = await s.get(url, impersonate=_BROWSER_IMPERSONATE, timeout=15,
+                            headers={"User-Agent": _USER_AGENT})
+            if r.status_code != 200:
+                return None
+            d = r.json()
+        if d.get("movie_results"):
+            m = d["movie_results"][0]
+            return {"tmdb_id": str(m.get("id", "")),
+                    "title": m.get("title") or m.get("original_title", ""),
+                    "year": _castle_year_of(m.get("release_date")), "is_tv": False}
+        if d.get("tv_results"):
+            t = d["tv_results"][0]
+            return {"tmdb_id": str(t.get("id", "")),
+                    "title": t.get("name") or t.get("original_name", ""),
+                    "year": _castle_year_of(t.get("first_air_date")), "is_tv": True}
+    except Exception as e:
+        logger.debug("TMDB find info failed for %s: %s", imdb_id, e)
+    return None
+
+
+async def _castletv_get_stream(tmdb_id: str, imdb_id: str,
+                               season: Optional[int], episode: Optional[int]) -> Optional[dict]:
+    """استخراج استریم از CastleTV — تنها سرور با 480p بومی تضمین‌شده.
+
+    جریان: getSecurityKey → searchByKeyword (عنوان+سال) → movie details
+           → (سریال: movieId فصل مربوطه) → episode → getVideo2 برای res=3/2/1.
+    خروجی: استریم HLS با لیست qualities (هر رزولوشن یک URL مستقل).
+    """
+    if not _CASTLE_CRYPTO_OK:
+        logger.debug("CastleTV skipped: cryptography module missing")
+        return None
+    info = await _get_tmdb_find_info(imdb_id)
+    if not info or not info.get("title"):
+        return None
+    title = (info["title"] or "").strip()
+    year = info.get("year")
+    is_tv = bool(season and episode)
+
+    try:
+        async with AsyncSession() as s:
+            # ۱) security key
+            r = await s.get(
+                f"{_CASTLE_BASE}/v0.1/system/getSecurityKey/1"
+                f"?channel={_CASTLE_CHANNEL}&clientType={_CASTLE_CLIENT}&lang={_CASTLE_LANG}",
+                impersonate=_BROWSER_IMPERSONATE, timeout=15, headers=_CASTLE_API_HEADERS)
+            if r.status_code != 200:
+                return None
+            j = r.json()
+            if str(j.get("code")) != "200" or not j.get("data"):
+                return None
+            key = _castle_derive_key(j["data"])
+
+            # ۲) جستجو با «عنوان سال»
+            kw = quote_plus(f"{title} {year}" if year else title)
+            r2 = await s.get(
+                f"{_CASTLE_BASE}/film-api/v1.1.0/movie/searchByKeyword"
+                f"?channel={_CASTLE_CHANNEL}&clientType={_CASTLE_CLIENT}&keyword={kw}"
+                f"&lang={_CASTLE_LANG}&mode=1&packageName={_CASTLE_PKG}&page=1&size=30",
+                impersonate=_BROWSER_IMPERSONATE, timeout=15, headers=_CASTLE_API_HEADERS)
+            if r2.status_code != 200:
+                return None
+            search = _castle_safe_parse(_castle_decrypt(_castle_extract_cipher(r2.text), key))
+            sdata = search.get("data") if isinstance(search.get("data"), dict) else search
+            rows = sdata.get("rows") or []
+            if not rows:
+                logger.info("CastleTV: no search results for %r", title)
+                return None
+
+            # ۳) تطبیق عنوان: دقیق → contains → اولین نتیجه
+            tl = title.lower().strip()
+            match = None
+            for row in rows:
+                nm = str(row.get("title") or row.get("name") or "").lower().strip()
+                if nm == tl:
+                    match = row
+                    break
+            if match is None:
+                for row in rows:
+                    nm = str(row.get("title") or row.get("name") or "").lower()
+                    if tl and (tl in nm or nm in tl):
+                        match = row
+                        break
+            if match is None:
+                match = rows[0]
+            castle_id = str(match.get("id") or match.get("redirectId") or "")
+            if not castle_id:
+                return None
+
+            # ۴) details (+ سوییچ به movieId فصل برای سریال‌ها)
+            async def _details(mid: str) -> dict:
+                url = (f"{_CASTLE_BASE}/film-api/v1.9.9/movie?channel={_CASTLE_CHANNEL}"
+                       f"&clientType={_CASTLE_CLIENT}&lang={_CASTLE_LANG}"
+                       f"&movieId={mid}&packageName={_CASTLE_PKG}")
+                rr = await s.get(url, impersonate=_BROWSER_IMPERSONATE, timeout=15,
+                                 headers=_CASTLE_API_HEADERS)
+                if rr.status_code != 200:
+                    return {}
+                det = _castle_safe_parse(_castle_decrypt(_castle_extract_cipher(rr.text), key))
+                return det.get("data") if isinstance(det.get("data"), dict) else det
+
+            det = await _details(castle_id)
+            active_id = castle_id
+            if is_tv:
+                for sv in det.get("seasons") or []:
+                    if sv.get("number") == season and sv.get("movieId"):
+                        new_id = str(sv["movieId"])
+                        if new_id != castle_id:
+                            active_id = new_id
+                            det = await _details(active_id)
+                        break
+
+            # ۵) قسمت مورد نظر
+            eps = det.get("episodes") or []
+            if is_tv:
+                ep = next((e for e in eps if e.get("number") == episode), None)
+            else:
+                ep = eps[0] if eps else None
+            if not ep or not ep.get("id"):
+                logger.info("CastleTV: episode %s/%s not found for %r", season, episode, title)
+                return None
+            episode_id = str(ep["id"])
+
+            # ۶) زبان: انگلیسی → اولین زبان → بدون زبان (shared)
+            tracks = ep.get("tracks") or []
+            lang_id = None
+            for t in tracks:
+                nm = str(t.get("languageName") or t.get("abbreviate") or "").lower()
+                if nm.startswith("en"):
+                    lang_id = str(t.get("languageId"))
+                    break
+            if lang_id is None and tracks:
+                lang_id = str(tracks[0].get("languageId"))
+
+            async def _getvideo(reso: int, lang: Optional[str]) -> list:
+                body = {
+                    "mode": "1", "appMarket": "GuanWang", "clientType": _CASTLE_CLIENT,
+                    "woolUser": "false", "apkSignKey": _CASTLE_APK_SIGN_KEY,
+                    "androidVersion": "13", "movieId": active_id, "episodeId": episode_id,
+                    "isNewUser": "true", "resolution": str(reso), "packageName": _CASTLE_PKG,
+                }
+                if lang:
+                    body["languageId"] = lang
+                r4 = await s.post(
+                    f"{_CASTLE_BASE}/film-api/v2.0.1/movie/getVideo2"
+                    f"?clientType={_CASTLE_CLIENT}&packageName={_CASTLE_PKG}"
+                    f"&channel={_CASTLE_CHANNEL}&lang={_CASTLE_LANG}",
+                    impersonate=_BROWSER_IMPERSONATE, timeout=20,
+                    headers={**_CASTLE_API_HEADERS, "Content-Type": "application/json"},
+                    data=json.dumps(body))
+                if r4.status_code != 200:
+                    return []
+                v = _castle_safe_parse(_castle_decrypt(_castle_extract_cipher(r4.text), key))
+                vd = v.get("data") if isinstance(v.get("data"), dict) else v
+                urls = [x.get("url") for x in (vd.get("videos") or []) if x.get("url")]
+                if not urls and vd.get("videoUrl"):
+                    urls = [vd["videoUrl"]]
+                return urls or []
+
+            # ۷) هر ۳ رزولوشن (۱=480، ۲=720، ۳=1080) — هر کدوم URL مستقل
+            #    CDN سگمنت هاست‌های چرخشی داره؛ بعضی هاست‌ها بعضی IPها رو 403 می‌دن،
+            #    پس هر URL قبل از پذیرش probe می‌شه و روی شکست، getVideo2 دوباره
+            #    صدا زده می‌شه تا هاست سالم جدید بگیریم.
+            collected: List[Tuple[int, str]] = []
+            seen_urls = set()
+
+            def _height_from_url(u: str) -> int:
+                path = urlparse(u).path
+                m = re.search(r"/(\d{3,4})/", path)
+                if m and int(m.group(1)) in _CASTLE_KNOWN_HEIGHTS:
+                    return int(m.group(1))
+                return 0
+
+            async def _url_works(u: str) -> bool:
+                try:
+                    rr = await s.get(u, impersonate=_BROWSER_IMPERSONATE, timeout=12,
+                                     headers={"User-Agent": _USER_AGENT,
+                                              "Accept-Encoding": "identity"})
+                    return rr.status_code == 200
+                except Exception:
+                    return False
+
+            async def _collect(reso_seq) -> None:
+                for reso in reso_seq:
+                    reso_height = _CASTLE_RES_HEIGHT.get(reso, 0)
+                    for _attempt in range(3):
+                        try:
+                            urls = await _getvideo(reso, lang_id)
+                            if not urls and lang_id:
+                                urls = await _getvideo(reso, None)  # بدون زبان (shared)
+                        except Exception as e:
+                            logger.debug("CastleTV getVideo2 res=%s failed: %s", reso, e)
+                            break
+                        fresh = [u for u in urls if u and u not in seen_urls]
+                        if not fresh:
+                            # همه URLهای تکراری بودن؛ getVideo2 دوباره؟ نه — بی‌خیال
+                            if urls:
+                                break
+                            continue
+                        got = False
+                        for u in fresh:
+                            if not await _url_works(u):
+                                continue  # هاست 403/خراب — URL بعدی/تازه
+                            seen_urls.add(u)
+                            collected.append((_height_from_url(u) or reso_height, u))
+                            got = True
+                            break
+                        if got:
+                            break
+                        # هیچ‌کدوم از URLهای این دور کار نکرد → دور بعد هاست تازه می‌دیم
+
+            await _collect((3, 2, 1))
+            if not collected and lang_id:
+                # آخرین تلاش: بدون languageId
+                lang_id = None
+                await _collect((3, 2, 1))
+            if not collected:
+                logger.info("CastleTV: no stream urls for %r (%s/%s)", title, season, episode)
+                return None
+
+            collected.sort(key=lambda x: -x[0])
+            qualities = [{"label": f"{h}p", "url": u} for h, u in collected if h]
+            logger.info("CastleTV %s S%sE%s -> %s quality url(s)",
+                        imdb_id, season, episode, [q["label"] for q in qualities])
+            return {
+                "url": collected[0][1],
+                "type": "hls",
+                "headers": {"User-Agent": _USER_AGENT, "Accept-Encoding": "identity"},
+                "server": "CastleTV",
+                "qualities": qualities,
+            }
+    except Exception as e:
+        logger.warning("CastleTV error: %s", e)
+        return None
+
+
+# ─── Server 11: VaPlayer (streamdata.vaplayer.ru) ────────────
+# یک درخواست ساده با imdb_id؛ لیست master m3u8 مولتی‌کیفیت برمی‌گردونه.
+_VAPLAYER_API = "https://streamdata.vaplayer.ru/api.php"
+_VAPLAYER_ORIGIN = "https://nextgencloudfabric.com"
+
+
+async def _vaplayer_get_stream(imdb_id: str, season: Optional[int],
+                               episode: Optional[int]) -> Optional[dict]:
+    if not imdb_id:
+        return None
+    is_tv = bool(season and episode)
+    params = f"imdb={imdb_id}&type={'tv' if is_tv else 'movie'}"
+    if is_tv:
+        params += f"&season={season}&episode={episode}"
+    referer = (f"{_VAPLAYER_ORIGIN}/embed/tv/{imdb_id}/{season}/{episode}" if is_tv
+               else f"{_VAPLAYER_ORIGIN}/embed/movie/{imdb_id}")
+    try:
+        async with AsyncSession() as s:
+            r = await s.get(f"{_VAPLAYER_API}?{params}",
+                            impersonate=_BROWSER_IMPERSONATE, timeout=20,
+                            headers={"User-Agent": _USER_AGENT, "Referer": referer,
+                                     "Origin": _VAPLAYER_ORIGIN})
+            if r.status_code != 200:
+                logger.debug("VaPlayer HTTP %s", r.status_code)
+                return None
+            d = r.json()
+            if str(d.get("status_code", "200")) not in ("200", 200):
+                return None
+            urls = ((d.get("data") or {}).get("stream_urls")) or []
+            for u in urls:
+                if u and ".m3u8" in u:
+                    logger.info("VaPlayer %s -> %s", imdb_id, u[:80])
+                    return {
+                        "url": u,
+                        "type": "hls",
+                        "headers": {"Referer": f"{_VAPLAYER_ORIGIN}/",
+                                    "Origin": _VAPLAYER_ORIGIN,
+                                    "User-Agent": _USER_AGENT},
+                        "server": "VaPlayer",
+                    }
+        return None
+    except Exception as e:
+        logger.warning("VaPlayer error: %s", e)
+        return None
+
+
+# ─── Server 12: VixSrc (vixsrc.to — master مولتی‌کیفیت ایتالیایی) ───
+# نکته: از بعضی IPهای دیتاسنتری Cloudflare بلاک می‌شه (403)؛ در آن حالت
+# خطا graceful نادیده گرفته می‌شه و سرورهای بعدی امتحان می‌شن.
+_VIXSRC_BASE = "https://vixsrc.to"
+
+
+async def _vixsrc_get_stream(tmdb_id: str, season: Optional[int],
+                             episode: Optional[int]) -> Optional[dict]:
+    if not tmdb_id:
+        return None
+    is_tv = bool(season and episode)
+    try:
+        async with AsyncSession() as s:
+            api_url = (f"{_VIXSRC_BASE}/api/tv/{tmdb_id}/{season}/{episode}" if is_tv
+                       else f"{_VIXSRC_BASE}/api/movie/{tmdb_id}")
+            r = await s.get(api_url, impersonate=_BROWSER_IMPERSONATE, timeout=15,
+                            headers={"User-Agent": _USER_AGENT,
+                                     "Referer": f"{_VIXSRC_BASE}/",
+                                     "Origin": _VIXSRC_BASE,
+                                     "Accept": "application/json, text/javascript, */*; q=0.01"})
+            if r.status_code != 200:
+                logger.debug("VixSrc api HTTP %s", r.status_code)
+                return None
+            src = r.json().get("src")
+            if not src:
+                return None
+            # صفحه embed → token/expires/playlist
+            r2 = await s.get(f"{_VIXSRC_BASE}{src}", impersonate=_BROWSER_IMPERSONATE,
+                             timeout=15, headers={"User-Agent": _USER_AGENT,
+                                                  "Referer": api_url,
+                                                  "Accept": "text/html,application/xhtml+xml,*/*"})
+            if r2.status_code != 200:
+                return None
+            html = r2.text
+            token = re.search(r"token['\"]\s*:\s*['\"]([^'\"]+)", html)
+            expires = re.search(r"expires['\"]\s*:\s*['\"]([^'\"]+)", html)
+            playlist = re.search(r"url\s*:\s*['\"]([^'\"]+)", html)
+            if not (token and expires and playlist):
+                logger.info("VixSrc: token/expires/playlist not found in embed page")
+                return None
+            pl = playlist.group(1)
+            sep = "&" if "?" in pl else "?"
+            master = f"{pl}{sep}token={token.group(1)}&expires={expires.group(1)}&h=1"
+            logger.info("VixSrc %s -> %s", tmdb_id, master[:80])
+            return {
+                "url": master,
+                "type": "hls",
+                "headers": {"Referer": api_url, "User-Agent": _USER_AGENT},
+                "server": "VixSrc",
+            }
+    except Exception as e:
+        logger.warning("VixSrc error: %s", e)
+        return None
+
+
+# ═══════════════════════════════════════════════════════════
 #   Stream routing: try each server in order
 # ═══════════════════════════════════════════════════════════
 
@@ -812,6 +1246,12 @@ async def _get_stream_for_server(server: dict, tmdb_id: str, imdb_id: str, seaso
         return await _2embed_get_stream(tmdb_id, imdb_id, season, episode)
     if sid == "s7":  # GarageBand
         return await _garageband_get_stream(imdb_id, season, episode)
+    if sid == "s10":  # CastleTV — 480p بومی
+        return await _castletv_get_stream(tmdb_id, imdb_id, season, episode)
+    if sid == "s11":  # VaPlayer
+        return await _vaplayer_get_stream(imdb_id, season, episode)
+    if sid == "s12":  # VixSrc
+        return await _vixsrc_get_stream(tmdb_id, season, episode)
     return None
 
 
@@ -843,6 +1283,9 @@ _EXTRACTION_METHODS = {
     "s3": "XOR Cipher + Seed (speedracelight API)",
     "s9": "Custom Base64 (vidnest API)",
     "s7": "WASM Decrypt (vidsrcme API)",
+    "s10": "AES-128-CBC (CastleTV app API — 480/720/1080)",
+    "s11": "Direct API (VaPlayer streamdata)",
+    "s12": "Token Embed (VixSrc master m3u8)",
 }
 
 
