@@ -169,12 +169,16 @@ def _idle_rows(label: str):
 
 
 def _menu_rows(chat_id: int, msg_id: int):
-    """منوی اصلی هر داکیومنت (جستجو / تغییر نام / Filebin / VLC / بستن)."""
+    """منوی اصلی هر داکیومنت (جستجو / تغییر نام / آپلود ابری / بستن).
+
+    🆕 دکمه‌های قدیمی Filebin حذف شدن — «آپلود ابری» خودش زنجیره‌ی
+    کامل fallback رو اجرا می‌کنه: سرور خودم → پیکسل‌درین → Litterbox
+    → Catbox → Uguu → Gofile (هندلر fvlc_).
+    """
     return [
         [Button.inline("🔍 جستجو در فایل", f"fexopen_{chat_id}_{msg_id}")],
         [Button.inline("✏️ تغییر نام", f"fren_{chat_id}_{msg_id}")],
-        [Button.inline("☁️ آپلود به Filebin", f"fbin_{chat_id}_{msg_id}")],
-        [Button.inline("🎬 آپلود برای پخش در VLC", f"fvlc_{chat_id}_{msg_id}")],
+        [Button.inline("☁️ آپلود ابری (لینک مستقیم)", f"fvlc_{chat_id}_{msg_id}")],
         [Button.inline("❌ بستن", f"fexdism_{chat_id}_{msg_id}")],
     ]
 
