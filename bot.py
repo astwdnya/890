@@ -7540,15 +7540,22 @@ async def _flush_video_send_batch(
     # دکمه زیرنویس فقط برای یه فایل منطقی‌تره
     if count == 1:
         buttons.append([Button.inline("🔤 Burn Subtitle", f"subburn_{batch_key}")])
-        # ☁️ آپلود ابری فقط برای فایل تکی — زنجیره‌ی جدید fallback:
+        # ☁️ آپلود ابری — زنجیره‌ی fallback جدید:
         # سرور خودم → پیکسل‌درین → Litterbox → Catbox → Uguu → Gofile
         # (هندلر fvlc_ خودش پیام وضعیت + نوار پیشرفت نشون میده)
         buttons.append([
             Button.inline("☁️ آپلود ابری (لینک مستقیم)", f"fvlc_{chat_id}_{files[0]['message_id']}"),
         ])
+        # ☁️ Filebin — مثل قبل سر جاشه
+        buttons.append([
+            Button.inline("☁️ آپلود به Filebin", f"fbin_{chat_id}_{files[0]['message_id']}"),
+        ])
 
     # دکمه اشتراک‌گذاری با لینک
     buttons.append([Button.inline("🔗 Share Link", f"sharelink_{batch_key}")])
+
+    # دکمه آپلود به uplod.ir — مثل قبل سر جاشه
+    buttons.append([Button.inline("📤 Upload to uplod.ir", f"uplod_{batch_key}")])
 
     if GITHUB_ENABLED:
         buttons.append([Button.inline("☁️ Upload to GitHub", f"vgh_batch_{batch_key}")])

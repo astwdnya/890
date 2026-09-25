@@ -169,16 +169,16 @@ def _idle_rows(label: str):
 
 
 def _menu_rows(chat_id: int, msg_id: int):
-    """منوی اصلی هر داکیومنت (جستجو / تغییر نام / آپلود ابری / بستن).
+    """منوی اصلی هر داکیومنت (جستجو / تغییر نام / آپلود ابری / Filebin / بستن).
 
-    🆕 دکمه‌های قدیمی Filebin حذف شدن — «آپلود ابری» خودش زنجیره‌ی
-    کامل fallback رو اجرا می‌کنه: سرور خودم → پیکسل‌درین → Litterbox
-    → Catbox → Uguu → Gofile (هندلر fvlc_).
-    """
+    🆕 «آپلود ابری» زنجیره‌ی fallback رو اجرا می‌کنه: سرور خودم →
+    پیکسل‌درین → Litterbox → Catbox → Uguu → Gofile (هندلر fvlc_).
+    دکمه‌ی Filebin هم مثل قبل سر جاش موند."""
     return [
         [Button.inline("🔍 جستجو در فایل", f"fexopen_{chat_id}_{msg_id}")],
         [Button.inline("✏️ تغییر نام", f"fren_{chat_id}_{msg_id}")],
         [Button.inline("☁️ آپلود ابری (لینک مستقیم)", f"fvlc_{chat_id}_{msg_id}")],
+        [Button.inline("📤 آپلود به Filebin", f"fbin_{chat_id}_{msg_id}")],
         [Button.inline("❌ بستن", f"fexdism_{chat_id}_{msg_id}")],
     ]
 
@@ -427,8 +427,10 @@ def _self_server_base() -> str:
 def _self_upload(remote_name: str, local_path: str, prog) -> dict:
     """ثبت فایل روی file_server → لینک پابلیک از دامنه‌ی خودم (سرور خودت).
 
-    بدون آپلود شبکه‌ای — فقط symlink + توکن (فوری). Flask مسیر /f/<token>
+    بدون آپلود شبکه‌ای — فقط هارد‌لینک + توکن (فوری). Flask مسیر /f/<token>
     رو با پشتیبانی Range سرو می‌کنه (همون چیزی که VLC برای Seek لازم داره).
+    🆕 هارد‌لینکه نه symlink — یعنی حتی اگه پوشه‌ی فایل اصلی بعد از آپلود
+    پاک بشه (work_dir یا کلین‌آپ ۲۰ ثانیه‌ای)، لینک زنده می‌مونه.
     فایل بعد از SELF_EXPIRY_HOURS (پیش‌فرض ۶ ساعت) خودکار پاک میشه."""
     from file_server import serve_file
     info = serve_file(

@@ -4,7 +4,7 @@ file_server.py
 هاست کردن فایل‌ها روی سرور بات برای ۶ ساعت + ارائه‌ی لینک مستقیم قابل play در VLC.
 
 استراتژی:
-- فایل‌ها در پوشه‌ی `/tmp/bot_files/` ذخیره می‌شن.
+- فایل‌ها با هارد‌لینک (یا کپی fallback) در پوشه‌ی `bot_files_storage/` کنار ربات نگه داشته می‌شن.
 - هر فایل یه token (UUID) می‌گیره.
 - endpoint ها:
     GET /f/<token>           → سرو فایل با پشتیبانی از Range (برای seek در VLC)
@@ -36,9 +36,43 @@ _FILES: Dict[str, dict] = {}  # token → {path, original_name, expires_at, cont
 _LOCK = threading.Lock()
 _CLEANUP_STARTED = False
 
-# Path where served files live (symlinks or copies)
-_STORAGE_DIR = "/tmp/bot_files"
+# Path where served files live (hard links or copies)
+# 🆕 FIX «File deleted from disk»:
+# قبلاً /tmp/bot_files با symlink بود — هر وقت پوشه‌ی فایل اصلی پاک می‌شد
+# (work_dir بعد از آپلود، یا کلین‌آپ ۲۰ ثانیه‌ای ربات) لینک می‌مرد.
+# حالا استوریج داخل همون دیسک اپه (cwd/bot_files_storage) تا هارد‌لینک
+# همیشه ممکن باشه؛ با env FILE_SERVER_DIR هم قابل تغییره.
+_STORAGE_DIR = os.environ.get("FILE_SERVER_DIR") or os.path.join(os.getcwd(), "bot_files_storage")
 os.makedirs(_STORAGE_DIR, exist_ok=True)
+
+
+def _purge_orphans(max_age_hours: float = None):
+    """🆕 پاک‌سازی فایل‌های یتیم استوریج بعد از ری‌استارت ربات.
+
+    رجیستری توکن‌ها تو حافظه‌ست؛ بعد از ری‌استارت دیگه کسی فایل‌های
+    استوریج رو صاحب نیست. هر فایلی که از زمان ساختش (mtime) بیشتر از
+    سقف عمر (env FILE_SERVER_MAX_AGE، دیفالت ۶ ساعت) گذشته باشه پاک میشه
+    تا استوریج (مخصوصاً با Railway Volume) بی‌حد نپره."""
+    try:
+        if max_age_hours is None:
+            max_age_hours = float(os.environ.get("FILE_SERVER_MAX_AGE", "6"))
+        cutoff = time.time() - max_age_hours * 3600
+        n = 0
+        for name in os.listdir(_STORAGE_DIR):
+            p = os.path.join(_STORAGE_DIR, name)
+            try:
+                if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                    os.unlink(p)
+                    n += 1
+            except Exception:
+                pass
+        if n:
+            logger.info("[FileServer] startup orphan purge: %d file(s)", n)
+    except Exception as e:
+        logger.warning("[FileServer] orphan purge failed: %s", e)
+
+
+_purge_orphans()
 
 
 def _ensure_cleanup_started():
@@ -57,13 +91,11 @@ def _ensure_cleanup_started():
                     expired = [t for t, v in _FILES.items() if v["expires_at"] < now]
                     for t in expired:
                         v = _FILES.pop(t)
-                        # اگه فایل symlink هست، فقط symlink رو پاک کن (نه فایل اصلی)
+                        # هارد‌لینک/کپی استوریج پاک میشه — فایل اصلی (اگه هنوز
+                        # جایی هست) دست‌نخورده می‌مونه
                         path = v["path"]
                         try:
-                            if os.path.islink(path):
-                                os.unlink(path)
-                            elif os.path.exists(path):
-                                # اگه کپی شده، پاک کن
+                            if os.path.lexists(path):
                                 os.unlink(path)
                         except Exception:
                             pass
@@ -138,22 +170,29 @@ def serve_file(
 
     token = uuid.uuid4().hex[:16]
     storage_path = os.path.join(_STORAGE_DIR, f"{token}_{os.path.basename(file_path)}")
+    abs_src = os.path.abspath(file_path)
+    import shutil
 
-    # ترجیح: symlink (سریع، بدون کپی)
-    # اگه فایل روی همون filesystem باشه، symlink کن
-    try:
-        if not copy:
-            os.symlink(os.path.abspath(file_path), storage_path)
-        else:
-            # کپی فایل
-            import shutil
-            shutil.copy2(file_path, storage_path)
-    except OSError:
-        # اگه symlink نشد (مثلاً cross-filesystem)، کپی کن
-        import shutil
-        if os.path.exists(storage_path):
-            os.unlink(storage_path)
-        shutil.copy2(file_path, storage_path)
+    # 🆕 FIX «File deleted from disk»:
+    # قبلاً symlink می‌ساختیم که به فایل اصلی اشاره می‌کرد؛ هر وقت پوشه‌ی
+    # اصلی پاک می‌شد (work_dir بعد از آپلود، یا کلین‌آپ ۲۰ ثانیه‌ای ربات
+    # بعد از ارسال به تلگرام) لینک می‌مرد و خطای «File deleted from disk»
+    # می‌داد. حالا هارد‌لینک می‌سازیم — دیتا مستقل از مسیر اصلی زنده
+    # می‌مونه، فوری و بدون کپی/مصرف فضای اضافه. cross-device بود → کپی.
+    linked = False
+    if not copy:
+        try:
+            os.link(abs_src, storage_path)
+            linked = True
+        except OSError:
+            linked = False
+    if not linked:
+        try:
+            if os.path.lexists(storage_path):
+                os.unlink(storage_path)
+        except Exception:
+            pass
+        shutil.copy2(abs_src, storage_path)
 
     expires_at = time.time() + (expires_in_hours * 3600)
     original_name = os.path.basename(file_path)

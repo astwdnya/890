@@ -68,8 +68,8 @@ COPY uplod_ir_handler.py .
 COPY otherwebsiteshandler/ otherwebsiteshandler/
 COPY searcher/ searcher/
 
-# ایجاد پوشه خروجی با دسترسی کامل
-RUN mkdir -p output_files && chmod -R 777 output_files
+# ایجاد پوشه خروجی و استوریج فایل‌سرور با دسترسی کامل
+RUN mkdir -p output_files bot_files_storage && chmod -R 777 output_files bot_files_storage
 
 EXPOSE 8099
 
