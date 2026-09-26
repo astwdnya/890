@@ -91,6 +91,136 @@ _SERVERS = [
     {"id": "s7", "name": "GarageBand", "prefer_imdb": True,  "quality_hint": "Auto"},
 ]
 
+# 🆕 اسم همه‌ی سرورها برای bot.py — منوی سرور همیشه همه رو نشون میده
+# (تأییدشده‌ها با ✅ + سرورهایی که پروب جواب نداد با 🧪 امتحانی)
+SERVER_NAMES = [s["name"] for s in _SERVERS]
+
+
+# ═══════════════════════════════════════════════════════════
+#   🆕 VidsrcMe multi-host (Castletv و بقیه‌ی هاست‌ها)
+#   API قدیمی ربات (data.vidsrcme.ru) چند m3u8 رمزنگاری‌شده می‌ده —
+#   بعد از decrypt هر URL = یه هاست/سرور با کیفیت‌های واقعی ۴۸۰/۷۲۰/۱۰۸۰
+# ═══════════════════════════════════════════════════════════
+
+# هدرهای مشترک هاست‌های vidsrcme (مثل _SEG_HEADERS در vidsrc_downloader)
+_VM_HEADERS = {
+    "Origin": "https://cloudorchestranova.com",
+    "Referer": "https://cloudorchestranova.com/",
+}
+
+# کش هاست‌ها: key = "tt..|sSeE" یا "tt..|movie" → {name: entry}
+_VIDSRCME_CACHE = {}
+
+
+def _vm_key(imdb_id: str, season=None, episode=None) -> str:
+    imdb_id = imdb_id if imdb_id.startswith("tt") else f"tt{imdb_id}"
+    if season is not None and episode is not None:
+        return f"{imdb_id}|s{season}e{episode}"
+    return f"{imdb_id}|movie"
+
+
+def _pretty_host(url: str) -> str:
+    """اسم خوانا از هاست URL — castletv.net → Castletv، v2.vidsrc.me → Vidsrc"""
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+    labels = [l for l in host.split(".") if l]
+    label = labels[0] if labels else ""
+    for l in labels:
+        if len(l) > 3 and not any(c.isdigit() for c in l):
+            label = l
+            break
+    label = re.sub(r"[^a-z]", "", label) or (labels[0] if labels else host)
+    return label.capitalize()
+
+
+async def _probe_vidsrcme_hosts(imdb_id: str, season=None, episode=None) -> List[dict]:
+    """هاست‌های vidsrcme (مثل Castletv) به‌صورت probe entry.
+
+    ۱) get_stream_info از vidsrc_downloader → API + wasm decrypt → لیست m3u8 ها
+    ۲) برای هر هاست: generate.php → token → master.m3u8 → variant ها
+    نتیجه cache می‌شه تا download_with_quality بتونه مستقیم ازش برداره.
+    Returns: [{"server": "Castletv", "type": "hls", "headers": ..., "url": ...,
+               "qualities": [...], "unverified": bool, "vidsrcme": True}]
+    """
+    key = _vm_key(imdb_id, season, episode)
+    if key in _VIDSRCME_CACHE:
+        return list(_VIDSRCME_CACHE[key].values())
+    try:
+        from vidsrc_downloader import (get_stream_info as _vm_info,
+                                       _fetch_token as _vm_token,
+                                       _apply_token as _vm_apply)
+    except Exception as e:
+        logger.warning("[IMDBPlay] vidsrcme module unavailable: %s", e)
+        return []
+    try:
+        info = await _vm_info(imdb_id, season, episode)
+        urls = list(info.stream_urls or []) if info else []
+    except Exception as e:
+        logger.warning("[IMDBPlay] vidsrcme API failed: %s", e)
+        return []
+    if not urls:
+        logger.info("[IMDBPlay] vidsrcme: no stream_urls for %s", key)
+        return []
+
+    entries = {}
+    # 🆕 اسم‌گذاری: هاست‌های vidsrcme می‌چرخن (castletv/loquaciouslexicon/...)
+    # اگه هر ۳ slot هم‌هاستن → «VidSrc 1..N»؛ اگه هاست‌ها فرق داشتن → اسم هاست
+    hosts = {_pretty_host(u).lower() for u in urls}
+    same_host = len(hosts) <= 1
+
+    async def _one(idx_u):
+        idx, u = idx_u
+        if same_host:
+            name = f"VidSrc {idx + 1}"
+        else:
+            name = _pretty_host(u) or "VidSrc"
+            base, i = name, 2
+            while name in entries:
+                name = f"{base}{i}"
+                i += 1
+        entry = {"server": name, "type": "hls", "headers": dict(_VM_HEADERS),
+                 "url": u, "qualities": [], "unverified": False, "vidsrcme": True}
+        entries[name] = entry  # رزرو اسم (جلوگیری از دوبلی در پروب موازی)
+        try:
+            async with AsyncSession() as s:
+                token = await _vm_token(s, u)
+                master = _vm_apply(u, token)
+                entry["url"] = master
+                r = await s.get(master, impersonate=_BROWSER_IMPERSONATE,
+                                timeout=15, headers=_VM_HEADERS)
+            if r.status_code == 200 and "#EXT-X-STREAM-INF:" in r.text:
+                variants = _parse_master_m3u8(r.text)
+                variants.sort(key=lambda v: -v[1])
+                for vu, bw, res in variants:
+                    entry["qualities"].append({
+                        "label": _resolution_to_label(res, bw),
+                        "url": _make_absolute(master, vu),
+                        "bandwidth": bw,
+                        "resolution": res,
+                    })
+            else:
+                logger.warning("[IMDBPlay] vidsrcme %s master HTTP %s", name,
+                               getattr(r, "status_code", "?"))
+        except Exception as e:
+            logger.warning("[IMDBPlay] vidsrcme %s probe failed: %s", name, e)
+        if not entry["qualities"]:
+            # هاست هست ولی variant نشد → Auto امتحانی
+            entry["unverified"] = True
+            entry["qualities"].append({"label": "Auto", "url": entry["url"],
+                                       "bandwidth": 0, "resolution": ""})
+
+    await asyncio.gather(*[_one(t) for t in enumerate(urls[:6])])
+    if entries:
+        _VIDSRCME_CACHE[key] = entries
+        if len(_VIDSRCME_CACHE) > 24:
+            for k in list(_VIDSRCME_CACHE.keys())[:-24]:
+                _VIDSRCME_CACHE.pop(k, None)
+    logger.info("[IMDBPlay] vidsrcme %s → %d host(s): %s", key, len(entries),
+                {n: [q["label"] for q in e["qualities"]] for n, e in entries.items()})
+    return list(entries.values())
+
 
 # ═══════════════════════════════════════════════════════════
 #   TMDB / IMDb conversion
@@ -802,6 +932,9 @@ async def _garageband_get_stream(imdb_id: str, season: Optional[int], episode: O
 async def _get_stream_for_server(server: dict, tmdb_id: str, imdb_id: str, season: Optional[int], episode: Optional[int]) -> Optional[dict]:
     """گرفتن stream info از یک سرور خاص."""
     sid = server["id"]
+    if sid == "vm":  # 🆕 هاست‌های vidsrcme (مثل Castletv) — از کشِ پروب
+        return _VIDSRCME_CACHE.get(_vm_key(imdb_id, season, episode), {}).get(
+            server.get("vm_name") or server.get("name", ""))
     if sid == "s2":  # Vidzee
         return await _vidzee_get_stream(tmdb_id, season, episode)
     if sid == "s1":  # Videasy
@@ -1198,7 +1331,7 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
         logger.error("Cannot resolve tmdb_id for %s", imdb_id)
         return []
 
-    async def _probe(server: dict) -> Optional[dict]:
+    async def _probe(server: dict, round_no: int = 1) -> Optional[dict]:
         try:
             stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
             if not stream or not stream.get("url"):
@@ -1209,6 +1342,8 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
                 "headers": stream.get("headers", {}),
                 "url": stream["url"],
                 "qualities": [],
+                # 🆕 True = stream داریم ولی لیست variant ها نتونست گرفته بشه → فقط Auto
+                "unverified": False,
             }
             # ۱) سرور خودش لیست کیفیت داده (مثل Videasy/Vidking)
             if stream.get("qualities"):
@@ -1221,46 +1356,87 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
                     })
                 if entry["qualities"]:
                     return entry
-                return None
-            # ۲) m3u8 رو بگیر و پارس کن
-            headers = {"User-Agent": _USER_AGENT}
-            headers.update(entry["headers"])
-            async with AsyncSession() as s:
-                r = await s.get(entry["url"], impersonate=_BROWSER_IMPERSONATE,
-                                timeout=20, headers=headers)
-            if r.status_code != 200:
-                logger.warning("[IMDBPlay] probe %s: m3u8 HTTP %d", entry["server"], r.status_code)
-                return None
-            text = r.text
-            if "#EXT-X-STREAM-INF:" in text:
-                variants = _parse_master_m3u8(text)
-                variants.sort(key=lambda v: -v[1])
-                for u, bw, res in variants:
-                    entry["qualities"].append({
-                        "label": _resolution_to_label(res, bw),
-                        "url": _make_absolute(entry["url"], u),
-                        "bandwidth": bw,
-                        "resolution": res,
-                    })
-            else:
+                # لیست خالی بود → Auto (لینک stream معتبره)
+                entry["qualities"].append({"label": "Auto", "url": entry["url"],
+                                           "bandwidth": 0, "resolution": ""})
+                return entry
+            # ۲) MP4 لیست variant نداره — بدون HTTP GET از روی URL برچسب بگیر
+            if entry["type"] == "mp4":
                 label = "Auto"
                 m = re.search(r'/(1080p|720p|480p|360p|4k|2160p)/', entry["url"], re.IGNORECASE)
                 if m:
                     label = m.group(1).lower()
                     if label in ("4k", "2160p"):
                         label = "4K"
-                entry["qualities"].append({
-                    "label": label, "url": entry["url"],
-                    "bandwidth": 0, "resolution": "",
-                })
-            return entry if entry["qualities"] else None
+                entry["qualities"].append({"label": label, "url": entry["url"],
+                                           "bandwidth": 0, "resolution": ""})
+                return entry
+            # ۳) m3u8 رو بگیر و پارس کن
+            try:
+                headers = {"User-Agent": _USER_AGENT}
+                headers.update(entry["headers"])
+                async with AsyncSession() as s:
+                    r = await s.get(entry["url"], impersonate=_BROWSER_IMPERSONATE,
+                                    timeout=15, headers=headers)
+                if r.status_code == 200:
+                    text = r.text
+                    if "#EXT-X-STREAM-INF:" in text:
+                        variants = _parse_master_m3u8(text)
+                        variants.sort(key=lambda v: -v[1])
+                        for u, bw, res in variants:
+                            entry["qualities"].append({
+                                "label": _resolution_to_label(res, bw),
+                                "url": _make_absolute(entry["url"], u),
+                                "bandwidth": bw,
+                                "resolution": res,
+                            })
+                    else:
+                        label = "Auto"
+                        m = re.search(r'/(1080p|720p|480p|360p|4k|2160p)/', entry["url"], re.IGNORECASE)
+                        if m:
+                            label = m.group(1).lower()
+                            if label in ("4k", "2160p"):
+                                label = "4K"
+                        entry["qualities"].append({
+                            "label": label, "url": entry["url"],
+                            "bandwidth": 0, "resolution": "",
+                        })
+                else:
+                    logger.warning("[IMDBPlay] probe %s: m3u8 HTTP %d (r%d)",
+                                   entry["server"], r.status_code, round_no)
+            except Exception as pf:
+                logger.warning("[IMDBPlay] probe %s: m3u8 fetch failed (r%d): %s",
+                               entry["server"], round_no, pf)
+            if not entry["qualities"]:
+                # 🆕 stream داریم ولی لیست variant نشد → Auto امتحانی
+                # (مثل رفتار قدیمی: سرور از قلم نمی‌افته)
+                entry["unverified"] = True
+                entry["qualities"].append({"label": "Auto", "url": entry["url"],
+                                           "bandwidth": 0, "resolution": ""})
+            return entry
         except Exception as e:
-            logger.warning("[IMDBPlay] probe %s failed: %s", server["name"], e)
+            logger.warning("[IMDBPlay] probe %s failed (r%d): %s", server["name"], round_no, e)
             return None
 
-    # پروب موازی — کل راند ~۸ ثانیه (به‌جای ~۴۰ ثانیه ترتیبی)
-    results = await asyncio.gather(*[_probe(s) for s in _SERVERS])
-    entries = [r for r in results if r]
+    # 🆕 پروب موازی ۲ رانده + هاست‌های vidsrcme (Castletv و...) همزمان
+    async def _servers_probe() -> list:
+        results = list(await asyncio.gather(*[_probe(s, 1) for s in _SERVERS]))
+        failed = [s for s, r in zip(_SERVERS, results) if not r]
+        if failed:
+            logger.info("[IMDBPlay] probe round 2 for %d failed server(s): %s",
+                        len(failed), [s["name"] for s in failed])
+            await asyncio.sleep(1.5)
+            retry_iter = iter(await asyncio.gather(*[_probe(s, 2) for s in failed]))
+            for i, r in enumerate(results):
+                if not r:
+                    results[i] = next(retry_iter)
+        return results
+
+    results, vm_entries = await asyncio.gather(
+        _servers_probe(),
+        _probe_vidsrcme_hosts(imdb_id, season, episode),
+    )
+    entries = [r for r in results if r] + list(vm_entries or [])
     logger.info("[IMDBPlay] get_all_server_qualities %s → %d server(s): %s",
                 imdb_id, len(entries),
                 [(e["server"], [q["label"] for q in e["qualities"]]) for e in entries])
@@ -1326,10 +1502,17 @@ async def download_with_quality(
             stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
     else:
         # برای کیفیت خاص، سرورها رو به ترتیب امتحان کن تا سروری پیدا بشه که اون کیفیت رو داشته باشه
-        for server in _SERVERS:
-            # 🆕 اگه کاربر سرور خاصی انتخاب کرده، فقط همون سرور
-            if preferred_server and server["name"] != preferred_server:
-                continue
+        # 🆕 سرور انتخابی کاربر «اول» امتحان میشه؛ اگه این کیفیت رو نداشت،
+        # بقیه‌ی سرورها هم امتحان می‌شن (فقط سرورهایی که دقیقاً همین کیفیت رو دارن).
+        # تضمین باگ 431MB سر جاشه: هرگز با Auto جایگزین نمی‌شه مگه strict=False.
+        ordered = list(_SERVERS)
+        # 🆕 هاست‌های vidsrcme کش‌شده (مثل Castletv) هم تو انتخاب هستن
+        vm_names = list(_VIDSRCME_CACHE.get(_vm_key(imdb_id, season, episode), {}).keys())
+        if vm_names:
+            ordered += [{"id": "vm", "name": n, "vm_name": n} for n in vm_names]
+        if preferred_server:
+            ordered.sort(key=lambda s: 0 if s["name"] == preferred_server else 1)
+        for server in ordered:
             try:
                 logger.info("[IMDBPlay] Trying server %s for quality %s...", server["name"], quality_label)
                 candidate = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)

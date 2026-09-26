@@ -82,7 +82,7 @@ if _searcher_imdb_dir not in _sys.path:
     _sys.path.insert(0, _searcher_imdb_dir)
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle, get_server_info, embed_subtitle_soft
-from searcher.imdb.imdbplay_downloader import get_all_server_qualities  # 🆕 پروب موازی همه‌ی سرورها (منوی سرور/کیفیت)
+from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES  # 🆕 پروب موازی همه‌ی سرورها (منوی سرور/کیفیت)
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -13999,22 +13999,26 @@ def _imdb_quality_buttons(qualities: list, is_episode: bool) -> list:
     return buttons
 
 
-def _imdb_server_buttons(servers: list, quality_label: str, is_episode: bool) -> list:
-    """🆕 دکمه‌های انتخاب سرور — فقط سرورهایی که این کیفیت رو دارن."""
+def _imdb_server_buttons(servers: list, quality_label: str, is_episode: bool, extras: list = None) -> list:
+    """دکمه‌های انتخاب سرور — مثل منوی قدیمی «همه‌ی سرورها» دیده می‌شن:
+    ✅ سرورهای تأییدشده (این کیفیت رو دارن) اول، بعد 🧪 سرورهای امتحانی."""
     pfx = "imd_esrv_" if is_episode else "imd_srv_"
     buttons = [[Button.inline("⚡️ خودکار (اولین سرور در دسترس)", f"{pfx}auto")]]
     row = []
-    for s in servers:
+    pairs = [(s, "✅") for s in servers] + [(e, "🧪") for e in (extras or [])]
+    for s, mark in pairs:
         qm = None
         for q in s.get("qualities", []):
             if q.get("label", "").lower() == quality_label.lower():
                 qm = q
                 break
-        label = f"🖥 {s.get('server', '?')}"
+        label = f"{mark} {s.get('server', '?')}"
         if s.get("type") == "mp4":
             label += " · MP4"
         if qm and qm.get("resolution"):
             label += f" · {qm['resolution']}"
+        if mark == "🧪":
+            label += " (امتحانی)"
         row.append(Button.inline(label, f"{pfx}{s.get('server', '?')}"))
         if len(row) == 2:
             buttons.append(row)
@@ -14095,7 +14099,7 @@ async def imdb_cb_title(event):
         # 🆕 پروب همه‌ی سرورها → کاربر سرور و کیفیت رو باهم می‌بینه
         sq = await get_all_server_qualities(imdb_id)
         qualities = _imdb_agg_qualities(sq)
-        if not qualities and not sq:
+        if not sq:
             await event.edit(f"{caption}\n\n❌ هیچ سروری این عنوان رو نداره.", parse_mode="md")
             return
         imdb_states[user_id]["sq"] = sq
@@ -14183,7 +14187,7 @@ async def imdb_cb_episode(event):
     # 🆕 پروب همه‌ی سرورها برای این قسمت
     sq = await get_all_server_qualities(imdb_id, season, episode)
     qualities = _imdb_agg_qualities(sq)
-    if not qualities and not sq:
+    if not sq:
         await event.edit("❌ هیچ سروری این قسمت رو نداره.")
         return
     state["sq"] = sq
@@ -14195,32 +14199,49 @@ async def imdb_cb_episode(event):
 
 
 async def _imdb_show_server_menu(event, state, is_episode: bool):
-    """🆕 بعد از انتخاب کیفیت → منوی سرور (فقط سرورهای دارای این کیفیت)."""
+    """بعد از انتخاب کیفیت → منوی سرور.
+    مثل منوی قدیمی «همه‌ی سرورها» دیده می‌شن: تأییدشده‌ها (✅) اول،
+    بعد سرورهای امتحانی (🧪) — سرورهایی که پروب جواب نداده.
+    اگه کاربر سرور امتحانی رو انتخاب کنه و کیفیت نباشه، دانلودر خودش
+    به بقیه‌ی سرورهای دارایِ این کیفیت برمی‌گرده."""
     quality_label = state.get("quality", "Auto")
     sq = state.get("sq") or []
     if quality_label.lower() == "auto":
-        servers = sq
+        servers = list(sq)
     else:
         servers = [
             s for s in sq
             if any(q.get("label", "").lower() == quality_label.lower()
                    for q in s.get("qualities", []))
         ]
-    if not servers:
+    # 🆕 سرورهای تأییدنشده: بقیه‌ی entries پروب + سرورهایی که اصلاً جواب ندادن
+    confirmed_ids = {id(s) for s in servers}
+    extras = [s for s in sq if id(s) not in confirmed_ids]
+    known_names = {s.get("server", "?") for s in sq}
+    for name in SERVER_NAMES:
+        if name not in known_names:
+            extras.append({"server": name, "type": "", "headers": {},
+                           "url": "", "qualities": []})
+    if not servers and quality_label.lower() != "auto":
         # 🆕 باگ قدیمی: اینجا قبلاً بی‌صدا Auto دانلود می‌شد (480p → 431MB)!
-        # حالا صادقانه می‌گیم کدوم کیفیت‌ها واقعاً موجوده.
+        # حالا: هشدار صادقانه + سرورهای امتحانی (اگه نداشته باشن، دانلودر به
+        # سرورهای دارایِ کیفیت برمی‌گرده و اگه هیچ‌جا نبود خطای واضح میده)
         avail = _imdb_agg_qualities(sq)
-        await event.answer(f"⚠️ کیفیت {quality_label} در دسترس نیست", alert=True)
+        avail_txt = " ، ".join(a["label"] for a in avail) if avail else "فقط Auto"
+        await event.answer(f"⚠️ کیفیت {quality_label} تأیید نشد", alert=True)
         await event.edit(
-            f"❌ کیفیت **{quality_label}** از هیچ سروری در دسترس نیست.\n"
-            f"👇 یکی از کیفیت‌های موجود رو انتخاب کن:",
-            buttons=_imdb_quality_buttons(avail, is_episode=is_episode),
+            f"⚠️ کیفیت **{quality_label}** از هیچ سروری به‌صورت قطع تأیید نشد.\n"
+            f"🎯 کیفیت‌های تأییدشده: **{avail_txt}**\n\n"
+            f"🧪 می‌تونی یه سرور رو امتحانی امتحان کنی یا «خودکار» رو بزنی:\n"
+            f"_(اگه سرورِ انتخابی نداشته باشه، خودکار به سرورهای دارایِ این کیفیت برمی‌گرده)_",
+            buttons=_imdb_server_buttons([], quality_label, is_episode, extras),
             parse_mode="md",
         )
         return
+    srv_txt = "✅" if servers else "🧪"
     await event.edit(
-        f"✅ کیفیت: **{quality_label}**\n\n🖥 کدوم سرور؟",
-        buttons=_imdb_server_buttons(servers, quality_label, is_episode),
+        f"✅ کیفیت: **{quality_label}**\n\n🖥 کدوم سرور؟ {srv_txt} = تأییدشده",
+        buttons=_imdb_server_buttons(servers, quality_label, is_episode, extras),
         parse_mode="md",
     )
 
