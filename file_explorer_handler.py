@@ -420,7 +420,14 @@ def _self_server_base() -> str:
     """دامنه‌ی عمومی سرور خودم — از PUBLIC_BASE_URL؛ خالی/نامعتبر → "".
 
     تو Railway Variables بذار: PUBLIC_BASE_URL=https://<دامنه‌ی Generate Domain>"""
-    base = (os.environ.get("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    base = (os.environ.get("PUBLIC_BASE_URL") or "").strip()
+    # کتیشن دوتایی/تکی که تو Railway Variables جا می‌مونه
+    while base[:1] in ('"', "'") and base[-1:] == base[:1]:
+        base = base[1:-1].strip()
+    base = base.rstrip("/")
+    # 🆕 اگه اسکییم نداشت خودکار https:// بذار (مقدار بدون https دیگه سرویس رو از زنجیره نمی‌ندازه)
+    if base and not base.startswith(("http://", "https://")):
+        base = "https://" + base.lstrip("/")
     return base if base.startswith(("http://", "https://")) else ""
 
 
@@ -450,7 +457,8 @@ class _ChainNullProg:
 
 
 async def upload_file_via_chain(local_path: str, remote_name: str,
-                                prog=None, status_cb=None) -> dict:
+                                prog=None, status_cb=None,
+                                only: str = "") -> dict:
     """🆕 آپلود فایل به بهترین هاست موجود (زنجیره‌ی fallback) — برای جریان IMDb.
 
     زنجیره: سرور خودم (PUBLIC_BASE_URL) → پیکسل‌درین → Litterbox → Catbox
@@ -481,18 +489,50 @@ async def upload_file_via_chain(local_path: str, remote_name: str,
 
     api_key = (os.environ.get("PIXDRAIN_API_KEY") or "").strip()
     size = os.path.getsize(local_path)
-    chain: list = []
-    if _self_server_base() and size <= SELF_MAX_BYTES:
-        chain.append("self")
-    if api_key and size <= PIXDRAIN_MAX_BYTES:
-        chain.append("pixeldrain")
-    if size <= LITTERBOX_MAX_BYTES:
-        chain.append("litterbox")
-    if size <= CATBOX_MAX_BYTES:
-        chain.append("catbox")
-    if size <= UGUU_MAX_BYTES:
-        chain.append("uguu")
-    chain.append("gofile")
+
+    # 🆕 only → فقط همین هاست، بدون fallback (برای دکمه‌ی مستقیم هر هاست)
+    only = (only or "").strip().lower()
+    if only:
+        _FA_ONLY = {
+            "self": "سرور خودت", "pixeldrain": "پیکسل‌درین",
+            "litterbox": "Litterbox", "catbox": "Catbox",
+            "uguu": "Uguu", "gofile": "Gofile",
+        }
+        if only not in _FA_ONLY:
+            raise _FeError(f"هاست نامعتبر: {_esc(only)}")
+        if only == "self" and not _self_server_base():
+            raise _FeError(
+                "سرور خودت در دسترس نیست: PUBLIC_BASE_URL تنظیم نشده یا نامعتبره."
+                "\nمثال درست: PUBLIC_BASE_URL=https://app-name.up.railway.app"
+            )
+        _ONLY_LIMIT = {
+            "self": SELF_MAX_BYTES,
+            "pixeldrain": PIXDRAIN_MAX_BYTES,
+            "litterbox": LITTERBOX_MAX_BYTES,
+            "catbox": CATBOX_MAX_BYTES,
+            "uguu": UGUU_MAX_BYTES,
+            "gofile": None,
+        }
+        _lim = _ONLY_LIMIT.get(only)
+        if _lim and size > _lim:
+            raise _FeError(
+                f"حجم فایل ({size / 1048576:.0f} مگ) برای {_FA_ONLY[only]} "
+                f"بیشتر از سقف مجازه ({_lim / 1048576:.0f} مگ)"
+            )
+        chain: list = [only]
+    else:
+        chain: list = []
+        if _self_server_base() and size <= SELF_MAX_BYTES:
+            chain.append("self")
+        if api_key and size <= PIXDRAIN_MAX_BYTES:
+            chain.append("pixeldrain")
+        if size <= LITTERBOX_MAX_BYTES:
+            chain.append("litterbox")
+        if size <= CATBOX_MAX_BYTES:
+            chain.append("catbox")
+        if size <= UGUU_MAX_BYTES:
+            chain.append("uguu")
+        chain.append("gofile")
 
     prov_fa = {
         "self": "سرور خودت",

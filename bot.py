@@ -83,7 +83,7 @@ if _searcher_imdb_dir not in _sys.path:
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, get_persian_subtitle, get_server_info, embed_subtitle_soft
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
-BOT_BUILD = "z11"  # نشانگر نسخه — تو لاگ استارت باید z11 دیده بشه
+BOT_BUILD = "z12"  # نشانگر نسخه — تو لاگ استارت باید z12 دیده بشه
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -14035,6 +14035,8 @@ def _imdb_dest_buttons() -> list:
     return [
         [Button.inline("📨 ارسال همینجا (تلگرام)", "imd_dest_tg")],
         [Button.inline("☁️ حافظه‌ی ابری سرورمون (لینک مستقیم)", "imd_dest_cloud")],
+        [Button.inline("🐱 لیترباکس (لینک ۷۲ ساعته)", "imd_dest_lb")],
+        [Button.inline("📦 کت‌باکس (لینک دائمی)", "imd_dest_cb")],
         [Button.inline("🚫 بستن", "imd_close")],
     ]
 
@@ -14319,7 +14321,14 @@ async def imdb_cb_dest(event):
         await event.answer("⏰ نشست شما منقضی شده.", alert=True)
         return
     pending = state.get("pending") or {"with_subtitle": False, "softsub": None}
-    state["delivery"] = "cloud" if data.endswith("cloud") else "tg"
+    if data.endswith("cloud"):
+        state["delivery"] = "cloud"
+    elif data.endswith("lb"):
+        state["delivery"] = "lb"      # 🆕 لیترباکس مستقیم
+    elif data.endswith("cb"):
+        state["delivery"] = "cb"      # 🆕 کت‌باکس مستقیم
+    else:
+        state["delivery"] = "tg"
     await event.answer("✅ شروع دانلود...", alert=False)
     asyncio.create_task(_imdb_download_task(
         event, user_id,
@@ -14502,7 +14511,8 @@ class _IMDBUploadProg:
 
 async def _imdb_cloud_deliver(event, status_msg, state, final_path, title,
                               season, episode, quality, size_mb, sub_note,
-                              separate_sub_path, active_downloads, dl_id) -> bool:
+                              separate_sub_path, active_downloads, dl_id,
+                              only_provider: str = "") -> bool:
     """🆕 آپلود فایل نهایی IMDb به حافظه‌ی ابری سرورمون (زنجیره‌ی fallback).
 
     زنجیره: سرور خودمون → پیکسل‌درین → Litterbox → Catbox → Uguu → Gofile
@@ -14539,7 +14549,8 @@ async def _imdb_cloud_deliver(event, status_msg, state, final_path, title,
 
         up_task = asyncio.create_task(_updater())
         try:
-            out = await upload_file_via_chain(final_path, disp, prog=prog, status_cb=_status)
+            out = await upload_file_via_chain(final_path, disp, prog=prog,
+                                              status_cb=_status, only=only_provider)
         finally:
             up_task.cancel()
 
@@ -14582,6 +14593,7 @@ async def _imdb_cloud_deliver(event, status_msg, state, final_path, title,
                     separate_sub_path,
                     os.path.basename(separate_sub_path),
                     status_cb=_status,
+                    only=only_provider,
                 )
                 sres = sub_out["res"]
                 lines.append("")
@@ -14597,8 +14609,9 @@ async def _imdb_cloud_deliver(event, status_msg, state, final_path, title,
     except Exception as e:
         logger.error(f"[IMDB] cloud deliver failed: {e}", exc_info=True)
         try:
+            _tail = "" if only_provider else "\n\n📤 از طریق تلگرام ارسال می‌شه..."
             await status_msg.edit(
-                f"⚠️ آپلود ابری ناموفق بود:\n<code>{_html.escape(str(e)[:300])}</code>\n\n📤 از طریق تلگرام ارسال می‌شه...",
+                f"⚠️ آپلود ابری ناموفق بود:\n<code>{_html.escape(str(e)[:300])}</code>{_tail}",
                 parse_mode="html",
             )
         except Exception:
@@ -14805,14 +14818,20 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
         size_mb = file_size / 1024 / 1024
 
         # 🆕 حافظه ابری — زنجیره: سرور خودمون → پیکسل‌درین → ... → گوفایل
-        if delivery == "cloud":
+        if delivery in ("cloud", "lb", "cb"):
+            # 🆕 lb/cb → فقط همون هاست بدون fallback؛ cloud → زنجیره کامل
+            only_provider = {"lb": "litterbox", "cb": "catbox"}.get(delivery, "")
             cloud_ok = await _imdb_cloud_deliver(
                 event, status_msg, state, final_path, title, season, episode,
                 quality, size_mb, sub_name if with_subtitle else None,
                 persian_sub_path if do_separate_sub else None,
-                active_downloads, dl_id,
+                active_downloads, dl_id, only_provider=only_provider,
             )
             if cloud_ok:
+                return
+            if delivery != "cloud":
+                # مقصد مشخص (لیترباکس/کت‌باکس) انتخاب شده — خطا نشون داده شد، بدون fallback تلگرام
+                active_downloads.pop(dl_id, None)
                 return
             # آپلود ابری شکست خورد و فایل قابل ارسال تلگرامه → ادامه به مسیر تلگرام
 

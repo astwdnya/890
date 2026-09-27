@@ -209,6 +209,13 @@ def serve_file(
         }
 
     base = public_base_url or os.environ.get("PUBLIC_BASE_URL", "")
+    # 🆕 نرمال‌سازی: کتیشن/فاصله حذف + اسکییم https:// خودکار
+    base = (base or "").strip()
+    while base[:1] in ('"', "'") and base[-1:] == base[:1]:
+        base = base[1:-1].strip()
+    if base and not base.startswith(("http://", "https://")):
+        base = "https://" + base.lstrip("/")
+    base = base.rstrip("/")
     if not base:
         # Fallback — به‌جای URL عمومی، فقط token رو برگردون
         url = f"/f/{token}"
