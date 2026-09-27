@@ -64,13 +64,19 @@ _USER_AGENT = (
 
 _BROWSER_IMPERSONATE = "chrome"
 
-# ─── دانلود همزمان سگمنت‌ها (قابل تنظیم با متغیرهای محیطی) ───
-# گلوگاه قبلی: Semaphore(10) + AsyncSession با max_clients پیش‌فرض 10
-# یعنی هر لحظه حداکثر 10 سگمنت در حال دانلود بود. برای لینک‌های کم‌سرعت/
-# پرتأخیر (مثل مسیر بین‌الملل ایران) هر کانکشن TCP محدود میشه و افزایش
-# تعداد کانکشن‌های همزمان سرعت را چند برابر می‌کند.
-SEGMENT_CONCURRENCY = int(os.environ.get("IMDB_SEG_CONCURRENCY", "24"))   # سگمنت همزمان
-SESSION_MAX_CLIENTS = int(os.environ.get("IMDB_MAX_CLIENTS", "32"))       # حداکثر curl handle همزمان
+# ─── دانلود همزمان سگمنت‌ها (z16 — موتور تطبیقی) ───
+# بنچمارک زنده نشون داد: تعداد کانکشن ثابت جواب نیست!
+#   sem=3 → 58MB/s | sem=16 → 105MB/s | sem=24+ → افت شدید (CDN به‌ازای هر IP محدود می‌کنه)
+# پس: worker-pool داینامیک + hill-climbing روی throughput واقعی.
+# نقطه‌ی بهینه برای هر CDN متفاوته و خودِ موتور پیداش می‌کنه.
+SEGMENT_CONCURRENCY = int(os.environ.get("IMDB_SEG_CONCURRENCY", "12"))   # نقطه‌ی شروع
+SESSION_MAX_CLIENTS = int(os.environ.get("IMDB_MAX_CLIENTS", "48"))       # حداکثر curl handle همزمان
+SEG_CONCURRENCY_MIN = int(os.environ.get("IMDB_SEG_MIN", "4"))            # کف concurrency
+SEG_CONCURRENCY_MAX = int(os.environ.get("IMDB_SEG_MAX", "40"))           # سقف concurrency
+SEG_ADAPT_ENABLED   = os.environ.get("IMDB_SEG_ADAPT", "1") != "0"        # خاموش/روشن کردن تطبیق
+SEG_ADAPT_WINDOW    = float(os.environ.get("IMDB_SEG_WINDOW", "4"))       # ثانیه بین اندازه‌گیری‌ها
+SEG_TIMEOUT         = int(os.environ.get("IMDB_SEG_TIMEOUT", "45"))       # تایم‌اوت هر سگمنت
+SEG_RETRIES         = int(os.environ.get("IMDB_SEG_RETRIES", "5"))        # تلاش مجدد هر سگمنت
 
 # TMDB API key که vidzee و چند سرور دیگه استفاده می‌کنن (به صورت embedded در JS اون‌هاست).
 # این کلید public در نظر گرفته شده و در فرانت‌اند سایت‌های embed استفاده می‌شه.
@@ -1443,6 +1449,252 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
     return entries
 
 
+async def _hls_segment_engine(
+    segments: List[Tuple[str, float]],
+    variant_url: str,
+    headers: dict,
+    out_dir: str,
+    shared_session,
+    seg_paths: list,
+    init_path: Optional[str],
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    stats_out: Optional[dict] = None,
+) -> None:
+    """
+    🚀 z16: موتور دانلود سگمنت با concurrency تطبیقی (adaptive concurrency).
+
+    چرا تطبیقی؟ بنچمارک زنده (Vidzee) نشون داد:
+        sem=3  → 58 MB/s
+        sem=16 → 105 MB/s   ← قله
+        sem=24 → 52 MB/s    ← افت!
+    یعنی CDNها به‌ازای هر IP سقف پهنای‌باند می‌ذارن و کانکشن زیاد «ضد» سرعته.
+    نقطه‌ی بهینه برای هر CDN فرق داره (2Embed/Vidzee/Vidking هرکدوم جور دیگه).
+    پس موتور چند کاندیدا رو زنده امتحان می‌کنه و روی بهترین throughput قفل می‌شه.
+
+    ساختار:
+      - worker-pool داینامیک: workerها از یک صف مشترک سگمنت برمی‌دارن
+      - کنترلر hill-climbing: هر کاندیدا ۲ پنجره‌ی زمانی تست می‌شه
+      - راند دوم (second-chance) برای سگمنت‌های شکست‌خورده
+      - stats_out: آمار زنده {mbps, concurrency} برای نمایش در بات
+    """
+    total = len(segments)
+    if stats_out is None:
+        stats_out = {}
+    stats_out["mbps"] = 0.0
+    stats_out["concurrency"] = max(1, min(SEGMENT_CONCURRENCY, SEG_CONCURRENCY_MAX))
+
+    counters = {"done": 0, "bytes": 0, "failed": 0}
+    state = {
+        "desired": max(1, min(SEGMENT_CONCURRENCY, SEG_CONCURRENCY_MAX)),
+        "alive": 0,
+        "abort": False,
+    }
+    q: asyncio.Queue = asyncio.Queue()
+    tasks: List[asyncio.Task] = []
+
+    def _report():
+        if progress_cb:
+            try:
+                progress_cb(counters["done"], total)
+            except asyncio.CancelledError:
+                state["abort"] = True
+                raise
+            except Exception:
+                pass
+
+    async def _fetch_one(idx: int, url: str, tries: int):
+        abs_url = _make_absolute(variant_url, url)
+        for attempt in range(max(1, tries)):
+            if state["abort"]:
+                return
+            try:
+                r = await shared_session.get(
+                    abs_url, impersonate=_BROWSER_IMPERSONATE,
+                    timeout=SEG_TIMEOUT, headers=headers,
+                )
+                if r.status_code == 200 and r.content:
+                    data = r.content
+                    ext = "m4s" if init_path else "ts"
+                    seg_path = os.path.join(out_dir, f"seg_{idx:05d}.{ext}")
+                    with open(seg_path, "wb") as f:
+                        f.write(data)
+                    seg_paths[idx] = seg_path
+                    counters["done"] += 1
+                    counters["bytes"] += len(data)
+                    _report()
+                    return
+                # 403/429/502/… → backoff کوتاه و تلاش دوباره
+                await asyncio.sleep(min(2.0, 0.4 * (attempt + 1)))
+            except asyncio.CancelledError:
+                state["abort"] = True
+                raise
+            except Exception as e:
+                logger.debug("seg %d attempt %d failed: %s", idx, attempt + 1, e)
+                await asyncio.sleep(min(3.0, 0.5 * (attempt + 1)))
+        counters["failed"] += 1
+        logger.warning("[SEG] seg %d failed after %d attempts", idx, max(1, tries))
+
+    async def _worker():
+        try:
+            while not state["abort"]:
+                # اضافی‌ها (بعد از کاهش desired) بعد از آیتم فعلی تمیز خارج می‌شن
+                if state["alive"] > state["desired"] and state["alive"] > 1:
+                    return
+                try:
+                    idx, url, tries = q.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                await _fetch_one(idx, url, tries)
+        finally:
+            state["alive"] -= 1
+
+    def _spawn(n: int):
+        for _ in range(max(0, n)):
+            state["alive"] += 1
+            tasks.append(asyncio.create_task(_worker()))
+
+    def _reconcile():
+        """🎯 بعد از تغییر desired، تعداد worker زنده رو هماهنگ کن (z16 fix).
+        بدون این، بالا بردن desired هیچ اثری روی دانلود موازی نداشت!"""
+        if state["alive"] < state["desired"]:
+            _spawn(state["desired"] - state["alive"])
+
+    async def _controller():
+        """hill-climbing روی concurrency: چند کاندیدا رو زنده می‌سنجه و بهترین رو قفل می‌کنه."""
+        WIN = max(0.2, SEG_ADAPT_WINDOW)
+        try:
+            # فاز warmup: دو پنجره با نقطه‌ی شروع
+            prev = counters["bytes"]
+            base_mbps = 0.0
+            for _ in range(2):
+                await asyncio.sleep(WIN)
+                if state["abort"] or counters["done"] >= total:
+                    return
+                now = counters["bytes"]
+                base_mbps = (now - prev) / WIN / 1048576
+                prev = now
+                stats_out["mbps"] = base_mbps
+                stats_out["concurrency"] = state["desired"]
+
+            # اگه خیلی نزدیک پایانیم، دست نزن
+            if total - counters["done"] - counters["failed"] < 30:
+                return
+
+            # نردبان کاندیداها (فقط صعودی؛ سقف با env قابل بالابردنه)
+            ladder = [state["desired"]]
+            c = ladder[0]
+            while c + 6 <= SEG_CONCURRENCY_MAX and len(ladder) < 5:
+                c += 6
+                ladder.append(c)
+
+            best_c, best_m = ladder[0], base_mbps
+            for cand in ladder[1:]:
+                if state["abort"] or counters["done"] >= total:
+                    break
+                if total - counters["done"] - counters["failed"] < 30:
+                    break
+                state["desired"] = cand
+                _reconcile()
+                m = 0.0
+                for _ in range(2):
+                    await asyncio.sleep(WIN)
+                    if state["abort"]:
+                        return
+                    now = counters["bytes"]
+                    m = (now - prev) / WIN / 1048576
+                    prev = now
+                    stats_out["mbps"] = m
+                    stats_out["concurrency"] = cand
+                if m > best_m * 1.05:  # حداقل ۵٪ بهبود واقعی
+                    best_c, best_m = cand, m
+
+            # 🆕 اگه هیچ کاندیدای بالاتر بهتر نشد، پایین‌ترها رو هم امتحان کن
+            # (برای CDNهایی که سقف پایینی به‌ازای هر IP دارن)
+            if best_c == ladder[0]:
+                c = ladder[0]
+                while c - 6 >= SEG_CONCURRENCY_MIN:
+                    c -= 6
+                    if state["abort"] or counters["done"] >= total:
+                        break
+                    if total - counters["done"] - counters["failed"] < 30:
+                        break
+                    state["desired"] = c
+                    _reconcile()
+                    m = 0.0
+                    for _ in range(2):
+                        await asyncio.sleep(WIN)
+                        if state["abort"]:
+                            return
+                        now = counters["bytes"]
+                        m = (now - prev) / WIN / 1048576
+                        prev = now
+                        stats_out["mbps"] = m
+                        stats_out["concurrency"] = c
+                    if m > best_m * 1.05:
+                        best_c, best_m = c, m
+                    else:
+                        break  # پایین‌تر هم بهتر نشد → کافیه
+
+            state["desired"] = best_c
+            _reconcile()
+            stats_out["concurrency"] = best_c
+            logger.info("[SEG] adaptive concurrency settled at %d (%.1f MB/s)", best_c, best_m)
+
+            # تا پایان: فقط آمار به‌روز کن
+            while not state["abort"] and counters["done"] < total:
+                await asyncio.sleep(WIN)
+                now = counters["bytes"]
+                stats_out["mbps"] = (now - prev) / WIN / 1048576
+                prev = now
+        except asyncio.CancelledError:
+            raise
+
+    async def _drain(items, tries: int, with_adapt: bool):
+        """یک راند کامل: صف رو پر کن، worker بگیر، تا اتمام صبر کن."""
+        expected = counters["done"] + counters["failed"] + len(items)
+        for idx, url in items:
+            q.put_nowait((idx, url, tries))
+        _spawn(min(state["desired"], len(items)))
+        ctrl = None
+        if with_adapt:
+            ctrl = asyncio.create_task(_controller())
+        try:
+            while not state["abort"] and (counters["done"] + counters["failed"]) < expected:
+                if state["alive"] == 0:
+                    # ایمنی: اگه همه‌ی workerها خارج شدن ولی هنوز کار مونده
+                    _spawn(max(1, min(state["desired"],
+                                      expected - counters["done"] - counters["failed"])))
+                await asyncio.sleep(0.25)
+        finally:
+            if ctrl:
+                ctrl.cancel()
+                try:
+                    await ctrl
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+        if state["abort"]:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise asyncio.CancelledError()
+
+    # ─── راند اصلی ───
+    await _drain([(i, u) for i, (u, _d) in enumerate(segments)], SEG_RETRIES, True)
+
+    # ─── راند دوم: شانس آخر برای سگمنت‌های از دست رفته ───
+    missing = [i for i, p in enumerate(seg_paths) if not p]
+    if missing:
+        logger.info("[SEG] 2nd chance: retrying %d missing segments", len(missing))
+        state["abort"] = False
+        state["desired"] = max(1, min(SEGMENT_CONCURRENCY, SEG_CONCURRENCY_MAX))
+        await _drain([(i, segments[i][0]) for i in missing], 3, False)
+
+    if counters["failed"]:
+        logger.info("[SEG] finished with %d failed segments (of %d)", counters["failed"], total)
+
+
 async def download_with_quality(
     imdb_id: str,
     quality_label: str,
@@ -1452,6 +1704,7 @@ async def download_with_quality(
     progress_cb: Optional[Callable[[int, int], None]] = None,
     preferred_server: Optional[str] = None,
     strict_quality: bool = False,
+    stats_out: Optional[dict] = None,
 ) -> Optional[str]:
     """
     دانلود فیلم یا قسمت سریال با کیفیت انتخابی.
@@ -1465,6 +1718,8 @@ async def download_with_quality(
         preferred_server: 🆕 نام سرور انتخابی کاربر (None = خودکار)
         strict_quality: 🆕 اگه True، وقتی هیچ سروری کیفیت رو نداره به‌جای
             دانلود اشتباه با Auto (باگ 480p→431MB)، خطای واضح میده.
+        stats_out: 🆕 z16 دیکشنری اختیاری که موتور سگمنت آمار زنده توش می‌ریزه
+            ({"mbps": سرعت لحظه‌ای, "concurrency": تعداد کانکشن فعلی})
 
     Returns:
         مسیر فایل دانلود شده، یا None در صورت خطا.
@@ -1761,14 +2016,25 @@ async def download_with_quality(
         variant_url = _make_absolute(m3u8_url, chosen[0])
         logger.info("Selected variant: %s (bandwidth=%d, resolution=%s)",
                     variant_url[:80], chosen[1], chosen[2])
-        try:
-            async with AsyncSession() as s:
-                r = await s.get(variant_url, impersonate=_BROWSER_IMPERSONATE, timeout=20, headers=headers)
-                if r.status_code != 200:
-                    raise RuntimeError(f"variant m3u8 HTTP {r.status_code}")
-                text = r.text
-        except Exception as e:
-            raise RuntimeError(f"variant m3u8 fetch failed: {e}")
+
+        # 🆕 z16: fetch پلی‌لیست واریانت با retry — 502/429 گذراها نباید کل دانلود رو بترکونن
+        text = None
+        last_verr = None
+        for _vatt in range(3):
+            try:
+                async with AsyncSession() as s:
+                    r = await s.get(variant_url, impersonate=_BROWSER_IMPERSONATE, timeout=30, headers=headers)
+                    if r.status_code == 200:
+                        text = r.text
+                        break
+                    last_verr = f"variant m3u8 HTTP {r.status_code}"
+                    logger.warning("%s (attempt %d/3)", last_verr, _vatt + 1)
+            except Exception as e:
+                last_verr = str(e)[:200]
+                logger.warning("variant m3u8 fetch attempt %d/3 failed: %s", _vatt + 1, last_verr)
+            await asyncio.sleep(1 + _vatt)
+        if not text:
+            raise RuntimeError(f"variant m3u8 fetch failed: {last_verr}")
 
     segments, init_url = _parse_variant_m3u8(text)
     if not segments:
@@ -1779,10 +2045,9 @@ async def download_with_quality(
     logger.info("Downloading %d segments from %s (init=%s)",
                 total, server_name, "yes" if init_url else "no")
 
-    # download segments in parallel — با session مشترک و retries بیشتر
+    # download segments in parallel — 🚀 z16: موتور تطبیقی (worker-pool + hill-climbing)
     seg_paths = [None] * total
     init_path = None
-    sem = asyncio.Semaphore(SEGMENT_CONCURRENCY)  # دانلود همزمان سگمنت‌ها (قابل تنظیم با IMDB_SEG_CONCURRENCY)
 
     async with AsyncSession(max_clients=SESSION_MAX_CLIENTS) as shared_session:
         # اگه init segment وجود داره (fMP4)، اول اون رو دانلود کن
@@ -1814,47 +2079,12 @@ async def download_with_quality(
             if not init_path and init_url:
                 logger.error("Init segment failed to download after 5 attempts — concat will likely fail")
 
-        async def download_one(idx: int, seg_url: str):
-            nonlocal seg_paths
-            abs_url = _make_absolute(variant_url, seg_url)
-            async with sem:
-                last_err = None
-                for attempt in range(5):
-                    try:
-                        r = await shared_session.get(
-                            abs_url, impersonate=_BROWSER_IMPERSONATE,
-                            timeout=60, headers=headers,
-                        )
-                        if r.status_code == 200 and r.content:
-                            data = r.content
-                            # تشخیص فرمت از روی URL یا محتوا
-                            if init_path:
-                                # fMP4 — پسوند .m4s
-                                seg_path = os.path.join(out_dir, f"seg_{idx:05d}.m4s")
-                            else:
-                                # MPEG-TS — پسوند .ts
-                                seg_path = os.path.join(out_dir, f"seg_{idx:05d}.ts")
-                            with open(seg_path, "wb") as f:
-                                f.write(data)
-                            seg_paths[idx] = seg_path
-                            if progress_cb:
-                                done = sum(1 for p in seg_paths if p)
-                                try:
-                                    progress_cb(done, total)
-                                except Exception:
-                                    pass
-                            return
-                        elif r.status_code in (429, 503):
-                            await asyncio.sleep(0.5 * (attempt + 1))
-                        else:
-                            await asyncio.sleep(0.5 * (attempt + 1))
-                    except Exception as e:
-                        last_err = e
-                        logger.debug("seg %d attempt %d failed: %s", idx, attempt, e)
-                        await asyncio.sleep(1 * (attempt + 1))
-                logger.error("seg %d failed after 5 attempts: %s", idx, last_err)
-
-        await asyncio.gather(*[download_one(i, u) for i, (u, _) in enumerate(segments)])
+        # 🚀 موتور تطبیقی: تعداد کانکشن همزمان رو بر اساس throughput واقعی تنظیم می‌کنه
+        await _hls_segment_engine(
+            segments, variant_url, headers, out_dir, shared_session,
+            seg_paths, init_path,
+            progress_cb=progress_cb, stats_out=stats_out,
+        )
 
     missing = [i for i, p in enumerate(seg_paths) if not p]
     if missing:

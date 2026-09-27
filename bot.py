@@ -84,7 +84,7 @@ from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episod
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, get_persian_subtitle, get_server_info, embed_subtitle_soft
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
-BOT_BUILD = "z15"  # نشانگر نسخه — تو لاگ استارت باید z15 دیده بشه
+BOT_BUILD = "z16"  # نشانگر نسخه — تو لاگ استارت باید z16 دیده بشه (موتور سگمنت تطبیقی)
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -14784,22 +14784,46 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                 with_subtitle = False
 
         last_progress = [0]
+        seg_stats = {}  # 🆕 z16: آمار زنده‌ی موتور سگمنت {"mbps", "concurrency"}
 
         def vid_progress(done, total):
             check_cancel()
             last_progress[0] = (done, total)
 
         async def update_vid():
+            prev_seg = (0, 0)
+            prev_time = time.monotonic()
             while True:
                 await asyncio.sleep(5)
                 check_cancel()
                 if last_progress[0]:
                     d, t = last_progress[0]
                     pct = d * 100 // t if t else 0
+                    srv_short = server_info.get("server", "") if server_info else ""
+                    srv_text = f" [{srv_short}]" if srv_short else ""
+                    # 🆕 z16: سرعت + تعداد کانکشن موازی + زمان باقی‌مانده
+                    speed_text = ""
+                    mbps = seg_stats.get("mbps") or 0
+                    if mbps >= 0.1:
+                        speed_text = f" | ⚡ {mbps:.1f} MB/s"
+                        conc = seg_stats.get("concurrency")
+                        if conc:
+                            speed_text += f" | 🔀 {conc}"
+                        # ETA از میانگین حجم سگمنت‌های دانلودشده
+                        try:
+                            if d > prev_seg[0] and d > 0:
+                                dt = time.monotonic() - prev_time
+                                segs_per_s = (d - prev_seg[0]) / dt
+                                remaining = (t - d) / segs_per_s
+                                if remaining < 5400:
+                                    m, s = divmod(int(remaining), 60)
+                                    speed_text += f" | ⏳ {m:02d}:{s:02d}"
+                        except Exception:
+                            pass
+                    prev_seg = (d, t)
+                    prev_time = time.monotonic()
                     try:
-                        srv_short = server_info.get("server", "") if server_info else ""
-                        srv_text = f" [{srv_short}]" if srv_short else ""
-                        await status_msg.edit(f"📥 دانلود سگمنت: {d}/{t} ({pct}%){srv_text}", buttons=cancel_btn)
+                        await status_msg.edit(f"📥 دانلود سگمنت: {d}/{t} ({pct}%){srv_text}{speed_text}", buttons=cancel_btn)
                     except Exception:
                         pass
 
@@ -14808,7 +14832,7 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
         try:
             video_path = await download_with_quality(
                 imdb_id, quality, out_dir, season, episode, progress_cb=vid_progress,
-                preferred_server=preferred_server, strict_quality=True,
+                preferred_server=preferred_server, strict_quality=True, stats_out=seg_stats,
             )
         except Exception as dl_err:
             logger.error(f"[IMDB] video download error: {dl_err}", exc_info=True)
