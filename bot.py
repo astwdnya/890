@@ -84,7 +84,7 @@ from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episod
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, get_persian_subtitle, get_server_info, embed_subtitle_soft
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
-BOT_BUILD = "z17"  # نشانگر نسخه — تو لاگ استارت باید z17 دیده بشه (ضد فریز ۹۹٪: backstop + watchdog + concat async)
+BOT_BUILD = "z18"  # نشانگر نسخه — تو لاگ استارت باید z18 دیده بشه (سقف آپلود = دقیقاً 2,097,152,000 بایت تلگرام)
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -657,7 +657,15 @@ def _parse_authorized_users() -> set:
 AUTHORIZED_USERS = _parse_authorized_users()
 
 MAX_FILE_SIZE_MB = 50000  # allow up to ~50GB (bot will split into 2GB parts)
-MAX_PART_SIZE = 1900 * 1024 * 1024  # 1.9GB per part for Telegram upload
+MAX_PART_SIZE = 1900 * 1024 * 1024  # هدف تکه‌تکه‌کردن (1.9GB — حاشیه‌ی امن برای کلیدفریم‌ها؛ خودِ تلگرام سقف بالاتری داره)
+
+# ═══ سقف واقعی و بایت‌به‌بایت آپلود تلگرام (MTProto/Telethon) ═══
+#   بدون پریمیوم (شامل بات‌ها — بات نمی‌تونه پریمیوم بگیره):
+#     2000 مگابایت = 2,048,000 کیلوبایت = 2,097,152,000 بایت
+#   پریمیوم: 4000 MB = 4,096,000 KB = 4,194,304,000 bytes (برای بات ممکن نیست)
+#   تلثون خودش هیچ سقفی سمت کلاینت نداره (فقط تکه‌های 512KB با upload.SaveBigFilePart
+#   می‌فرسته) — سقف کاملاً سمت سرور تلگرامه و دقیقاً همین عدد بالاست.
+TG_UPLOAD_MAX_BYTES = 2000 * 1024 * 1024   # 2,097,152,000 bytes — دقیقاً سقف تلگرام
 OUTPUT_FOLDER = "output_files"
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -6706,7 +6714,9 @@ async def generic_url_handler(event):
         free_space = get_free_space()
         file_size = os.path.getsize(filepath)
 
-        if file_size > MAX_PART_SIZE:
+        # 🆕 z18: فایل تا 2,097,152,000 بایت (سقف دقیق تلگرام) مستقیم آپلود می‌شه؛
+        # فقط بالاتر از سقف واقعی تکه‌تکه می‌شه (هدف پارت‌ها 1900MB می‌مونه برای حاشیه‌ی کلیدفریم)
+        if file_size > TG_UPLOAD_MAX_BYTES:
             # Large file — split into parts and upload each separately
             need_space = file_size + 512 * 1024 * 1024  # extra 512MB margin
             if free_space < need_space:
@@ -14956,8 +14966,13 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                 return
             # آپلود ابری شکست خورد و فایل قابل ارسال تلگرامه → ادامه به مسیر تلگرام
 
-        if size_mb > 1900:
-            await status_msg.edit(f"⚠ فایل خیلی بزرگه ({size_mb:.1f} MB). محدودیت تلگرام 2GB. برای فایل‌های بزرگ‌تر از گزینه‌ی «حافظه‌ی ابری» استفاده کن.")
+        if file_size > TG_UPLOAD_MAX_BYTES:
+            over_b = file_size - TG_UPLOAD_MAX_BYTES
+            await status_msg.edit(
+                f"⚠ فایل خیلی بزرگه ({size_mb:.1f} MB).\n"
+                f"سقف دقیق آپلود تلگرام: 2000 MB = 2,048,000 KB = 2,097,152,000 بایت\n"
+                f"این فایل {over_b:,} بایت از سقف بیشتره. برای فایل‌های بزرگ‌تر از گزینه‌ی «حافظه‌ی ابری» استفاده کن."
+            )
             return
 
         await status_msg.edit(f"📤 در حال آپلود ({size_mb:.1f} MB)...", buttons=None)
@@ -15621,11 +15636,11 @@ async def _itchio_perform_download(client, chat_id, status_msg, game_url, upload
     # بررسی اولیه‌ی حجم از اطلاعات صفحه (قبل از دانلود)
     # (صرفه‌جویی در پهنای باند — حجم واقعی بعد از دانلود هم دوباره چک میشه)
     pre_size = upload.get("size_bytes") or 0
-    if pre_size > 1900 * 1024 * 1024:
+    if pre_size > TG_UPLOAD_MAX_BYTES:
         try:
             await status_msg.edit(
                 f"⚠️ فایل `{upload_name}` حجمش {upload.get('size_str') or '?'} هست.\n\n"
-                f"از محدودیت سند تلگرام (2GB) بزرگتره و نمیتونم بفرستمش.\n"
+                f"از سقف آپلود تلگرام (2000 MB = 2,097,152,000 بایت) بزرگتره و نمیتونم بفرستمش.\n"
                 f"🔗 {game_url}",
                 parse_mode="md",
             )
@@ -15672,11 +15687,11 @@ async def _itchio_perform_download(client, chat_id, status_msg, game_url, upload
 
         size_mb = size / 1024 / 1024
 
-        # بررسی محدودیت حجم سند تلگرام (~2GB)
-        if size > 1900 * 1024 * 1024:
+        # بررسی محدودیت حجم آپلود تلگرام — بایت‌به‌بایت: 2,097,152,000 بایت
+        if size > TG_UPLOAD_MAX_BYTES:
             await status_msg.edit(
                 f"⚠️ فایل `{upload_name}` دانلود شد ({size_mb:.1f} MB)\n\n"
-                f"ولی از محدودیت حجم سند تلگرام (2GB) بزرگتره و نمیتونم بفرستمش.\n"
+                f"ولی از سقف آپلود تلگرام (2000 MB = 2,097,152,000 بایت) بزرگتره و نمیتونم بفرستمش.\n"
                 f"🔗 {game_url}",
                 parse_mode="md",
             )
