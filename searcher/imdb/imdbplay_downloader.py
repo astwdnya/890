@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -77,6 +78,13 @@ SEG_ADAPT_ENABLED   = os.environ.get("IMDB_SEG_ADAPT", "1") != "0"        # خا
 SEG_ADAPT_WINDOW    = float(os.environ.get("IMDB_SEG_WINDOW", "4"))       # ثانیه بین اندازه‌گیری‌ها
 SEG_TIMEOUT         = int(os.environ.get("IMDB_SEG_TIMEOUT", "45"))       # تایم‌اوت هر سگمنت
 SEG_RETRIES         = int(os.environ.get("IMDB_SEG_RETRIES", "5"))        # تلاش مجدد هر سگمنت
+# 🛡 z17 — ضد فریز: توقف در ۹۹٪ (مثل 1710/1714) سه علت داشت:
+#   1) درخواست curl_cffi که هیچ‌وقت برنمی‌گرده → _drain برای همیشه منتظر می‌مونه
+#   2) کرش غیرمنتظره‌ی worker بعد از برداشتن آیتم از صف → آیتم گم می‌شه → done+failed هیچ‌وقت به expected نمی‌رسه
+#   3) concat بلاک‌کننده‌ی event loop (subprocess.run چند دقیقه‌ای) → بات مرده به نظر می‌رسه
+SEG_HARD_BACKSTOP   = float(os.environ.get("IMDB_SEG_BACKSTOP", "15"))    # ⏱ سقف سخت wait_for روی هر درخواست (SEG_TIMEOUT + این)
+SEG_STALL_TIMEOUT   = float(os.environ.get("IMDB_SEG_STALL", "150"))      # ⏱ اگه این‌قدر ثانیه هیچ پیشرفتی نبود → راند force-finish می‌شه
+ALLOW_REENCODE      = os.environ.get("IMDB_ALLOW_REENCODE", "0") == "1"   # re-encode چندساعته پیش‌فرض خاموشه
 
 # TMDB API key که vidzee و چند سرور دیگه استفاده می‌کنن (به صورت embedded در JS اون‌هاست).
 # این کلید public در نظر گرفته شده و در فرانت‌اند سایت‌های embed استفاده می‌شه.
@@ -1488,6 +1496,8 @@ async def _hls_segment_engine(
         "desired": max(1, min(SEGMENT_CONCURRENCY, SEG_CONCURRENCY_MAX)),
         "alive": 0,
         "abort": False,
+        "stall": False,   # 🛡 z17: watch-dog ضد فریز فعال شد
+        "session": None,  # 🛡 z17: راند سوم با سشن تازه
     }
     q: asyncio.Queue = asyncio.Queue()
     tasks: List[asyncio.Task] = []
@@ -1504,13 +1514,20 @@ async def _hls_segment_engine(
 
     async def _fetch_one(idx: int, url: str, tries: int):
         abs_url = _make_absolute(variant_url, url)
+        sess = state.get("session") or shared_session
         for attempt in range(max(1, tries)):
-            if state["abort"]:
+            if state["abort"] or state.get("stall"):
                 return
             try:
-                r = await shared_session.get(
-                    abs_url, impersonate=_BROWSER_IMPERSONATE,
-                    timeout=SEG_TIMEOUT, headers=headers,
+                # 🛡 z17: backstop سخت — حتی اگه curl_cffi گیر کنه یا event loop شلوغ باشه،
+                # این wait_for بعد از SEG_TIMEOUT+SEG_HARD_BACKSTOP ثانیه حتماً برمی‌گرده.
+                # بدون این، یک درخواست گیرکرده = فریز ابدی در ۹۹٪!
+                r = await asyncio.wait_for(
+                    sess.get(
+                        abs_url, impersonate=_BROWSER_IMPERSONATE,
+                        timeout=SEG_TIMEOUT, headers=headers,
+                    ),
+                    timeout=SEG_TIMEOUT + SEG_HARD_BACKSTOP,
                 )
                 if r.status_code == 200 and r.content:
                     data = r.content
@@ -1525,6 +1542,10 @@ async def _hls_segment_engine(
                     return
                 # 403/429/502/… → backoff کوتاه و تلاش دوباره
                 await asyncio.sleep(min(2.0, 0.4 * (attempt + 1)))
+            except asyncio.TimeoutError:
+                # ⏱ z17: تایم‌اوت سخت wait_for — مثل یک تلاش ناموفق حساب کن
+                logger.debug("seg %d attempt %d hard-backstop timeout", idx, attempt + 1)
+                await asyncio.sleep(min(3.0, 0.5 * (attempt + 1)))
             except asyncio.CancelledError:
                 state["abort"] = True
                 raise
@@ -1536,7 +1557,7 @@ async def _hls_segment_engine(
 
     async def _worker():
         try:
-            while not state["abort"]:
+            while not state["abort"] and not state.get("stall"):
                 # اضافی‌ها (بعد از کاهش desired) بعد از آیتم فعلی تمیز خارج می‌شن
                 if state["alive"] > state["desired"] and state["alive"] > 1:
                     return
@@ -1544,7 +1565,17 @@ async def _hls_segment_engine(
                     idx, url, tries = q.get_nowait()
                 except asyncio.QueueEmpty:
                     return
-                await _fetch_one(idx, url, tries)
+                try:
+                    await _fetch_one(idx, url, tries)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as w_err:
+                    # 🛡 z17: هیچ آیتمی نباید بین صف و شمارنده گم بشه — اگه worker
+                    # بعد از برداشتن آیتم کرش کنه و شمرده نشه، done+failed هیچ‌وقت
+                    # به expected نمی‌رسه و _drain برای همیشه فریز می‌شه (باگ ۹۹٪!)
+                    counters["failed"] += 1
+                    logger.error("[SEG] seg %d worker crashed (counted as failed): %s",
+                                 idx, w_err)
         finally:
             state["alive"] -= 1
 
@@ -1658,13 +1689,28 @@ async def _hls_segment_engine(
         ctrl = None
         if with_adapt:
             ctrl = asyncio.create_task(_controller())
+        # 🛡 z17: watch-dog ضد فریز — اگه این‌قدر ثانیه هیچ پیشرفتی نبود
+        # (درخواست گیرکرده/آیتم گم‌شده)، راند force-finish می‌شه و آیتم‌های
+        # ناتمام تو راند بعدی (با سشن تازه) retry می‌شن.
+        last_snap = (counters["done"] + counters["failed"], counters["bytes"])
+        last_change = time.monotonic()
         try:
-            while not state["abort"] and (counters["done"] + counters["failed"]) < expected:
+            while (not state["abort"] and not state.get("stall")
+                   and (counters["done"] + counters["failed"]) < expected):
                 if state["alive"] == 0:
                     # ایمنی: اگه همه‌ی workerها خارج شدن ولی هنوز کار مونده
                     _spawn(max(1, min(state["desired"],
                                       expected - counters["done"] - counters["failed"])))
                 await asyncio.sleep(0.25)
+                snap = (counters["done"] + counters["failed"], counters["bytes"])
+                if snap != last_snap:
+                    last_snap = snap
+                    last_change = time.monotonic()
+                elif (expected - last_snap[0]) > 0 and \
+                        time.monotonic() - last_change > SEG_STALL_TIMEOUT:
+                    state["stall"] = True
+                    logger.warning("[SEG] ⏱ no progress for %.0fs (%d/%d) — force-finishing round",
+                                   SEG_STALL_TIMEOUT, last_snap[0], expected)
         finally:
             if ctrl:
                 ctrl.cancel()
@@ -1674,25 +1720,57 @@ async def _hls_segment_engine(
                     pass
                 except Exception:
                     pass
+        if state["stall"]:
+            # workerهای گیرکرده رو بکش؛ آیتم‌های ناتمام تو راند بعدی retry می‌شن
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            tasks.clear()
+            state["alive"] = 0
+            return
         if state["abort"]:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            tasks.clear()
+            state["alive"] = 0
             raise asyncio.CancelledError()
 
     # ─── راند اصلی ───
+    stats_out["phase"] = "download"
     await _drain([(i, u) for i, (u, _d) in enumerate(segments)], SEG_RETRIES, True)
 
-    # ─── راند دوم: شانس آخر برای سگمنت‌های از دست رفته ───
+    # ─── راند دوم: شانس برای سگمنت‌های از دست رفته ───
     missing = [i for i, p in enumerate(seg_paths) if not p]
     if missing:
         logger.info("[SEG] 2nd chance: retrying %d missing segments", len(missing))
         state["abort"] = False
+        state["stall"] = False
         state["desired"] = max(1, min(SEGMENT_CONCURRENCY, SEG_CONCURRENCY_MAX))
+        stats_out["phase"] = "retry"
         await _drain([(i, segments[i][0]) for i in missing], 3, False)
 
-    if counters["failed"]:
-        logger.info("[SEG] finished with %d failed segments (of %d)", counters["failed"], total)
+    # ─── راند سوم (z17): سشن کاملاً تازه — کانکشن‌های خراب/گیرکرده دور ریخته می‌شن ───
+    missing = [i for i, p in enumerate(seg_paths) if not p]
+    if missing:
+        logger.info("[SEG] 3rd chance (fresh session): retrying %d missing segments", len(missing))
+        state["abort"] = False
+        state["stall"] = False
+        state["desired"] = max(2, min(8, SEGMENT_CONCURRENCY))
+        stats_out["phase"] = "retry2"
+        try:
+            async with AsyncSession(max_clients=SESSION_MAX_CLIENTS) as fresh:
+                state["session"] = fresh
+                await _drain([(i, segments[i][0]) for i in missing], 2, False)
+        finally:
+            state["session"] = None
+
+    missing = [i for i, p in enumerate(seg_paths) if not p]
+    stats_out["missing"] = len(missing)
+    stats_out["phase"] = "done"
+    if counters["failed"] or missing:
+        logger.info("[SEG] finished: %d failed / %d missing (of %d)",
+                    counters["failed"], len(missing), total)
 
 
 async def download_with_quality(
@@ -2094,8 +2172,20 @@ async def download_with_quality(
     if not valid_paths:
         raise RuntimeError("All segments failed to download")
 
+    # 🛡 z17: سگمنت ناقص = فایل خراب (دقیقاً «خراب میشه»ی کاربر!). موتور ۳ راند
+    # تلاش کرد (آخرینش با سشن کاملاً تازه)؛ اگه هنوز سگمنتی نیست یعنی منبع واقعاً
+    # لینک‌ها رو قطع کرده — به‌جای آپلود فایل خراب، خطای شفاف و قابل‌اقدام بده.
+    if missing:
+        miss_pct = len(missing) * 100.0 / max(1, total)
+        raise RuntimeError(
+            f"{len(missing)} سگمنت از {total} دانلود نشد ({miss_pct:.1f}٪) — "
+            "منبع قطع شده یا لینک منقضی شده. دوباره امتحان کن یا سرور/کیفیت دیگه‌ای انتخاب کن."
+        )
+
     out_path = os.path.join(out_dir, f"{int(time.time())}.mp4")
-    if not _concat_segments(valid_paths, out_path, init_path):
+    # 🛡 z17: concat حالا کاملاً async هست — دیگه موقع سوار کردن فیلمِ چندگیگ،
+    # event loop بات (و پیام‌های پیشرفت) فریز نمی‌شه
+    if not await _concat_segments_async(valid_paths, out_path, init_path):
         raise RuntimeError("ffmpeg concat failed")
 
     # پاک کردن سگمنت‌ها و init
@@ -2115,9 +2205,226 @@ async def download_with_quality(
     return out_path
 
 
+async def _concat_segments_async(seg_paths: List[str], out_path: str,
+                                 init_path: Optional[str] = None) -> bool:
+    """
+    🛡 z17: نسخه‌ی async کنکت — مشکل «تا آخر میره و ادامه نمیده» نیمه‌ی دومش اینجا بود:
+
+      - _concat_segments قدیمی subprocess.run بلاک‌کننده بود → کل event loop بات
+        (تلثون، پیام‌های پیشرفت، بقیه‌ی کاربرها) چند دقیقه فریز می‌شد
+      - binary concat با fin.read() تک‌ضربی → چند گیگ RAM و I/O بلاک‌کننده
+      - -movflags +faststart یعنی ffmpeg فایل رو دو بار می‌نویسه → روی فیلم ۲-۳ گیگی
+        زمان و دیسک زیاد می‌بره
+      - روش ۴ (re-encode) برای فیلم ۲ ساعته روی VPS ضعیف = ۱-۲ ساعت «هیچی نمی‌شه»
+
+    این نسخه:
+      - ffmpeg با create_subprocess_exec + wait_for (تایم‌اوت سخت، بدون بلاک شدن loop)
+      - کپی باینری chunk-به-chunk در thread جدا (RAM ثابت، loop آزاد)
+      - 🛡 گارد فضای دیسک: اگه جا برای روش باینری نیست، مستقیم می‌ره سراغ concat
+        demuxer؛ و اگه کلاً جا نیست، خطای شفاف فضای دیسک می‌ده (نه فایل خراب)
+      - re-encode پیش‌فرض خاموش (IMDB_ALLOW_REENCODE=1 برای فعال‌سازی)
+
+    Returns:
+        True اگه موفق، False در غیر این صورت. (خطای دیسک RuntimeError برمی‌گرده)
+    """
+    try:
+        has_init = init_path and os.path.exists(init_path)
+
+        # ─── محاسبه‌ی حجم ورودی + گارد فضای دیسک ───
+        total_in = 0
+        for p in ([init_path] if has_init else []) + list(seg_paths):
+            try:
+                if p and os.path.exists(p):
+                    total_in += os.path.getsize(p)
+            except OSError:
+                pass
+        try:
+            free = shutil.disk_usage(os.path.dirname(os.path.abspath(out_path))).free
+        except Exception:
+            free = None
+        # روش باینری (fMP4) به ~۲.۳ برابر حجم ورودی جا نیاز داره (combined + خروجی + faststart)
+        binary_ok = has_init and (free is None or free > total_in * 2.3)
+        if free is not None and free < total_in * 1.25 and total_in > 0:
+            raise RuntimeError(
+                f"فضای دیسک کمه: {free / 1073741824:.1f}GB آزاده ولی حداقل "
+                f"{total_in * 1.25 / 1073741824:.1f}GB لازمه (فیلم: {total_in / 1073741824:.1f}GB) — "
+                "فضای سرور رو خالی کن و دوباره امتحان کن."
+            )
+
+        async def _ffmpeg_run(cmd: List[str], timeout: float):
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                await proc.wait()
+                raise
+            return proc.returncode, (err or b"")
+
+        # ─── روش 1 (فقط برای fMP4 با init): binary concat + remux ───
+        if has_init and binary_ok:
+            combined_path = out_path + ".combined.mp4"
+            try:
+                def _binary_copy():
+                    # chunk-به-chunk در thread جدا — RAM ثابت، event loop آزاد
+                    with open(combined_path, "wb") as fout:
+                        for p in [init_path] + list(seg_paths):
+                            if p and os.path.exists(p):
+                                with open(p, "rb") as fin:
+                                    while True:
+                                        chunk = fin.read(1024 * 1024)
+                                        if not chunk:
+                                            break
+                                        fout.write(chunk)
+
+                await asyncio.to_thread(_binary_copy)
+
+                # remux با ffmpeg (تبدیل fragmented MP4 به MP4 استاندارد)
+                cmd1 = [
+                    "ffmpeg", "-y", "-i", combined_path,
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    out_path,
+                ]
+                rc1, err1 = await _ffmpeg_run(cmd1, 1800)
+                if rc1 == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    logger.info("concat succeeded (method 1: binary concat + remux for fMP4)")
+                    try:
+                        os.unlink(combined_path)
+                    except Exception:
+                        pass
+                    return True
+                # اگه fail شد، combined رو نگه نمی‌داریم — جایی رو اشغال نکنه
+                logger.warning("method 1 (binary concat) failed: %s",
+                               err1.decode("utf-8", errors="ignore")[:300])
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("method 1 (binary concat) exception: %s", e)
+            finally:
+                try:
+                    if os.path.exists(combined_path):
+                        os.unlink(combined_path)
+                except Exception:
+                    pass
+
+        # ─── روش 2+: concat demuxer (برای MPEG-TS) ───
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            for p in seg_paths:
+                if p and os.path.exists(p):
+                    p_escaped = p.replace("'", "'\\''")
+                    f.write(f"file '{p_escaped}'\n")
+            list_path = f.name
+
+        try:
+            cmd2 = [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", list_path,
+                "-c", "copy",
+                "-bsf:a", "aac_adtstoasc",
+                "-movflags", "+faststart",
+                out_path,
+            ]
+            rc2, _err2 = await _ffmpeg_run(cmd2, 1800)
+            if rc2 == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                logger.info("concat succeeded (method 2: concat demuxer + aac_adtstoasc)")
+                return True
+
+            # ─── روش 3: concat demuxer بدون bitstream filter ───
+            cmd3 = [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", list_path,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                out_path,
+            ]
+            rc3, _err3 = await _ffmpeg_run(cmd3, 1800)
+            if rc3 == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                logger.info("concat succeeded (method 3: concat demuxer copy only)")
+                return True
+
+            # ─── روش 5: مسیر مطلق (سریع — قبل از re-encode امتحان می‌شه) ───
+            try:
+                all_paths = []
+                if has_init:
+                    all_paths.append(init_path)
+                all_paths.extend([p for p in seg_paths if p and os.path.exists(p)])
+
+                with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f2:
+                    for p in all_paths:
+                        p_abs = os.path.abspath(p)
+                        p_escaped = p_abs.replace("'", "'\\''")
+                        f2.write(f"file '{p_escaped}'\n")
+                    list_path2 = f2.name
+
+                try:
+                    cmd5 = [
+                        "ffmpeg", "-y",
+                        "-f", "concat", "-safe", "0",
+                        "-i", list_path2,
+                        "-c", "copy",
+                        "-movflags", "+faststart",
+                        out_path,
+                    ]
+                    rc5, _err5 = await _ffmpeg_run(cmd5, 1800)
+                    if rc5 == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                        logger.info("concat succeeded (method 5: absolute paths + copy)")
+                        return True
+                finally:
+                    try:
+                        os.unlink(list_path2)
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("method 5 failed: %s", e)
+
+            # ─── روش 4: re-encode (fallback نهایی) ───
+            # 🛡 z17: برای فیلم ۲ ساعته روی VPS ضعیف ۱-۲ ساعت طول می‌کشه و شبیه
+            # «هیچی نمی‌شه» به نظر می‌رسه — فقط با IMDB_ALLOW_REENCODE=1 فعال می‌شه
+            if ALLOW_REENCODE:
+                cmd4 = [
+                    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                    "-i", list_path,
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart",
+                    out_path,
+                ]
+                rc4, err4 = await _ffmpeg_run(cmd4, 3600)
+                if rc4 == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    logger.info("concat succeeded (method 4: re-encode)")
+                    return True
+
+            logger.error("ffmpeg concat failed all methods (last: method 2 rc=%s)", rc2)
+            return False
+        finally:
+            try:
+                os.unlink(list_path)
+            except Exception:
+                pass
+    except RuntimeError:
+        # خطای شفاف (مثل فضای دیسک) — ببر بالا تا کاربر ببینه
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error("concat error: %s", e)
+        return False
+
+
 def _concat_segments(seg_paths: List[str], out_path: str, init_path: Optional[str] = None) -> bool:
     """
-    concat سگمنت‌ها با ffmpeg.
+    concat سگمنت‌ها با ffmpeg (نسخه‌ی قدیمی sync — دیگر توسط download_with_quality
+    استفاده نمی‌شه؛ نسخه‌ی async بالا جایگزینشه. برای سازگاری نگه داشته شده.)
 
     برای MPEG-TS (بدون init): از concat demuxer استفاده می‌شه.
     برای fMP4 (با init): ابتدا binary concat (init + segments)، سپس remux.

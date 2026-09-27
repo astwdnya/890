@@ -84,7 +84,7 @@ from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episod
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, get_persian_subtitle, get_server_info, embed_subtitle_soft
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
-BOT_BUILD = "z16"  # نشانگر نسخه — تو لاگ استارت باید z16 دیده بشه (موتور سگمنت تطبیقی)
+BOT_BUILD = "z17"  # نشانگر نسخه — تو لاگ استارت باید z17 دیده بشه (ضد فریز ۹۹٪: backstop + watchdog + concat async)
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -14801,6 +14801,12 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                     pct = d * 100 // t if t else 0
                     srv_short = server_info.get("server", "") if server_info else ""
                     srv_text = f" [{srv_short}]" if srv_short else ""
+                    # 🆕 z17: فاز موتور سگمنت (تلاش مجدد سگمنت‌های باقی‌مانده)
+                    _phase = seg_stats.get("phase") or ""
+                    if _phase == "retry":
+                        srv_text += " | 🔄 تلاش مجدد سگمنت‌ها"
+                    elif _phase == "retry2":
+                        srv_text += " | 🔄 تلاش مجدد (اتصال جدید)"
                     # 🆕 z16: سرعت + تعداد کانکشن موازی + زمان باقی‌مانده
                     speed_text = ""
                     mbps = seg_stats.get("mbps") or 0
@@ -14901,7 +14907,10 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                     except Exception:
                         pass
                     softsub_out = os.path.join(out_dir, f"softsub_{int(time.time())}.mp4")
-                    embedded = embed_subtitle_soft(video_path, persian_sub_path, softsub_out)
+                    # 🛡 z17: embed_subtitle_soft قبلاً subprocess.run بلاک‌کننده بود و
+                    # event loop رو حین remux فریز می‌کرد — حالا در thread جدا اجرا می‌شه
+                    embedded = await asyncio.to_thread(
+                        embed_subtitle_soft, video_path, persian_sub_path, softsub_out)
                     if embedded and os.path.exists(embedded):
                         final_path = embedded
                         if not sub_name:
