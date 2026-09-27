@@ -91,28 +91,37 @@ async def search_persian_subtitle(
             results = []
             # Find all subtitle list items
             for li in soup.select("li.item"):
-                # Iterate ALL <a> inside li to find the detail-page link
+                # لینک صفحه‌ی جزئیات: a.download یا هر a با الگوی /subtitles/{slug}/farsi_persian/{id}
                 detail_url = None
-                for a in li.find_all("a", href=True):
-                    href = a["href"]
-                    # Match: /subtitles/{slug}/farsi_persian/{id}
-                    if re.match(r"/subtitles/[^/]+/farsi_persian/\d+", href):
-                        detail_url = urljoin(_BASE, href)
-                        break
+                a_dl = li.select_one("a.download[href]")
+                if a_dl and re.match(r"/subtitles/[^/]+/farsi_persian/\d+", a_dl["href"]):
+                    detail_url = urljoin(_BASE, a_dl["href"])
+                if not detail_url:
+                    for a in li.find_all("a", href=True):
+                        href = a["href"]
+                        # Match: /subtitles/{slug}/farsi_persian/{id}
+                        if re.match(r"/subtitles/[^/]+/farsi_persian/\d+", href):
+                            detail_url = urljoin(_BASE, href)
+                            break
                 if not detail_url:
                     continue
-                # Find version text — usually 2nd <a> text or li .col1 .text-col
+                # 🆕 نسخه(های) واقعی — در ul.scrolllist داخل col-info هستن
+                # (پارسر قدیمی به‌اشتباه اسم آپلودر رو برمی‌داشت!)
                 version = ""
-                # Look for the version: usually in second <a> or in the listing text
-                all_a = li.find_all("a", href=True)
-                # Find text that's not just "Farsi/Persian"
-                for a in all_a:
-                    text = a.get_text(" ", strip=True)
-                    if text and "farsi" not in text.lower() and "persian" not in text.lower():
-                        version = text[:100]
-                        break
+                scroll = li.select_one("ul.scrolllist")
+                if scroll:
+                    parts = [x.get_text(" ", strip=True) for x in scroll.find_all("li")
+                             if x.get_text(strip=True)]
+                    version = " / ".join(parts[:3])[:120]
                 if not version:
-                    # Fallback: full li text
+                    # Fallback: متن لینک‌های غیر از Farsi/Persian
+                    for a in li.find_all("a", href=True):
+                        text = a.get_text(" ", strip=True)
+                        if text and "farsi" not in text.lower() and "persian" not in text.lower() \
+                           and not a["href"].startswith("/u/"):
+                            version = text[:100]
+                            break
+                if not version:
                     full_text = li.get_text(" ", strip=True)
                     version = full_text[:100]
                 # Find download count — span with just a number
@@ -365,6 +374,89 @@ async def get_subtitle_for_imdb(
                     slug, top.get("version", "?")[:50], top.get("downloads", 0))
         return await download_persian_subtitle(top["url"], out_dir)
     return None
+
+
+def _episode_match_score(version: str, season: int, episode: int) -> int:
+    """امتیاز تطابق نسخه با قسمت — ۰ = مچ دقیق SxxExx، ۵ = فقط فصل، ۱۰ = بدون مچ."""
+    v = (version or "").lower()
+    targets = [
+        f"s{season:02d}e{episode:02d}", f"s{season}e{episode}",
+        f"{season}x{episode:02d}", f"{season}x{episode}",
+        f"e{episode:02d}" if f"s{season:02d}" in v else f"s{season:02d}e{episode:02d}",
+    ]
+    for t in targets:
+        if t in v:
+            return 0
+    if f"season {season}" in v or f"s{season:02d}" in v or f"فصل {season}" in v:
+        return 5
+    return 10
+
+
+async def list_persian_subtitles(
+    title: str,
+    year: Optional[int] = None,
+    season: Optional[int] = None,
+    episode: Optional[int] = None,
+    max_candidates: int = 5,
+    timeout: int = 15,
+) -> List[dict]:
+    """
+    🆕 لیست کردن همه‌ی زیرنویس‌های فارسی یک عنوان از subf2m — بدون دانلود.
+
+    برای منوی انتخاب زیرنویس در ربات استفاده می‌شه؛ کاربر هر نسخه‌ای
+    که خواست انتخاب می‌کنه (مثلاً نسخه‌ی مچ با S02E03).
+
+    Returns:
+        لیست dict ها (همون ساختار search_persian_subtitle) + فیلد «match»:
+        ۰ = مچ دقیق SxxExx (فقط وقتی season/episode داده شده)، مرتب‌شده:
+        اول مچ‌های دقیق، بعد بیشترین دانلود.
+    """
+    base_slug = _slugify(title)
+    if not base_slug:
+        return []
+
+    candidates = [base_slug]
+    if year:
+        candidates.append(f"{base_slug}-{year}")
+    if season:
+        ordinal = _ORDINAL_SEASONS.get(season)
+        if ordinal:
+            candidates.append(f"{base_slug}-{ordinal}-season")
+        candidates.append(f"{base_slug}-season-{season}")
+        candidates.append(f"{base_slug}-s{season:02d}")
+
+    def _rank(results: List[dict]) -> List[dict]:
+        if season and episode:
+            for r in results:
+                r["match"] = _episode_match_score(r.get("version", ""), season, episode)
+            results.sort(key=lambda x: (x["match"], -x["downloads"]))
+        else:
+            for r in results:
+                r["match"] = 0
+        return results
+
+    tried = set()
+    # ۱) اسلاگ‌های مستقیم
+    for slug in candidates[:max_candidates]:
+        if not slug or slug in tried:
+            continue
+        tried.add(slug)
+        results = await search_persian_subtitle(slug, timeout=timeout)
+        if results:
+            logger.info("subf2m list: %d entries via slug '%s'", len(results), slug)
+            return _rank(results)
+    # ۲) جستجوی عنوان (برای سریال‌ها با اسلاگ خاص مثل adults-first-season)
+    slugs = await _search_by_title(title, timeout=timeout)
+    for slug in slugs[:3]:
+        if slug in tried:
+            continue
+        tried.add(slug)
+        results = await search_persian_subtitle(slug, timeout=timeout)
+        if results:
+            logger.info("subf2m list: %d entries via searchbytitle slug '%s'", len(results), slug)
+            return _rank(results)
+    logger.info("subf2m list: no Persian subtitles found for '%s'", title)
+    return []
 
 
 # ═══════════════════════════════════════════════════════════
