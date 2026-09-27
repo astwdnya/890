@@ -83,8 +83,8 @@ if _searcher_imdb_dir not in _sys.path:
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, get_persian_subtitle, get_server_info, embed_subtitle_soft
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
-from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست کامل زیرنویس‌ها + دانلود انتخابی کاربر
-BOT_BUILD = "z14"  # نشانگر نسخه — تو لاگ استارت باید z14 دیده بشه
+from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
+BOT_BUILD = "z15"  # نشانگر نسخه — تو لاگ استارت باید z15 دیده بشه
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -14336,12 +14336,14 @@ async def _imdb_show_sub_menu(event, state, is_episode: bool):
     if subs:
         parts.append(f"📄 OpenSubtitles: {len(subs)} زیرنویس")
     if fsubs:
-        m = sum(1 for f in fsubs if f.get("match") == 0)
-        parts.append(f"🌐 آرشیو subf2m: {len(fsubs)} زیرنویس" + (f" (✅ {m} تا مچ دقیق همین قسمت)" if m else ""))
+        # 🆕 لیست subf2m فقط مچ دقیق همین قسمت رو شامل می‌شه (فیلتر SxxEyy)
+        parts.append(f"🌐 آرشیو subf2m: {len(fsubs)} زیرنویس مچ دقیق همین قسمت")
     if parts:
         sub_count_text = "\n".join(parts) + "\n\n👇 زیرنویس موردنظر رو انتخاب کن:"
     else:
-        sub_count_text = "❌ هیچ زیرنویس فارسی پیدا نشد — می‌تونی «زیرنویس خودکار» رو امتحان کنی:"
+        ep_tag = f" برای S{season:02d}E{episode:02d}" if (season and episode) else ""
+        sub_count_text = (f"❌ هیچ زیرنویس فارسی مچ دقیق{ep_tag} پیدا نشد — "
+                          f"می‌تونی «زیرنویس خودکار» رو امتحان کنی:")
     await event.edit(
         f"✅ کیفیت: **{quality_label}** | 🖥 سرور: **{srv}**\n\n📝 زیرنویس فارسی:\n{sub_count_text}",
         buttons=_imdb_sub_buttons(subs, is_episode, fsubs=fsubs),

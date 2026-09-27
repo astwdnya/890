@@ -356,19 +356,21 @@ async def get_subtitle_for_imdb(
         results = await search_persian_subtitle(slug)
         if not results:
             continue
-        # If series and we have season/episode, try to find a version matching "SxxExx"
         if season and episode:
-            target = f"S{season:02d}E{episode:02d}".lower()
-            target_loose = f"S{season}E{episode}".lower()
-            target_persian = f"قسمت {episode}"
-            # Prefer version matching SxxExx
-            for r in results:
-                ver = r.get("version", "").lower()
-                if target in ver or target_loose in ver or target_persian in ver:
-                    logger.info("subf2m: matched S%02dE%02d in '%s'",
-                               season, episode, r.get("version", "")[:50])
-                    return await download_persian_subtitle(r["url"], out_dir)
-        # Pick the most-downloaded one
+            # 🆕 فقط مچ دقیق همین قسمت — اگه نبود، نسخه‌ی اشتباه دانلود نشه
+            pinned = _slug_pins_season(slug)
+            matched = [r for r in results
+                       if _episode_match_score(r.get("version", ""), season, episode,
+                                               season_pinned=pinned) == 0]
+            matched.sort(key=lambda x: -x.get("downloads", 0))
+            if matched:
+                logger.info("subf2m: exact S%02dE%02d match in '%s' → %s",
+                            season, episode, slug, matched[0].get("version", "")[:50])
+                return await download_persian_subtitle(matched[0]["url"], out_dir)
+            logger.info("subf2m: '%s' has %d subs but no exact S%02dE%02d match → next slug",
+                        slug, len(results), season, episode)
+            continue
+        # فیلم: پربازدیدترین
         top = results[0]
         logger.info("subf2m: best match for '%s' = %s (downloads=%d)",
                     slug, top.get("version", "?")[:50], top.get("downloads", 0))
@@ -376,20 +378,51 @@ async def get_subtitle_for_imdb(
     return None
 
 
-def _episode_match_score(version: str, season: int, episode: int) -> int:
-    """امتیاز تطابق نسخه با قسمت — ۰ = مچ دقیق SxxExx، ۵ = فقط فصل، ۱۰ = بدون مچ."""
-    v = (version or "").lower()
-    targets = [
-        f"s{season:02d}e{episode:02d}", f"s{season}e{episode}",
-        f"{season}x{episode:02d}", f"{season}x{episode}",
-        f"e{episode:02d}" if f"s{season:02d}" in v else f"s{season:02d}e{episode:02d}",
+_PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def _episode_match_score(version: str, season: int, episode: int,
+                         season_pinned: bool = False) -> int:
+    """امتیاز تطابق نسخه با قسمت — ۰ = مچ دقیق همین قسمت، ۵ = فقط فصل، ۱۰ = بدون مچ.
+
+    season_pinned: اگه اسلاگ صفحه خودش فصل رو مشخص کرده (مثل adults-season-2)،
+    «قسمت 3» بدون ذکر فصل هم مچ دقیق حساب می‌شه.
+    """
+    v = (version or "").lower().translate(_PERSIAN_DIGITS)
+    v = re.sub(r"[._\-–—:]+", " ", v)  # جداکننده‌های رایج → فاصله
+    sea = rf"0?{int(season)}"
+    ep = rf"0?{int(episode)}"
+    # ۱) مچ دقیق: s02e03 / s2e3 / 2x03 / season 2 episode 3 / فصل 2 قسمت 3
+    exact = [
+        rf"\bs{sea}\s*e{ep}(?!\d)",
+        rf"\b{sea}x{ep}(?!\d)",
+        rf"season\s*{sea}\s*episode\s*{ep}(?!\d)",
+        rf"فصل\s*{sea}\s*قسمت\s*{ep}(?!\d)",
     ]
-    for t in targets:
-        if t in v:
+    for p in exact:
+        if re.search(p, v):
             return 0
-    if f"season {season}" in v or f"s{season:02d}" in v or f"فصل {season}" in v:
+    # ۲) فصل و قسمت جدا از هم (مثلاً «S02» + «E03» یا «فصل 2 - قسمت 3»)
+    has_season = re.search(rf"\bs{sea}(?!\d)|season\s*{sea}(?!\d)|فصل\s*{sea}(?!\d)", v)
+    has_ep = re.search(rf"\be{ep}(?!\d)|episode\s*{ep}(?!\d)|قسمت\s*{ep}(?!\d)", v)
+    if has_season and has_ep:
+        return 0
+    if season_pinned and has_ep:
+        return 0  # صفحه‌ی فصل مشخصه → «قسمت 3» یعنی همین فصل
+    if has_season:
         return 5
     return 10
+
+
+def _slug_pins_season(slug: str) -> bool:
+    """آیا اسلاگ صفحه‌ی subf2m خودش فصل رو مشخص کرده؟ (مثل adults-season-2)"""
+    s = (slug or "").lower()
+    if re.search(r"-season-\d+", s) or re.search(r"-s\d{1,2}$", s):
+        return True
+    for ordinal in _ORDINAL_SEASONS.values():
+        if f"-{ordinal}-season" in s:
+            return True
+    return False
 
 
 async def list_persian_subtitles(
@@ -425,14 +458,18 @@ async def list_persian_subtitles(
         candidates.append(f"{base_slug}-season-{season}")
         candidates.append(f"{base_slug}-s{season:02d}")
 
-    def _rank(results: List[dict]) -> List[dict]:
+    def _rank(results: List[dict], season_pinned: bool = False) -> List[dict]:
         if season and episode:
             for r in results:
-                r["match"] = _episode_match_score(r.get("version", ""), season, episode)
-            results.sort(key=lambda x: (x["match"], -x["downloads"]))
-        else:
-            for r in results:
-                r["match"] = 0
+                r["match"] = _episode_match_score(r.get("version", ""), season, episode,
+                                                  season_pinned=season_pinned)
+            # 🆕 فقط مچ دقیق همین قسمت — کاربر اشتباهی ساب قسمت دیگه انتخاب نکنه
+            exact = [r for r in results if r["match"] == 0]
+            exact.sort(key=lambda x: -x["downloads"])
+            return exact
+        for r in results:
+            r["match"] = 0
+        results.sort(key=lambda x: -x["downloads"])
         return results
 
     tried = set()
@@ -442,9 +479,15 @@ async def list_persian_subtitles(
             continue
         tried.add(slug)
         results = await search_persian_subtitle(slug, timeout=timeout)
-        if results:
-            logger.info("subf2m list: %d entries via slug '%s'", len(results), slug)
-            return _rank(results)
+        if not results:
+            continue
+        ranked = _rank(results, season_pinned=_slug_pins_season(slug))
+        if ranked:
+            logger.info("subf2m list: %d exact entries via slug '%s'", len(ranked), slug)
+            return ranked
+        if season and episode:
+            logger.info("subf2m list: slug '%s' had %d subs but none matched S%02dE%02d → next slug",
+                        slug, len(results), season, episode)
     # ۲) جستجوی عنوان (برای سریال‌ها با اسلاگ خاص مثل adults-first-season)
     slugs = await _search_by_title(title, timeout=timeout)
     for slug in slugs[:3]:
@@ -452,10 +495,17 @@ async def list_persian_subtitles(
             continue
         tried.add(slug)
         results = await search_persian_subtitle(slug, timeout=timeout)
-        if results:
-            logger.info("subf2m list: %d entries via searchbytitle slug '%s'", len(results), slug)
-            return _rank(results)
-    logger.info("subf2m list: no Persian subtitles found for '%s'", title)
+        if not results:
+            continue
+        ranked = _rank(results, season_pinned=_slug_pins_season(slug))
+        if ranked:
+            logger.info("subf2m list: %d exact entries via searchbytitle slug '%s'", len(ranked), slug)
+            return ranked
+    if season and episode:
+        logger.info("subf2m list: no exact S%02dE%02d Persian subtitle found for '%s'",
+                    season, episode, title)
+    else:
+        logger.info("subf2m list: no Persian subtitles found for '%s'", title)
     return []
 
 
