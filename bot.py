@@ -81,8 +81,9 @@ _searcher_imdb_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
 if _searcher_imdb_dir not in _sys.path:
     _sys.path.insert(0, _searcher_imdb_dir)
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
-from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, download_with_quality, get_persian_subtitle, get_server_info, embed_subtitle_soft
-from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES  # 🆕 پروب موازی همه‌ی سرورها (منوی سرور/کیفیت)
+from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, get_persian_subtitle, get_server_info, embed_subtitle_soft
+from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
+BOT_BUILD = "z11"  # نشانگر نسخه — تو لاگ استارت باید z11 دیده بشه
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -22757,7 +22758,7 @@ async def main():
     await _load_admins()
     _load_user_settings()
 
-    logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id})")
+    logger.info(f"[BOOT] Bot connected as @{me.username} (id={me.id}) | build={BOT_BUILD}")
     logger.info(f"[BOOT] Authorized users: {AUTHORIZED_USERS}")
     logger.info(
         f"[BOOT] admin-ids persist: {ADMINS_REPO}/{ADMINS_FILE} (branch {ADMINS_BRANCH})"
