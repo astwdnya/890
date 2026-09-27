@@ -83,7 +83,7 @@ if _searcher_imdb_dir not in _sys.path:
 from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episodes
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, get_persian_subtitle, get_server_info, embed_subtitle_soft
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
-BOT_BUILD = "z12"  # نشانگر نسخه — تو لاگ استارت باید z12 دیده بشه
+BOT_BUILD = "z13"  # نشانگر نسخه — تو لاگ استارت باید z13 دیده بشه
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -14779,6 +14779,7 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                         season=season,
                         episode=episode,
                         out_dir=sub_out_dir,
+                        title=title,
                     )
                 else:
                     persian_sub_path = sub_path
@@ -14891,6 +14892,7 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                         season=season,
                         episode=episode,
                         out_dir=sub_out_dir,
+                        title=title,
                     )
                     if persian_sub_path and os.path.exists(persian_sub_path):
                         sub_size_kb = os.path.getsize(persian_sub_path) / 1024

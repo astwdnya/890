@@ -2046,6 +2046,7 @@ async def get_persian_subtitle(
     season: Optional[int] = None,
     episode: Optional[int] = None,
     out_dir: Optional[str] = None,
+    title: Optional[str] = None,
 ) -> Optional[str]:
     """
     گرفتن زیرنویس فارسی از چندین منبع.
@@ -2145,8 +2146,102 @@ async def get_persian_subtitle(
     except Exception as e:
         logger.debug("videasy subs failed: %s", e)
 
+    # ─── Source 4: subf2m.co (بزرگ‌ترین آرشیو زیرنویس فارسی — mirror Subscene) ──
+    # ماژول آماده‌ی ریپو (subf2m_subtitle) تا حالا به هیچ‌جایی وصل نبود —
+    # الان به عنوان منبع چهارم به زنجیره وصل شد. برای پیدا شدنش title لازمه.
+    if title:
+        try:
+            try:
+                from subf2m_subtitle import get_subtitle_for_imdb
+            except ImportError:
+                from searcher.imdb.subf2m_subtitle import get_subtitle_for_imdb
+            srt_path = await get_subtitle_for_imdb(
+                imdb_id, title, season=season, episode=episode, out_dir=out_dir,
+            )
+            if srt_path and os.path.exists(srt_path):
+                logger.info("Found Persian subtitle on subf2m: %s", srt_path)
+                return srt_path
+        except Exception as e:
+            logger.debug("subf2m failed: %s", e)
+
+    # ─── Source 5: podnapisi.net (آرشیو رسمی چندزبانه با API) ──
+    try:
+        p_path = await _podnapisi_persian(imdb_id, season, episode, out_dir)
+        if p_path and os.path.exists(p_path):
+            logger.info("Found Persian subtitle on podnapisi: %s", p_path)
+            return p_path
+    except Exception as e:
+        logger.debug("podnapisi failed: %s", e)
+
     logger.info("No Persian subtitle found for %s", imdb_id)
     return None
+
+
+def _srt_from_zip_bytes(content: bytes, out_dir: Optional[str], imdb_id: str,
+                        source: str) -> Optional[str]:
+    """استخراج اولین SRT از ZIP زیرنویس + تبدیل به UTF-8."""
+    import io
+    import zipfile as _zipfile
+    if not out_dir:
+        out_dir = "/tmp"
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        zf = _zipfile.ZipFile(io.BytesIO(content))
+    except Exception:
+        return None
+    srt_names = [n for n in zf.namelist() if n.lower().endswith(".srt")]
+    if not srt_names:
+        return None
+    raw = zf.read(srt_names[0])
+    decoded = None
+    try:
+        decoded = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        for enc in ("windows-1256", "cp1256", "iso-8859-6"):
+            try:
+                cand = raw.decode(enc)
+                if any(c in cand for c in "یوره"):
+                    decoded = cand
+                    break
+            except UnicodeDecodeError:
+                continue
+        if decoded is None:
+            decoded = raw.decode("utf-8", errors="replace")
+    out_path = os.path.join(out_dir, f"{imdb_id}_{source}_persian.srt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(decoded)
+    return out_path
+
+
+async def _podnapisi_persian(imdb_id: str, season: Optional[int],
+                             episode: Optional[int],
+                             out_dir: Optional[str]) -> Optional[str]:
+    """زیرنویس فارسی از podnapisi.net — API رسمی (همون که Sonarr/Radarr استفاده می‌کنن)."""
+    imdb_num = imdb_id.replace("tt", "") if imdb_id.startswith("tt") else imdb_id
+    payload = {"languages": ["fa"], "imdbId": int(imdb_num)}
+    if season and episode:
+        payload["seasons"] = [int(season)]
+        payload["episodes"] = [int(episode)]
+    async with AsyncSession() as s:
+        r = await s.post("https://api.podnapisi.net/v2/subtitles/search/pairs",
+                         json=payload, timeout=12,
+                         headers={"User-Agent": _USER_AGENT})
+        if r.status_code != 200:
+            return None
+        results = (r.json() or {}).get("results") or []
+        if not results:
+            return None
+        results.sort(key=lambda x: int(x.get("downloads", 0) or 0), reverse=True)
+        page_url = results[0].get("url", "") or ""
+        m = re.search(r"/subtitles/(\d+)", page_url)
+        if not m:
+            return None
+        zip_url = f"https://www.podnapisi.net/subtitles/{m.group(1)}/download"
+        r2 = await s.get(zip_url, timeout=25, allow_redirects=True,
+                         headers={"User-Agent": _USER_AGENT})
+        if r2.status_code != 200 or r2.content[:4] != b"PK\x03\x04":
+            return None
+        return _srt_from_zip_bytes(r2.content, out_dir, imdb_id, "podnapisi")
 
 
 async def _download_subtitle_file(url: str, out_dir: Optional[str], imdb_id: str, source: str) -> Optional[str]:

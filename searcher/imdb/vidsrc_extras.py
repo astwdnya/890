@@ -48,30 +48,6 @@ _USER_AGENT = (
 # ═══════════════════════════════════════════════════════════
 
 
-async def get_server_qualities(
-    imdb_id: str,
-    season: Optional[int] = None,
-    episode: Optional[int] = None,
-) -> List[dict]:
-    """
-    پروب «سروربه‌سرور» — برای منوی انتخاب سرور.
-
-    خروجی: لیستی (به ترتیب اولویت سرورها) از dict:
-      - server: نام سرور
-      - stream_type: "hls" یا "mp4"
-      - auto_url: استریم پایه
-      - qualities: {label_lower: {"label","url","resolution","bandwidth"}}
-      - quality_list: همون مقادیر مرتب‌شده نزولی
-    نتیجه ۱۰ دقیقه کش می‌شه (مشترک با get_qualities).
-    """
-    try:
-        from imdbplay_downloader import get_server_qualities as _new_srvq
-        return await _new_srvq(imdb_id, season, episode)
-    except Exception as e:
-        logger.error("get_server_qualities via imdbplay failed: %s", e)
-        return []
-
-
 async def get_qualities(
     imdb_id: str,
     season: Optional[int] = None,
@@ -119,51 +95,20 @@ async def download_with_quality(
     season: Optional[int] = None,
     episode: Optional[int] = None,
     progress_cb=None,
-    preferred_server: Optional[str] = None,
 ) -> Optional[str]:
     """
     دانلود ویدیو با کیفیت مشخص از سرورهای imdbplay.tech.
 
     quality_label="Auto" → بهترین کیفیت
     quality_label="720p" → کیفیت 720p (اگه نباشه، نزدیک‌ترین)
-    preferred_server → سرور انتخابی کاربر (مثل "CastleTV") اول امتحان می‌شه؛
-    اگه شکست خورد زنجیره عادی فالباک ادامه پیدا می‌کنه.
-
-    لایه‌های fallback:
-      1. سرورهای imdbplay (Vidzee, Videasy, Vidking, 2Embed, GarageBand)
-         + fallback داخلی بین variantها و ۲ دور تلاش
-      2. دانلودر مستقل vidsrcme.ru (vidsrc_downloader) — وقتی همه سرورهای
-         imdbplay از دسترس خارج باشن (مثلاً API 502 یا CDN خراب)
     """
     try:
         from imdbplay_downloader import download_with_quality as _new_download
-        result = await _new_download(
-            imdb_id, quality_label, out_dir, season, episode,
-            progress_cb=progress_cb, preferred_server=preferred_server,
-        )
-        if result:
-            return result
-        logger.warning("download_with_quality via imdbplay returned None — trying vidsrcme fallback")
-    except Exception as e:
-        logger.warning("download_with_quality via imdbplay failed: %s — trying vidsrcme fallback", e)
-
-    # ─── Fallback: دانلودر مستقل vidsrcme.ru ───
-    try:
-        from vidsrc_downloader import download_episode as _vd_episode
-        from vidsrc_downloader import download_movie as _vd_movie
-        quality = "best" if (not quality_label or quality_label.lower() == "auto") else quality_label
-        logger.info("[VidsrcExtras] vidsrcme fallback: quality=%s season=%s episode=%s",
-                    quality, season, episode)
-        if season and episode:
-            return await _vd_episode(
-                imdb_id, season, episode,
-                out_dir=out_dir, quality=quality, progress_cb=progress_cb,
-            )
-        return await _vd_movie(
-            imdb_id, out_dir=out_dir, quality=quality, progress_cb=progress_cb,
+        return await _new_download(
+            imdb_id, quality_label, out_dir, season, episode, progress_cb=progress_cb
         )
     except Exception as e:
-        logger.error("vidsrcme fallback also failed: %s", e)
+        logger.error("download_with_quality via imdbplay failed: %s", e)
         raise
 
 
@@ -172,6 +117,7 @@ async def get_persian_subtitle(
     season: Optional[int] = None,
     episode: Optional[int] = None,
     out_dir: Optional[str] = None,
+    title: Optional[str] = None,
 ) -> Optional[str]:
     """
     گرفتن زیرنویس فارسی از سرورهای imdbplay.
@@ -186,7 +132,7 @@ async def get_persian_subtitle(
     """
     try:
         from imdbplay_downloader import get_persian_subtitle as _new_get_sub
-        return await _new_get_sub(imdb_id, season=season, episode=episode, out_dir=out_dir)
+        return await _new_get_sub(imdb_id, season=season, episode=episode, out_dir=out_dir, title=title)
     except Exception as e:
         logger.error("get_persian_subtitle via imdbplay failed: %s", e)
         return None
