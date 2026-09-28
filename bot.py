@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z21"  # نشانگر نسخه — تو لاگ استارت باید z21 دیده بشه (سرور FJ 🇮🇷 = tdmmo.xyz با اکانت + کپچای ریاضی خودکار، همزمان با سرچ عادی پروب می‌شه)
+BOT_BUILD = "z22"  # نشانگر نسخه — تو لاگ استارت باید z22 دیده بشه (🆕 z22: فیکس کرش iran_hints → منابع 🇮🇷 (FJ/فیلمجو + f2m/doost/farsi) حالا تو پروب IMDB لود می‌شن + سرچر دیفالت = IMDB)
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -770,7 +770,7 @@ sponsors: list = []  # هر آیتم: {"name": str, "chat_id": str, "link": str}
 pending_sponsor_name: Dict[int, str] = {}  # مرحله اول اضافه کردن اسپانسر
 
 # ── Default search engine per user ──
-USER_DEFAULT_SEARCH: Dict[int, str] = {}  # user_id -> "ph"|"xv"|"ep"|"xn"  (default: "ph")
+USER_DEFAULT_SEARCH: Dict[int, str] = {}  # user_id -> "ph"|"xv"|"ep"|"xn"  (default: "imd" ← 🆕 z22)
 USER_SETTINGS_FILE = "user_settings.json"
 
 def _load_user_settings():
@@ -791,7 +791,9 @@ def _save_user_settings():
         logger.warning(f"[SETTINGS] Error saving user settings: {e}")
 
 def get_user_default_search(user_id: int) -> str:
-    return USER_DEFAULT_SEARCH.get(user_id, "ph")
+    # 🆕 z22 — دیفالت سرچر IMDB هست (قبلاً PornHub بود)
+    # کاربرایی که قبلاً با /setsearch صریحاً انتخاب کردن، همون انتخاب براشون می‌مونه
+    return USER_DEFAULT_SEARCH.get(user_id, "imd")
 
 def set_user_default_search(user_id: int, source: str):
     USER_DEFAULT_SEARCH[user_id] = source
@@ -13872,7 +13874,7 @@ async def setsearch_cmd(event):
         [Button.inline(f"{'✅ ' if current == k else ''}{v}", f"setsearch_{k}") for k, v in labels.items()]
     ]
     await event.reply(
-        f"🔍 **Default Search Engine**\n\nCurrent: **{labels.get(current, 'PornHub')}**\n\nChoose your default search engine for inline queries without prefix:",
+        f"🔍 **Default Search Engine**\n\nCurrent: **{labels.get(current, 'IMDB')}**\n\nChoose your default search engine for inline queries without prefix:",
         parse_mode="markdown",
         buttons=buttons,
     )

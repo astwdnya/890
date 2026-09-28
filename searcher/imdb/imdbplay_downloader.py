@@ -125,6 +125,29 @@ _VM_HEADERS = {
 # کش هاست‌ها: key = "tt..|sSeE" یا "tt..|movie" → {name: entry}
 _VIDSRCME_CACHE = {}
 
+# 🆕 z22 کش منابع ایرانی (FJ 🇮🇷 / Film2Movie / دوستی‌ها / فارسی‌لند):
+# key = _vm_key(...) → {server_name: entry} — تا download_with_quality بتونه
+# بعد از انتخاب کاربر مستقیم از کش برداره (همون الگوی _VIDSRCME_CACHE)
+_IRAN_CACHE = {}
+_IRAN_CACHE_MAX = 48
+
+
+def _iran_cache_put(key: str, entries: list) -> None:
+    """ذخیره‌ی entry های ایرانی در کش (بدون بازنویسی entry های قبلی همین key)."""
+    if not entries:
+        return
+    bucket = _IRAN_CACHE.setdefault(key, {})
+    for e in entries:
+        nm = e.get("server") or "FJ"
+        bucket[nm] = e
+    if len(_IRAN_CACHE) > _IRAN_CACHE_MAX:
+        for k in list(_IRAN_CACHE.keys())[:-_IRAN_CACHE_MAX]:
+            _IRAN_CACHE.pop(k, None)
+
+
+def _iran_cache_get(key: str) -> dict:
+    return _IRAN_CACHE.get(key, {})
+
 
 def _vm_key(imdb_id: str, season=None, episode=None) -> str:
     imdb_id = imdb_id if imdb_id.startswith("tt") else f"tt{imdb_id}"
@@ -946,6 +969,9 @@ async def _garageband_get_stream(imdb_id: str, season: Optional[int], episode: O
 async def _get_stream_for_server(server: dict, tmdb_id: str, imdb_id: str, season: Optional[int], episode: Optional[int]) -> Optional[dict]:
     """گرفتن stream info از یک سرور خاص."""
     sid = server["id"]
+    if sid == "ir":  # 🆕 z22 منابع ایرانی (FJ 🇮🇷 / Film2Movie / ...) — از کشِ پروب
+        return _iran_cache_get(_vm_key(imdb_id, season, episode)).get(
+            server.get("ir_name") or server.get("name", ""))
     if sid == "vm":  # 🆕 هاست‌های vidsrcme (مثل Castletv) — از کشِ پروب
         return _VIDSRCME_CACHE.get(_vm_key(imdb_id, season, episode), {}).get(
             server.get("vm_name") or server.get("name", ""))
@@ -980,6 +1006,12 @@ async def _get_first_working_stream(tmdb_id: str, imdb_id: str, season: Optional
             logger.warning("[IMDBPlay] ✗ Server %s exception: %s", server["name"], e)
             continue
     logger.error("[IMDBPlay] All servers failed for tmdb=%s imdb=%s", tmdb_id, imdb_id)
+    # 🆕 z22 — آخرین شانس: entry های ایرانی کش‌شده (FJ 🇮🇷 / Film2Movie / ...)
+    # برای عناوین ایرانی که فقط منابع ایرانی دارن، Auto هم باید کار کنه.
+    for _nm, _e in _iran_cache_get(_vm_key(imdb_id, season, episode)).items():
+        if _e.get("url"):
+            logger.info("[IMDBPlay] ✓ Iran server %s (cached) succeeded", _nm)
+            return _e
     return None
 
 
@@ -1319,16 +1351,26 @@ async def get_qualities(imdb_id: str, season: Optional[int] = None, episode: Opt
 # ═══════════════════════════════════════════════════════════
 
 
-async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, episode: Optional[int] = None) -> List[dict]:
+async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, episode: Optional[int] = None,
+                                   iran_hints: Optional[dict] = None) -> List[dict]:
     """
     🆕 پروب موازی همه‌ی سرورها → لیست کیفیت‌های هر سرور (برای منوی انتخاب سرور).
 
     برخلاف get_qualities که با اولین سرورِ چندکیفیتی متوقف میشه، این تابع
     همه‌ی سرورها رو امتحان می‌کنه تا کاربر ببینه کدوم سرور چه کیفیتی داره.
 
+    🆕 z22 — iran_hints: خروجی _imdb_iran_hints از bot.py
+        ({"names": [EN, FA...], "year": int, "is_series": bool})
+        اگه داده بشه، منابع ایرانی (FJ 🇮🇷 = tdmmo/فیلمجو + Film2Movie +
+        دوستی‌ها + فارسی‌لند) «همزمان» با سرورهای CDN پروب می‌شن و entry هاشون
+        با فلگ iran=True اول لیست می‌شینه (دانلود مستقیم MP4/MKV، بدون هات‌لینک).
+        این همون فیکسِ کرش «TypeError: ... unexpected keyword argument
+        'iran_hints'» هست که باعث می‌شد منو تا ابد رو «⏳ در حال بررسی سرورها...»
+        گیر کنه و هیچ سروری — حتی قدیمی‌ها — لود نشه.
+
     Returns:
         لیست dict:
-        - server: نام سرور (Vidzee/Videasy/Vidking/2Embed/GarageBand)
+        - server: نام سرور (FJ 🇮🇷/Film2Movie/... یا Vidzee/Videasy/Vidking/2Embed/GarageBand)
         - type: "hls" یا "mp4"
         - headers: هدرهای لازم برای دانلود
         - url: آدرس stream اصلی
@@ -1344,6 +1386,32 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
     if not tmdb_id:
         logger.error("Cannot resolve tmdb_id for %s", imdb_id)
         return []
+
+    # 🆕 z22 — پروب منابع ایرانی (با عایق خطا؛ هیچ‌وقت فلوی اصلی رو نمی‌شکنه)
+    async def _iran_probe() -> list:
+        hints = iran_hints if isinstance(iran_hints, dict) else {}
+        names = [str(n).strip() for n in (hints.get("names") or [])
+                 if n and len(str(n).strip()) >= 2][:4]
+        if not names:
+            return []
+        try:
+            from searcher.iranserver.iranhub import probe_iran_sources
+            entries = await probe_iran_sources(
+                imdb_id, names, hints.get("year"),
+                bool(hints.get("is_series")),
+                season=season, episode=episode, timeout=12.0,
+            )
+            entries = [e for e in (entries or []) if e and e.get("url")]
+            if entries:
+                _iran_cache_put(_vm_key(imdb_id, season, episode), entries)
+                logger.info("[IMDBPlay] iran sources %s → %d entry(ies): %s",
+                            imdb_id, len(entries),
+                            [(e.get("server"), [q.get("label") for q in e.get("qualities", [])])
+                             for e in entries])
+            return entries
+        except Exception as e:
+            logger.warning("[IMDBPlay] iran probe failed (non-fatal): %s", e)
+            return []
 
     async def _probe(server: dict, round_no: int = 1) -> Optional[dict]:
         try:
@@ -1446,11 +1514,14 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
                     results[i] = next(retry_iter)
         return results
 
-    results, vm_entries = await asyncio.gather(
+    # 🆕 z22 — منابع ایرانی همزمان با CDN + vidsrcme پروب می‌شن (صفر تاخیر اضافه)
+    results, vm_entries, iran_entries = await asyncio.gather(
         _servers_probe(),
         _probe_vidsrcme_hosts(imdb_id, season, episode),
+        _iran_probe(),
     )
-    entries = [r for r in results if r] + list(vm_entries or [])
+    # اول منابع ایرانی (لینک مستقیم، بدون هات‌لینک) بعد CDN بعد vidsrcme
+    entries = list(iran_entries or []) + [r for r in results if r] + list(vm_entries or [])
     logger.info("[IMDBPlay] get_all_server_qualities %s → %d server(s): %s",
                 imdb_id, len(entries),
                 [(e["server"], [q["label"] for q in e["qualities"]]) for e in entries])
@@ -1773,6 +1844,55 @@ async def _hls_segment_engine(
                     counters["failed"], len(missing), total)
 
 
+async def _download_direct_entry(entry: dict, out_dir: str,
+                                 progress_cb: Optional[Callable[[int, int], None]] = None) -> Optional[str]:
+    """🆕 z22 — دانلود مستقیم یک entry منبع ایرانی (MP4/MKV) از کش پروب.
+
+    برای مسیر «Auto + سرور انتخابی» استفاده می‌شه؛ اگه دانلود شکست None
+    برمی‌گردونه تا فلوی عادی CDN ادامه پیدا کنه (هیچ‌وقت کل دانلود رو نمی‌شکنه).
+    """
+    url = entry.get("url") or ""
+    if not url:
+        return None
+    headers = {"User-Agent": _USER_AGENT}
+    headers.update(entry.get("headers") or {})
+    _ext = ".mp4"
+    _m_ext = re.search(r"\.(mp4|mkv|avi|mov)(?:[?#]|$)", url.lower())
+    if _m_ext:
+        _ext = _m_ext.group(1)
+    out_path = os.path.join(out_dir, f"{int(time.time())}{_ext}")
+    try:
+        async with AsyncSession() as s:
+            r = await s.get(url, impersonate=_BROWSER_IMPERSONATE, timeout=600,
+                            headers=headers, stream=True)
+            if r.status_code != 200:
+                logger.warning("[IMDBPlay] direct iran fetch HTTP %d (%s)",
+                               r.status_code, entry.get("server"))
+                return None
+            total = int(r.headers.get("content-length", 0))
+            done = 0
+            with open(out_path, "wb") as f:
+                async for chunk in r.aiter_content(chunk_size=1024 * 256):
+                    f.write(chunk)
+                    done += len(chunk)
+                    if progress_cb:
+                        try:
+                            progress_cb(done, total)
+                        except Exception:
+                            pass
+        logger.info("[IMDBPlay] direct iran download OK: %s (%.1f MB)",
+                    out_path, os.path.getsize(out_path) / 1024 / 1024)
+        return out_path
+    except Exception as e:
+        logger.warning("[IMDBPlay] direct iran download failed: %s", e)
+        try:
+            if os.path.exists(out_path) and os.path.getsize(out_path) == 0:
+                os.remove(out_path)
+        except Exception:
+            pass
+        return None
+
+
 async def download_with_quality(
     imdb_id: str,
     quality_label: str,
@@ -1821,6 +1941,14 @@ async def download_with_quality(
     if target_quality == "auto":
         # 🆕 اگه کاربر سرور خاصی انتخاب کرده، اول همون سرور امتحان میشه
         if preferred_server:
+            # 🆕 z22 — منابع ایرانی (FJ 🇮🇷 و...) اول چک می‌شن (لینک مستقیم MP4)
+            iran_entry = _iran_cache_get(_vm_key(imdb_id, season, episode)).get(preferred_server)
+            if iran_entry and iran_entry.get("url"):
+                logger.info("[IMDBPlay] Auto + iran server %s (cached direct link)", preferred_server)
+                _p = await _download_direct_entry(iran_entry, out_dir, progress_cb)
+                if _p:
+                    return _p
+                logger.warning("[IMDBPlay] iran server %s failed → falling back to CDN", preferred_server)
             for server in _SERVERS:
                 if server["name"] == preferred_server:
                     try:
@@ -1839,6 +1967,10 @@ async def download_with_quality(
         # بقیه‌ی سرورها هم امتحان می‌شن (فقط سرورهایی که دقیقاً همین کیفیت رو دارن).
         # تضمین باگ 431MB سر جاشه: هرگز با Auto جایگزین نمی‌شه مگه strict=False.
         ordered = list(_SERVERS)
+        # 🆕 z22 — منابع ایرانی کش‌شده هم تو انتخاب هستن (FJ 🇮🇷 و...)
+        iran_names = list(_iran_cache_get(_vm_key(imdb_id, season, episode)).keys())
+        if iran_names:
+            ordered = [{"id": "ir", "name": n, "ir_name": n} for n in iran_names] + ordered
         # 🆕 هاست‌های vidsrcme کش‌شده (مثل Castletv) هم تو انتخاب هستن
         vm_names = list(_VIDSRCME_CACHE.get(_vm_key(imdb_id, season, episode), {}).keys())
         if vm_names:
@@ -1887,12 +2019,16 @@ async def download_with_quality(
         # (این همون باگ «480p انتخاب می‌کردم 431MB دانلود می‌شد» بود)
         if not stream:
             if strict_quality:
+                # 🆕 z22 — کیفیت‌های منابع ایرانی کش‌شده (FJ 🇮🇷 و...) هم تو لیست «موجود» میان
+                _ck = _vm_key(imdb_id, season, episode)
                 avail = sorted({
                     q.get("label", "?")
-                    for e in (await get_all_server_qualities(imdb_id, season, episode))
+                    for e in (list(_iran_cache_get(_ck).values())
+                              + list(_VIDSRCME_CACHE.get(_ck, {}).values())
+                              + (await get_all_server_qualities(imdb_id, season, episode)))
                     for q in e["qualities"]
                     if q.get("label", "").lower() != "auto"
-                } )
+                })
                 raise RuntimeError(
                     f"کیفیت {quality_label} از هیچ سروری در دسترس نیست. "
                     f"کیفیت‌های موجود: {', '.join(avail) if avail else 'هیچ'}"
@@ -1913,7 +2049,12 @@ async def download_with_quality(
     stream_type = stream.get("type", "hls")
     if stream_type == "mp4":
         logger.info("Downloading MP4 directly from %s", stream.get("server", ""))
-        out_path = os.path.join(out_dir, f"{int(time.time())}.mp4")
+        # 🆕 z22 — پسوند از خود URL (فایل‌های منابع ایرانی بعضاً MKV هستن)
+        _ext = ".mp4"
+        _m_ext = re.search(r"\.(mp4|mkv|avi|mov)(?:[?#]|$)", (m3u8_url or "").lower())
+        if _m_ext:
+            _ext = _m_ext.group(1)
+        out_path = os.path.join(out_dir, f"{int(time.time())}{_ext}")
         mp4_failed = False
         try:
             async with AsyncSession() as s:
