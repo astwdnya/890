@@ -84,7 +84,8 @@ from searcher.imdb.imdb_search import search_imdb, get_title_info, get_tv_episod
 from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, download_subtitle, get_persian_subtitle, get_server_info, embed_subtitle_soft
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
-BOT_BUILD = "z18"  # نشانگر نسخه — تو لاگ استارت باید z18 دیده بشه (سقف آپلود = دقیقاً 2,097,152,000 بایت تلگرام)
+from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
+BOT_BUILD = "z19"  # نشانگر نسخه — تو لاگ استارت باید z19 دیده بشه (منبع زیرنویس جدید subtitlecat.com با ترجمه‌ی ماشینی on-demand)
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -14052,8 +14053,9 @@ def _imdb_dest_buttons() -> list:
     ]
 
 
-def _imdb_sub_buttons(subs: list, is_episode: bool, fsubs: list = None) -> list:
-    """🆕 دکمه‌های انتخاب زیرنویس — OpenSubtitles + لیست کامل آرشیو subf2m + خودکار + بدون زیرنویس"""
+def _imdb_sub_buttons(subs: list, is_episode: bool, fsubs: list = None,
+                      scsubs: list = None) -> list:
+    """🆕 دکمه‌های انتخاب زیرنویس — OpenSubtitles + آرشیو subf2m + SubtitleCat (ترجمه‌ی ماشینی) + خودکار + بدون زیرنویس"""
     buttons = []
     for i, s in enumerate(subs[:5]):
         label = f"📄 {s['file_name'][:40]} (↓{s['downloads']})"
@@ -14064,6 +14066,12 @@ def _imdb_sub_buttons(subs: list, is_episode: bool, fsubs: list = None) -> list:
         dl = f.get("downloads", 0)
         label = f"{mark} {ver}" + (f" (↓{dl})" if dl else "")
         buttons.append([Button.inline(label, f"imd_efsub_{i}" if is_episode else f"imd_fsub_{i}")])
+    # 🆕 z19: کاندیدهای subtitlecat — هر نسخه‌ای رو می‌شه با ترجمه‌ی ماشینی فارسی کرد
+    for i, f in enumerate((scsubs or [])[:3]):
+        ver = (f.get("name", "?") or "?")[:40]
+        dl = f.get("downloads", 0)
+        label = f"🔁 ترجمه‌ی ماشینی: {ver}" + (f" (↓{dl})" if dl else "")
+        buttons.append([Button.inline(label, f"imd_escat_{i}" if is_episode else f"imd_scat_{i}")])
     # زیرنویس خودکار — زنجیره‌ی سرورها + آرشیوها (بدون انتخاب دستی)
     buttons.append([Button.inline("🎬 زیرنویس خودکار (سرورها + آرشیو)", "imd_withsub")])
     buttons.append([Button.inline("⏭ بدون زیرنویس", "imd_enosub" if is_episode else "imd_nosub")])
@@ -14338,9 +14346,21 @@ async def _imdb_show_sub_menu(event, state, is_episode: bool):
             logger.warning(f"[IMDB] subf2m list failed: {e}")
             return []
 
-    subs, fsubs = await asyncio.gather(_os_subs(), _f2m_subs())
+    async def _scat_subs():
+        # 🆕 z19: کاندیدهای subtitlecat — ترجمه‌ی ماشینی (فقط لیست، فوری)
+        if not title or title == "Unknown":
+            return []
+        try:
+            return await list_menu_subtitles(title, season=season, episode=episode,
+                                             max_items=3)
+        except Exception as e:
+            logger.warning(f"[IMDB] subtitlecat list failed: {e}")
+            return []
+
+    subs, fsubs, scsubs = await asyncio.gather(_os_subs(), _f2m_subs(), _scat_subs())
     state["subs"] = subs
     state["fsubs"] = fsubs
+    state["scsubs"] = scsubs
 
     parts = []
     if subs:
@@ -14348,6 +14368,8 @@ async def _imdb_show_sub_menu(event, state, is_episode: bool):
     if fsubs:
         # 🆕 لیست subf2m فقط مچ دقیق همین قسمت رو شامل می‌شه (فیلتر SxxEyy)
         parts.append(f"🌐 آرشیو subf2m: {len(fsubs)} زیرنویس مچ دقیق همین قسمت")
+    if scsubs:
+        parts.append(f"🔁 ترجمه‌ی ماشینی SubtitleCat: {len(scsubs)} نسخه")
     if parts:
         sub_count_text = "\n".join(parts) + "\n\n👇 زیرنویس موردنظر رو انتخاب کن:"
     else:
@@ -14356,7 +14378,7 @@ async def _imdb_show_sub_menu(event, state, is_episode: bool):
                           f"می‌تونی «زیرنویس خودکار» رو امتحان کنی:")
     await event.edit(
         f"✅ کیفیت: **{quality_label}** | 🖥 سرور: **{srv}**\n\n📝 زیرنویس فارسی:\n{sub_count_text}",
-        buttons=_imdb_sub_buttons(subs, is_episode, fsubs=fsubs),
+        buttons=_imdb_sub_buttons(subs, is_episode, fsubs=fsubs, scsubs=scsubs),
         parse_mode="md",
     )
 
@@ -14406,6 +14428,12 @@ async def _check_persian_subtitle_available(imdb_id, season=None, episode=None):
                     source = "2Embed"
                 elif "videasy" in sub_path.lower():
                     source = "Videasy"
+                elif "subf2m" in sub_path.lower():
+                    source = "subf2m"
+                elif "podnapisi" in sub_path.lower():
+                    source = "podnapisi"
+                elif "subtitlecat" in sub_path.lower():
+                    source = "SubtitleCat (ترجمه‌ی ماشینی)"
                 return {"available": True, "source": source}
         return {"available": False}
     except Exception:
@@ -14424,6 +14452,7 @@ async def imdb_cb_sub(event):
         # imdbplay softsub — دانلود زیرنویس فارسی از سرورها+آرشیوها (زنجیره‌ی خودکار)
         state["selected_sub"] = None
         state["selected_fsub"] = None
+        state["selected_scat"] = None
         state["use_imdbplay_sub"] = True
         # 🆕 به‌جای شروع فوری → انتخاب مقصد خروجی
         state["pending"] = {"with_subtitle": True, "softsub": None}
@@ -14458,6 +14487,7 @@ async def imdb_cb_sub(event):
             return
         state["selected_sub"] = state["subs"][sub_idx]
         state["selected_fsub"] = None
+        state["selected_scat"] = None
         state["use_imdbplay_sub"] = False
         sub_name = state["subs"][sub_idx].get("file_name", "")[:40]
         await event.edit(
@@ -14478,6 +14508,7 @@ async def imdb_cb_esub(event):
     if data == "imd_withsub":
         state["selected_sub"] = None
         state["selected_fsub"] = None
+        state["selected_scat"] = None
         state["use_imdbplay_sub"] = True
         # 🆕 به‌جای شروع فوری → انتخاب مقصد خروجی
         state["pending"] = {"with_subtitle": True, "softsub": None}
@@ -14507,6 +14538,7 @@ async def imdb_cb_esub(event):
             return
         state["selected_sub"] = state["subs"][sub_idx]
         state["selected_fsub"] = None
+        state["selected_scat"] = None
         state["use_imdbplay_sub"] = False
         sub_name = state["subs"][sub_idx].get("file_name", "")[:40]
         await event.edit(
@@ -14538,11 +14570,49 @@ async def imdb_cb_fsub(event):
     fsub = fsubs[sub_idx]
     state["selected_fsub"] = fsub
     state["selected_sub"] = None
+    state["selected_scat"] = None
     state["use_imdbplay_sub"] = False
     ver = (fsub.get("version", "subf2m") or "subf2m")[:60]
     await event.answer("✅ انتخاب شد", alert=False)
     await event.edit(
         f"✅ زیرنویس انتخاب شد (آرشیو subf2m):\n**{ver}**\n\n📄 نحوه ارسال رو انتخاب کن:",
+        buttons=_imdb_delivery_buttons(is_episode=is_ep),
+        parse_mode="md",
+    )
+
+
+async def imdb_cb_scat(event):
+    """🆕 z19 انتخاب زیرنویس از کاندیدهای SubtitleCat (imd_scat_{i} / imd_escat_{i}).
+
+    این نسخه‌ها موقع دانلود، با ترجمه‌ی ماشینی (Google gtx از طریق سایت)
+    فارسی می‌شن — تا ~۱ دقیقه طول می‌کشه.
+    """
+    data = event.data.decode()
+    user_id = event.sender_id
+    state = imdb_states.get(user_id)
+    if not state:
+        await event.answer("⏰ نشست شما منقضی شده.\n🔄 لطفاً دوباره سرچ کنید.", alert=True)
+        return
+    is_ep = data.startswith("imd_escat_")
+    idx_txt = data[len("imd_escat_"):] if is_ep else data[len("imd_scat_"):]
+    try:
+        sub_idx = int(idx_txt)
+    except ValueError:
+        await event.answer("زیرنویس نامعتبر", alert=True)
+        return
+    scsubs = state.get("scsubs") or []
+    if sub_idx >= len(scsubs):
+        await event.answer("زیرنویس نامعتبر", alert=True)
+        return
+    scat = scsubs[sub_idx]
+    state["selected_scat"] = scat
+    state["selected_fsub"] = None
+    state["selected_sub"] = None
+    state["use_imdbplay_sub"] = False
+    ver = (scat.get("name", "subtitlecat") or "subtitlecat")[:60]
+    await event.answer("✅ انتخاب شد", alert=False)
+    await event.edit(
+        f"✅ زیرنویس انتخاب شد (SubtitleCat — ترجمه‌ی ماشینی):\n**{ver}**\n\n⏳ حین دانلود ترجمه می‌شه (تا ~۱ دقیقه)\n\n📄 نحوه ارسال رو انتخاب کن:",
         buttons=_imdb_delivery_buttons(is_episode=is_ep),
         parse_mode="md",
     )
@@ -14780,6 +14850,27 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                 await status_msg.edit(f"✅ زیرنویس: `{sub_name}`", parse_mode="md")
             else:
                 await status_msg.edit("⚠ دانلود زیرنویس از subf2m ناموفق بود، ادامه بدون زیرنویس.")
+                with_subtitle = False
+        elif with_subtitle and state.get("selected_scat") and not use_imdbplay_sub:
+            # 🆕 z19: زیرنویس انتخابی کاربر از SubtitleCat — ترجمه‌ی ماشینی on-demand
+            scat = state["selected_scat"]
+            try:
+                await status_msg.edit("🔁 در حال آماده‌سازی زیرنویس SubtitleCat — ترجمه‌ی ماشینی به فارسی (تا ~۱ دقیقه)...")
+            except Exception:
+                pass
+            sub_path = await download_scat_persian(scat.get("url", ""), out_dir)
+            if sub_path and os.path.exists(sub_path):
+                sub_name = f"subtitlecat: {scat.get('name', '')[:45]}"
+                persian_sub_path = sub_path
+                try:
+                    await status_msg.edit(f"✅ زیرنویس (ترجمه‌ی ماشینی): `{sub_name}`", parse_mode="md")
+                except Exception:
+                    pass
+            else:
+                try:
+                    await status_msg.edit("⚠ ترجمه‌ی ماشینی زیرنویس ناموفق بود، ادامه بدون زیرنویس.")
+                except Exception:
+                    pass
                 with_subtitle = False
         elif with_subtitle and state.get("selected_sub") and not use_imdbplay_sub:
             # User selected a specific subtitle from OpenSubtitles
@@ -22904,6 +22995,9 @@ async def main():
     # 🆕 زیرنویس آرشیو subf2m — لیست کامل + انتخاب کاربر
     client.add_event_handler(imdb_cb_fsub, events.CallbackQuery(pattern=r"imd_fsub_\d+$"))
     client.add_event_handler(imdb_cb_fsub, events.CallbackQuery(pattern=r"imd_efsub_\d+$"))
+    # 🆕 z19: انتخاب زیرنویس از کاندیدهای ترجمه‌ی ماشینی SubtitleCat
+    client.add_event_handler(imdb_cb_scat, events.CallbackQuery(pattern=r"imd_scat_\d+$"))
+    client.add_event_handler(imdb_cb_scat, events.CallbackQuery(pattern=r"imd_escat_\d+$"))
     # 🆕 انتخاب سرور (بعد از کیفیت) + انتخاب مقصد خروجی (تلگرام / ابری)
     client.add_event_handler(imdb_cb_server, events.CallbackQuery(pattern=r"imd_esrv_"))
     client.add_event_handler(imdb_cb_server, events.CallbackQuery(pattern=r"imd_srv_"))

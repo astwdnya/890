@@ -2592,6 +2592,9 @@ async def get_persian_subtitle(
       1. core.vidzee.wtf/subs (سرور Vidzee) — بهترین منبع
       2. sub.vdrk.site (سرور 2Embed)
       3. subs.videasy.to (سرورهای Videasy/Vidking) — عموماً انگلیسی
+      4. subf2m.co (بزرگ‌ترین آرشیو فارسی — mirror Subscene)
+      5. podnapisi.net (آرشیو رسمی با API)
+      6. subtitlecat.com (ترجمه‌ی ماشینی on-demand — z19)
 
     Args:
         imdb_id: e.g. "tt33071426"
@@ -2709,6 +2712,25 @@ async def get_persian_subtitle(
             return p_path
     except Exception as e:
         logger.debug("podnapisi failed: %s", e)
+
+    # ─── Source 6: subtitlecat.com (ترجمه‌ی ماشینی on-demand — z19) ──
+    # ریورس کامل شد: جستجو روی اسم نسخه‌ها + fa کش‌شده یا ترجمه‌ی gtx —
+    # سایت هر زیرنویسی رو به فارسی ترجمه می‌کنه (Google gtx) و کش می‌کنه.
+    # برای سریال فقط نسخه‌های مچ دقیق همین SxxEyy (خط‌مشی z15).
+    if title:
+        try:
+            try:
+                from subtitlecat_subtitle import get_subtitle_for_imdb
+            except ImportError:
+                from searcher.imdb.subtitlecat_subtitle import get_subtitle_for_imdb
+            scat_path = await get_subtitle_for_imdb(
+                imdb_id, title, season=season, episode=episode, out_dir=out_dir,
+            )
+            if scat_path and os.path.exists(scat_path):
+                logger.info("Found Persian subtitle on subtitlecat: %s", scat_path)
+                return scat_path
+        except Exception as e:
+            logger.debug("subtitlecat failed: %s", e)
 
     logger.info("No Persian subtitle found for %s", imdb_id)
     return None
