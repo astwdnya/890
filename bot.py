@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z19"  # نشانگر نسخه — تو لاگ استارت باید z19 دیده بشه (منبع زیرنویس جدید subtitlecat.com با ترجمه‌ی ماشینی on-demand)
+BOT_BUILD = "z21"  # نشانگر نسخه — تو لاگ استارت باید z21 دیده بشه (سرور FJ 🇮🇷 = tdmmo.xyz با اکانت + کپچای ریاضی خودکار، همزمان با سرچ عادی پروب می‌شه)
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -13957,6 +13957,24 @@ def _imdb_seasons_buttons(eps) -> list:
     return buttons
 
 
+def _imdb_iran_hints(info: dict) -> dict:
+    """🆕 z20 — ساخت hints منابع ایرانی از اطلاعات IMDb (اسم EN + اسم اصلی FA + سال)."""
+    if not isinstance(info, dict):
+        return None
+    names = []
+    for k in ("title", "original_title"):
+        v = (info.get(k) or "").strip()
+        if v and v.lower() != "unknown" and v not in names:
+            names.append(v)
+    if not names:
+        return None
+    return {
+        "names": names,
+        "year": info.get("year"),
+        "is_series": bool(info.get("is_series")),
+    }
+
+
 def _imdb_agg_qualities(sq: list) -> list:
     """🆕 تجمیع کیفیت‌های همه‌ی سرورها → [{label, resolution, servers[]}].
 
@@ -14026,6 +14044,9 @@ def _imdb_server_buttons(servers: list, quality_label: str, is_episode: bool, ex
                 qm = q
                 break
         label = f"{mark} {s.get('server', '?')}"
+        # 🆕 z20: سرورهای منابع ایرانی با پرچم 🇮🇷 مشخص می‌شن (لینک مستقیم MP4/MKV)
+        if s.get("iran"):
+            label = f"🇮🇷 {label}"
         if s.get("type") == "mp4":
             label += " · MP4"
         if qm and qm.get("resolution"):
@@ -14122,8 +14143,8 @@ async def imdb_cb_title(event):
     else:
         imdb_states[user_id] = {"imdb_id": imdb_id, "info": info}
         await event.edit(f"{caption}\n\n⏳ در حال بررسی سرورها و کیفیت‌ها...", parse_mode="md")
-        # 🆕 پروب همه‌ی سرورها → کاربر سرور و کیفیت رو باهم می‌بینه
-        sq = await get_all_server_qualities(imdb_id)
+        # 🆕 پروب همه‌ی سرورها → کاربر سرور و کیفیت رو باهم می‌بینه (z20: + سرورهای 🇮🇷)
+        sq = await get_all_server_qualities(imdb_id, iran_hints=_imdb_iran_hints(info))
         qualities = _imdb_agg_qualities(sq)
         if not sq:
             await event.edit(f"{caption}\n\n❌ هیچ سروری این عنوان رو نداره.", parse_mode="md")
@@ -14210,8 +14231,9 @@ async def imdb_cb_episode(event):
         f"🎬 **{title}** - S{season:02d}E{episode:02d}\n\n⏳ در حال بررسی سرورها و کیفیت‌ها...",
         parse_mode="md",
     )
-    # 🆕 پروب همه‌ی سرورها برای این قسمت
-    sq = await get_all_server_qualities(imdb_id, season, episode)
+    # 🆕 پروب همه‌ی سرورها برای این قسمت (z20: + منابع 🇮🇷 برای سریالای ایرانی)
+    sq = await get_all_server_qualities(imdb_id, season, episode,
+                                        iran_hints=_imdb_iran_hints(state.get("info")))
     qualities = _imdb_agg_qualities(sq)
     if not sq:
         await event.edit("❌ هیچ سروری این قسمت رو نداره.")
