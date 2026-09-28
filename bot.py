@@ -85,7 +85,14 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z24"  # نشانگر نسخه — تو لاگ استارت باید z24 دیده بشه (🆕 z24: FJ سریع شد (lazy resolve + سشن keep-alive) + تامبنیل پوستر + لیبل قسمت‌ها + صفحه‌بندی منو)
+BOT_BUILD = "z25"  # نشانگر نسخه — تو لاگ استارت باید z25 دیده بشه (🆕 z25: فارسی‌سرچر غیرفعال شد (سوییچ پایین) — کد حذف نشده)
+
+# ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
+# 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
+# تمام کد (پروب، تامبنیل، لیبل قسمت‌ها، صفحه‌بندی، دانلود مستقیم) سر جاش هست —
+# فقط این دو سوییچ رو True کن تا برگردن:
+IRAN_INLINE_SEARCH_ENABLED = False   # نتایج منابع ایرانی در سرچ اینلاین IMDB (z23/z24)
+IRAN_MENU_SOURCES_ENABLED = False    # منابع ایرانی (تگ 🇮🇷 FJ و…) در منوی دانلود IMDB (z22)
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -14211,8 +14218,11 @@ async def imdb_cb_title(event):
     else:
         imdb_states[user_id] = {"imdb_id": imdb_id, "info": info}
         await event.edit(f"{caption}\n\n⏳ در حال بررسی سرورها و کیفیت‌ها...", parse_mode="md")
-        # 🆕 پروب همه‌ی سرورها → کاربر سرور و کیفیت رو باهم می‌بینه (z20: + سرورهای 🇮🇷)
-        sq = await get_all_server_qualities(imdb_id, iran_hints=_imdb_iran_hints(info))
+        # 🆕 پروب همه‌ی سرورها → کاربر سرور و کیفیت رو باهم می‌بینه
+        # 🆕 z25 — منابع 🇮🇷 فقط وقتی IRAN_MENU_SOURCES_ENABLED=True (پیش‌فرض: خاموش برای سرعت)
+        sq = await get_all_server_qualities(
+            imdb_id,
+            iran_hints=_imdb_iran_hints(info) if IRAN_MENU_SOURCES_ENABLED else None)
         qualities = _imdb_agg_qualities(sq)
         if not sq:
             await event.edit(f"{caption}\n\n❌ هیچ سروری این عنوان رو نداره.", parse_mode="md")
@@ -14527,9 +14537,11 @@ async def imdb_cb_episode(event):
         f"🎬 **{title}** - S{season:02d}E{episode:02d}\n\n⏳ در حال بررسی سرورها و کیفیت‌ها...",
         parse_mode="md",
     )
-    # 🆕 پروب همه‌ی سرورها برای این قسمت (z20: + منابع 🇮🇷 برای سریالای ایرانی)
-    sq = await get_all_server_qualities(imdb_id, season, episode,
-                                        iran_hints=_imdb_iran_hints(state.get("info")))
+    # 🆕 پروب همه‌ی سرورها برای این قسمت
+    # 🆕 z25 — منابع 🇮🇷 فقط وقتی IRAN_MENU_SOURCES_ENABLED=True (پیش‌فرض: خاموش برای سرعت)
+    sq = await get_all_server_qualities(
+        imdb_id, season, episode,
+        iran_hints=_imdb_iran_hints(state.get("info")) if IRAN_MENU_SOURCES_ENABLED else None)
     qualities = _imdb_agg_qualities(sq)
     if not sq:
         await event.edit("❌ هیچ سروری این قسمت رو نداره.")
@@ -17720,25 +17732,28 @@ async def xnxx_inline_handler(event):
 
         iran_inline_entries: list = []  # 🆕 z23 — فقط برای سرچر IMDB پر می‌شه
         if is_imd:
-            # 🆕 z23 — سرچ IMDB و پروب منابع ایرانی (FJ 🇮🇷 / دوستی‌ها / فارسی‌لند / F2M)
-            # همزمان شروع می‌شن تا هیچ تاخیری به imdb اضافه نشه
-            imdb_task = asyncio.create_task(search_imdb(query, limit=INLINE_RESULTS_LIMIT))
-            iran_task = asyncio.create_task(_imdb_inline_iran_probe(query))
+            # 🆕 z25 — پروب منابع ایرانی به‌صورت پیش‌فرض خاموشه (سرعت اینلاین اولویت داشت)
+            # IRAN_INLINE_SEARCH_ENABLED=True → دوباره نتایج 🇮🇷 (FJ/دوستی‌ها/…) میان
+            iran_task = None
+            if IRAN_INLINE_SEARCH_ENABLED:
+                # سرچ IMDB و پروب منابع ایرانی همزمان شروع می‌شن تا هیچ تاخیری به imdb اضافه نشه
+                iran_task = asyncio.create_task(_imdb_inline_iran_probe(query))
             try:
-                results = await imdb_task
+                results = await search_imdb(query, limit=INLINE_RESULTS_LIMIT)
             except Exception as _srch_e:
                 logger.warning(f"[INLINE] IMDB search failed: {_srch_e}")
                 results = []
             # نتایج ایرانی با سقف زمانی جواب داده می‌شن؛ اگه دیر بجوشن (مثل FJ
             # که لاگین/کپچا می‌خواد)، تسک بک‌گراند ادامه می‌ده و نتیجه‌ش کش می‌شه —
             # تایپ بعدی همون کلمه فوری جواب می‌گیره
-            try:
-                _done, _pending = await asyncio.wait({iran_task}, timeout=IMDB_IRAN_INLINE_WAIT)
-                if _done and not iran_task.exception():
-                    iran_inline_entries = iran_task.result() or []
-            except Exception as _iran_e:
-                logger.warning(f"[INLINE] iran inline wait error: {_iran_e}")
-                iran_inline_entries = []
+            if iran_task is not None:
+                try:
+                    _done, _pending = await asyncio.wait({iran_task}, timeout=IMDB_IRAN_INLINE_WAIT)
+                    if _done and not iran_task.exception():
+                        iran_inline_entries = iran_task.result() or []
+                except Exception as _iran_e:
+                    logger.warning(f"[INLINE] iran inline wait error: {_iran_e}")
+                    iran_inline_entries = []
         elif is_ph:
             if page == 0:
                 results = await search_pornhub_multi_page(
