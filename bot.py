@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z26"  # نشانگر نسخه — تو لاگ استارت باید z26 دیده بشه (🆕 z26: فیکس سگمنت‌های جاافتاده — راند چهارم ترتیبی + تحمل خطای کوچک به‌جای ریجکت کل دانلود)
+BOT_BUILD = "z27"  # نشانگر نسخه — تو لاگ استارت باید z27 دیده بشه (🆕 z27: سافت‌ساب زرد استایل‌دار — ASS داخل MKV؛ VLC بدون تنظیمات زرد نشون می‌ده)
 
 # ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
 # 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
@@ -15340,7 +15340,8 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                         await status_msg.edit("📝 در حال جاسازی زیرنویس درون ویدیو (softsub)...")
                     except Exception:
                         pass
-                    softsub_out = os.path.join(out_dir, f"softsub_{int(time.time())}.mp4")
+                    # 🆕 z27: خروجی سافت‌ساب MKV هست (ترک ASS زرد استایل‌دار) — ویدیو/صدا copy می‌شن
+                    softsub_out = os.path.join(out_dir, f"softsub_{int(time.time())}.mkv")
                     # 🛡 z17: embed_subtitle_soft قبلاً subprocess.run بلاک‌کننده بود و
                     # event loop رو حین remux فریز می‌کرد — حالا در thread جدا اجرا می‌شه
                     embedded = await asyncio.to_thread(

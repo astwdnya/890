@@ -3025,21 +3025,129 @@ async def _download_subtitle_file(url: str, out_dir: Optional[str], imdb_id: str
 #   Local ffmpeg subtitle embedding (softsub - no re-encode)
 # ═══════════════════════════════════════════════════════════
 
+# 🆕 z27: فرمت SRT/mov_text اصلاً اطلاعات رنگ/استایل نداره و پلیر پیش‌فرض سفید
+# نشونش می‌ده. با تبدیل به ASS و جاسازی در MKV، استایل داخل فایل ذخیره می‌شه و
+# VLC (libass) بدون هیچ تنظیمی همون رنگ/فونت رو روی هر دستگاهی نشون می‌ده.
+# رنگ ASS به فرمت &HAABBGGRR هست: زرد = &H0000FFFF (B=00, G=FF, R=FF)
+_SUB_STYLE_TPL = (
+    "Style: {name},Arial,20,&H0000FFFF,&H000000FF,&H00000000,&H00000000,"
+    "-1,0,0,0,100,100,0,0,1,2,1,2,40,40,45,1"
+)
+
+
+def _styled_ass_from_subtitle(subtitle_path: str, out_dir: str) -> Optional[str]:
+    """
+    🆕 z27: تبدیل زیرنویس (SRT/VTT/ASS) به فایل ASS استایل‌دار
+    (زرد + بولد + دورخط مشکی + فونت درشت‌تر — خوانا در گوشی).
+
+    - مرحله ۱: تبدیل به ASS با ffmpeg (فرآیند متنی — سریع، بدون re-encode)
+    - مرحله ۲: پچ خطوط Style — نام استایل حفظ می‌شه چون خطوط Dialogue بهش ارجاع می‌دن
+
+    Returns:
+        مسیر فایل ASS استایل‌دار اگه موفق، None در غیر این صورت
+        (caller به مسیرهای قدیمی fallback می‌کنه).
+    """
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        out_ass = os.path.join(out_dir, f"styled_sub_{int(time.time())}.ass")
+
+        # مرحله ۱: تبدیل به ASS
+        cmd = ["ffmpeg", "-y", "-i", subtitle_path, "-c:s", "ass", out_ass]
+        r = subprocess.run(cmd, capture_output=True, timeout=120)
+        if r.returncode != 0 or not os.path.exists(out_ass) or os.path.getsize(out_ass) == 0:
+            logger.warning("styled ASS convert failed: %s",
+                           r.stderr.decode("utf-8", errors="ignore")[:300])
+            return None
+
+        # مرحله ۲: پچ خط Style
+        with open(out_ass, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+
+        def _repl(m):
+            return _SUB_STYLE_TPL.format(name=(m.group(1).strip() or "Default"))
+
+        new_content, n = re.subn(r"(?m)^Style:\s*([^,]+?),.*$", _repl, content)
+        if n == 0:
+            # فایل Style نداره — بعد از خط Format (یا خود هدر) اضافه‌ش کن
+            styled_line = _SUB_STYLE_TPL.format(name="Default")
+            new_content, n2 = re.subn(
+                r"(?m)^(Format:.*\n)",
+                lambda m2: m2.group(1) + styled_line + "\n",
+                content, count=1)
+            if n2 == 0:
+                new_content = content.replace(
+                    "[V4+ Styles]",
+                    "[V4+ Styles]\n" + styled_line, 1)
+
+        with open(out_ass, "w", encoding="utf-8") as f:
+            f.write(new_content)
+
+        logger.info("[z27] subtitle converted to yellow-styled ASS: %s",
+                    os.path.basename(out_ass))
+        return out_ass
+    except Exception as e:
+        logger.warning("styled ASS error: %s", e)
+        return None
+
 
 def embed_subtitle_soft(video_path: str, subtitle_path: str, out_path: str) -> Optional[str]:
     """
     قرار دادن زیرنویس به‌صورت softsub داخل فایل ویدیو (بدون re-encode).
     این کار خیلی سریع هست (فقط remux) و زیرنویس قابل روشن/خاموش شدن در VLC هست.
 
+    🆕 z27: روش اصلی حالا زیرنویس رو به ASS استایل‌دار (زرد + بولد + دورخط مشکی)
+    تبدیل و در کانتینر MKV جاسازی می‌کنه — VLC استایل‌ها رو رعایت می‌کنه و زیرنویس
+    روی هر دستگاهی زرد دیده می‌شه (بدون نیاز به تغییر تنظیمات VLC).
+    اگه این مسیر شکست خورد، به روش‌های قدیمی (MP4/mov_text و MKV/srt) برمی‌گرده.
+
     Args:
         video_path: مسیر فایل ویدیو
         subtitle_path: مسیر فایل زیرنویس (VTT یا SRT)
-        out_path: مسیر فایل خروجی
+        out_path: مسیر فایل خروجی (پسوند نهایی خروجی ممکنه .mkv باشه)
 
     Returns:
         مسیر فایل خروجی اگه موفق، None در غیر این صورت.
     """
     try:
+        out_dir = os.path.dirname(out_path) or "."
+        os.makedirs(out_dir, exist_ok=True)
+
+        # ─── 🆕 z27 روش اصلی: ASS زرد استایل‌دار داخل MKV (فقط remux) ───
+        styled_ass = _styled_ass_from_subtitle(subtitle_path, out_dir)
+        if styled_ass:
+            mkv_out = os.path.splitext(out_path)[0] + ".mkv"
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-i", styled_ass,
+                "-map", "0:v:0",   # اولین استریم ویدیو (کاور/attached_pic رو برنمی‌داره)
+                "-map", "0:a?",    # همه‌ی ترک‌های صوتی (اگه باشن)
+                "-map", "1:0",     # ترک زیرنویس استایل‌دار
+                "-c", "copy",      # بدون re-encode — فقط remux
+                "-metadata:s:s:0", "language=far",
+                "-metadata:s:s:0", "title=Persian",
+                mkv_out,
+            ]
+
+            logger.info("[z27] embedding styled softsub: %s + %s -> %s",
+                        os.path.basename(video_path), os.path.basename(styled_ass),
+                        os.path.basename(mkv_out))
+
+            result = subprocess.run(cmd, capture_output=True, timeout=600)  # 10 min timeout
+
+            if result.returncode == 0 and os.path.exists(mkv_out) and os.path.getsize(mkv_out) > 0:
+                logger.info("[z27] styled softsub (yellow ASS/MKV) complete: %s (%.1f MB)",
+                            mkv_out, os.path.getsize(mkv_out) / 1024 / 1024)
+                try:
+                    os.unlink(styled_ass)
+                except Exception:
+                    pass
+                return mkv_out
+
+            logger.warning("styled MKV embed failed, falling back to legacy paths: %s",
+                           result.stderr.decode("utf-8", errors="ignore")[:300])
+
+        # ─── مسیرهای قدیمی (fallback) ───
         # تشخیص فرمت خروجی بر اساس پسوند
         if out_path.endswith(".mkv"):
             sub_codec = "srt"
