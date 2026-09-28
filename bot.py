@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z25"  # نشانگر نسخه — تو لاگ استارت باید z25 دیده بشه (🆕 z25: فارسی‌سرچر غیرفعال شد (سوییچ پایین) — کد حذف نشده)
+BOT_BUILD = "z26"  # نشانگر نسخه — تو لاگ استارت باید z26 دیده بشه (🆕 z26: فیکس سگمنت‌های جاافتاده — راند چهارم ترتیبی + تحمل خطای کوچک به‌جای ریجکت کل دانلود)
 
 # ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
 # 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
@@ -14005,7 +14005,8 @@ def _imdb_format_caption(info: dict, eps=None) -> str:
     return "\n".join(lines)
 
 
-def _imdb_dl_caption(title: str, season, episode, subtitle_name, file_size_mb: float) -> str:
+def _imdb_dl_caption(title: str, season, episode, subtitle_name, file_size_mb: float,
+                     seg_warning: str = "") -> str:
     lines = []
     if season and episode:
         lines.append(f"🎬 **{title}** - S{season:02d}E{episode:02d}")
@@ -14014,6 +14015,8 @@ def _imdb_dl_caption(title: str, season, episode, subtitle_name, file_size_mb: f
     if subtitle_name:
         lines.append(f"📝 زیرنویس هاردکد: `{subtitle_name}`")
     lines.append(f"💾 حجم: {file_size_mb:.1f} MB")
+    if seg_warning:
+        lines.append(seg_warning)
     return "\n".join(lines)
 
 
@@ -15397,7 +15400,13 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
             return
 
         await status_msg.edit(f"📤 در حال آپلود ({size_mb:.1f} MB)...", buttons=None)
-        caption = _imdb_dl_caption(title, season, episode, sub_name if with_subtitle else None, size_mb)
+        # 🆕 z26 — اگه چند سگمنت خیلی کم تحمل شد (موتور ۴ راند تلاش کرد)، فایل
+        # ارسال می‌شه ولی کاربر با یه هشدار صادقانه بدون پرشِ احتمالی می‌شه
+        _seg_warn = ""
+        if (seg_stats or {}).get("missing_tol"):
+            _seg_warn = f"⚠️ {seg_stats.get('missing')} سگمنت کوچک جا افتاد — احتمالاً یه پرش چندثانیه‌ای تو ویدیو هست"
+        caption = _imdb_dl_caption(title, season, episode, sub_name if with_subtitle else None, size_mb,
+                                   seg_warning=_seg_warn)
 
         cover = info.get("cover")
         if cover:

@@ -1837,6 +1837,26 @@ async def _hls_segment_engine(
             state["session"] = None
 
     missing = [i for i, p in enumerate(seg_paths) if not p]
+    # ─── راند چهارم (z26): آخرین شانس — ترتیبی، بدون صف و بدون واتچ‌داگ ───
+    # سگمنت‌های تکیِ جاافتاده (معمولاً آخر playlist) که راندهای موازی به‌خاطر
+    # stall-force-finish یا کرش worker بین صف و fetch جا انداختنشون.
+    # ترتیبی + فاصله‌ی ۱.۵ ثانیه‌ای → هیچ فشاری روی CDN نیست و واتچ‌داگ هم
+    # نمی‌تونه وسط کار راند رو بکشه.
+    if missing and len(missing) <= 8 and not state["abort"]:
+        logger.info("[SEG] 4th chance (sequential, no watchdog): retrying %d missing segment(s)",
+                    len(missing))
+        stats_out["phase"] = "retry3"
+        state["abort"] = False
+        state["stall"] = False
+        state["desired"] = 1
+        for idx in list(missing):
+            if state["abort"]:
+                break
+            await _fetch_one(idx, segments[idx][0], 3)
+            if not seg_paths[idx]:
+                # نفس کوتاه قبل از حرکت — بعضی CDNها بلافاصله بعد از قطعی جواب نمی‌دن
+                await asyncio.sleep(1.5)
+    missing = [i for i, p in enumerate(seg_paths) if not p]
     stats_out["missing"] = len(missing)
     stats_out["phase"] = "done"
     if counters["failed"] or missing:
@@ -2313,15 +2333,27 @@ async def download_with_quality(
     if not valid_paths:
         raise RuntimeError("All segments failed to download")
 
-    # 🛡 z17: سگمنت ناقص = فایل خراب (دقیقاً «خراب میشه»ی کاربر!). موتور ۳ راند
-    # تلاش کرد (آخرینش با سشن کاملاً تازه)؛ اگه هنوز سگمنتی نیست یعنی منبع واقعاً
-    # لینک‌ها رو قطع کرده — به‌جای آپلود فایل خراب، خطای شفاف و قابل‌اقدام بده.
+    # 🛡 z17: سگمنت ناقص = فایل خراب (دقیقاً «خراب میشه»ی کاربر!). موتور ۴ راند
+    # تلاش کرد (آخرینش ترتیبی با فاصله)؛ اگه هنوز سگمنت مونده:
+    # 🆕 z26 — تحمل خطای کوچک: ۱-چند سگمنت گم‌شده از صدها (۰.x٪) ≠ فایل خراب!
+    # پرشِ چندثانیه‌ای تو ویدیو بهتر از ریجکت کل دانلوده. آستانه:
+    #   total < 60  → صفر تحمل (ویدیو کوتاهه، هر سگمنت مهمه)
+    #   else        → حداکثر ۱٪ سگمنت‌ها (۵۰۸ → ۵ سگمنت ≈ ۲۰ ثانیه پرش)
     if missing:
         miss_pct = len(missing) * 100.0 / max(1, total)
-        raise RuntimeError(
-            f"{len(missing)} سگمنت از {total} دانلود نشد ({miss_pct:.1f}٪) — "
-            "منبع قطع شده یا لینک منقضی شده. دوباره امتحان کن یا سرور/کیفیت دیگه‌ای انتخاب کن."
-        )
+        tol = 0 if total < 60 else max(2, int(total * 0.01))
+        if len(missing) <= tol:
+            logger.warning("[SEG] tolerating %d/%d missing segment(s) (%.2f%%) — "
+                           "concat continues, tiny skip(s) expected",
+                           len(missing), total, miss_pct)
+            if stats_out is not None:
+                stats_out["missing"] = len(missing)
+                stats_out["missing_tol"] = True
+        else:
+            raise RuntimeError(
+                f"{len(missing)} سگمنت از {total} دانلود نشد ({miss_pct:.1f}٪) — "
+                "منبع قطع شده یا لینک منقضی شده. دوباره امتحان کن یا سرور/کیفیت دیگه‌ای انتخاب کن."
+            )
 
     out_path = os.path.join(out_dir, f"{int(time.time())}.mp4")
     # 🛡 z17: concat حالا کاملاً async هست — دیگه موقع سوار کردن فیلمِ چندگیگ،
