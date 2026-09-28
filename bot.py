@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z22"  # نشانگر نسخه — تو لاگ استارت باید z22 دیده بشه (🆕 z22: فیکس کرش iran_hints → منابع 🇮🇷 (FJ/فیلمجو + f2m/doost/farsi) حالا تو پروب IMDB لود می‌شن + سرچر دیفالت = IMDB)
+BOT_BUILD = "z23"  # نشانگر نسخه — تو لاگ استارت باید z23 دیده بشه (🆕 z23: نتایج منابع 🇮🇷 (FJ/دوستی‌ها/فارسی‌لند/F2M) تو سرچ اینلاین IMDB + تگ سرور + دانلود مستقیم)
 # diycraft handler
 from otherwebsiteshandler.diycraft_handler import is_diycraft_url, extract_video_info, extract_episode_video, download_video as diycraft_download
 # sarrast handler (Persian adult visual stories)
@@ -13861,6 +13861,69 @@ def _store_inline_pick(url: str) -> str:
     return token
 
 
+# ── 🆕 z23 — نتایج منابع ایرانی (FJ 🇮🇷 / دوستی‌ها / فارسی‌لند / Film2Movie) در سرچ اینلاین IMDB ──
+IMDB_IRAN_INLINE_WAIT = 6.5          # حداکثر انتظار برای پروب منابع ایرانی قبل از جواب اینلاین
+IMDB_IRAN_QUERY_TTL = 300            # کش کوئری → entries (۵ دقیقه)
+_imdb_iran_probe_sem = asyncio.Semaphore(3)  # ضد استمپد — حداکثر ۳ پروب موازی
+imdb_iran_picks: Dict[str, dict] = {}        # token → entry (برای دکمه دانلود)
+imdb_iran_query_cache: Dict[str, tuple] = {} # norm_query → (ts, entries)
+
+
+def _store_iran_pick(entry: dict) -> str:
+    """ذخیره entry منبع ایرانی با توکن کوتاه برای دکمه دانلود اینلاین."""
+    now = time.time()
+    expired = [k for k, v in imdb_iran_picks.items() if now - v.get("ts", 0) > INLINE_PICK_TTL]
+    for k in expired:
+        imdb_iran_picks.pop(k, None)
+    token = uuid.uuid4().hex[:12]
+    imdb_iran_picks[token] = {"entry": entry, "ts": now}
+    return token
+
+
+def _imdb_inline_iran_cache_get(norm_q: str):
+    hit = imdb_iran_query_cache.get(norm_q)
+    if hit and time.time() - hit[0] <= IMDB_IRAN_QUERY_TTL:
+        return hit[1]
+    return None
+
+
+async def _imdb_inline_iran_probe(query: str) -> list:
+    """🆕 z23 — پروب منابع ایرانی برای کوئری اینلاین (مثل imdbplay ولی بدون tt-id).
+
+    نتیجه کش می‌شه؛ چون اینلاین با هر کلید زدن دوباره صدا زده می‌شه، پروب‌های
+    قبلی (مخصوصاً FJ که لاگین/کپچا می‌خواد) کش رو گرم می‌کنن و تایپ بعدی فوریه.
+    """
+    nm = (query or "").strip()
+    if len(nm) < 3:
+        return []
+    key = nm.lower()
+    cached = _imdb_inline_iran_cache_get(key)
+    if cached is not None:
+        return cached
+    try:
+        # ضد استمپد — با هر کلید تایپ یه کوئری جدید میاد؛ بیش از ۳ پروب موازی
+        # نباید به سایت‌های ایرانی فشار بیاره
+        async with _imdb_iran_probe_sem:
+            # شاید وسط صف، همون کوئری توسط تایپ قبلی کش شده باشه
+            cached = _imdb_inline_iran_cache_get(key)
+            if cached is not None:
+                return cached
+            from searcher.iranserver.iranhub import probe_iran_sources
+            entries = await probe_iran_sources("", [nm], None, False, timeout=IMDB_IRAN_INLINE_WAIT)
+            entries = [e for e in (entries or []) if e and e.get("url")]
+    except Exception as e:
+        logger.warning(f"[INLINE] iran probe failed for '{nm}': {e}")
+        entries = []
+    imdb_iran_query_cache[key] = (time.time(), entries)
+    if len(imdb_iran_query_cache) > 96:
+        for k in list(imdb_iran_query_cache.keys())[:-48]:
+            imdb_iran_query_cache.pop(k, None)
+    if entries:
+        logger.info("[INLINE] iran sources for '%s' → %d entry(ies): %s",
+                    nm, len(entries), [e.get("server") for e in entries])
+    return entries
+
+
 PH_SORT_MAP = {"new": "mr", "month": "mr", "top": "tr", "rating": "tr", "long": "lg", "length": "lg", "best": "tr", "views": "mv", "most": "mv"}
 
 # ── Default search engine selection ──
@@ -14213,6 +14276,185 @@ async def imdb_cb_close(event):
         await event.delete()
     except Exception:
         await event.edit("✖ بسته شد", buttons=None)
+
+
+# ── 🆕 z23 — منابع ایرانی در نتایج اینلاین IMDB (کال‌بک‌ها) ──
+
+async def imdb_iran_cb_menu(event):
+    """دکمه «📥 دانلود از FJ/دوستی‌ها/...» در نتایج اینلاین → منوی انتخاب کیفیت."""
+    user_id = event.sender_id
+    if user_id not in AUTHORIZED_USERS:
+        await event.answer("⛔ Unauthorized", alert=True)
+        return
+    token = event.data.decode()[len("imdir_"):]
+    pick = imdb_iran_picks.get(token)
+    entry = (pick or {}).get("entry")
+    if not entry:
+        await event.answer("⏰ این نتیجه منقضی شده — دوباره سرچ کن.", alert=True)
+        return
+    meta = entry.get("iran_meta") or {}
+    srv = entry.get("server", "IR")
+    title = str(meta.get("post_title") or srv)[:80]
+    quals = entry.get("qualities") or []
+    if not quals:
+        await event.answer("❌ کیفیتی برای این عنوان پیدا نشد.", alert=True)
+        return
+    buttons = []
+    row = []
+    for idx, q in enumerate(quals):
+        row.append(Button.inline(str(q.get("label", "Auto"))[:32], f"imirq_{token}_{idx}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([Button.inline("🚫 بستن", "imd_close")])
+    try:
+        await event.edit(
+            f"🇮🇷 **{title}** — منبع: **{srv}**\n\n🎯 کیفیت رو انتخاب کن:",
+            buttons=buttons,
+            parse_mode="md",
+        )
+    except Exception:
+        pass
+    await event.answer()
+
+
+async def imdb_iran_cb_quality(event):
+    """انتخاب کیفیت منبع ایرانی در اینلاین → شروع دانلود مستقیم."""
+    data = event.data.decode()
+    if not data.startswith("imirq_"):
+        return
+    rest = data[len("imirq_"):]
+    parts = rest.rsplit("_", 1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        return
+    token, idx = parts[0], int(parts[1])
+    user_id = event.sender_id
+    if user_id not in AUTHORIZED_USERS:
+        await event.answer("⛔ Unauthorized", alert=True)
+        return
+    pick = imdb_iran_picks.get(token)
+    entry = (pick or {}).get("entry")
+    if not entry:
+        await event.answer("⏰ این نتیجه منقضی شده — دوباره سرچ کن.", alert=True)
+        return
+    quals = entry.get("qualities") or []
+    if idx >= len(quals):
+        await event.answer("کیفیت نامعتبر", alert=True)
+        return
+    q = quals[idx]
+    url = q.get("url") or entry.get("url")
+    if not url:
+        await event.answer("لینک نامعتبر", alert=True)
+        return
+    label = str(q.get("label", "Auto"))
+    srv = entry.get("server", "IR")
+    headers = dict(entry.get("headers") or {})
+    await event.answer("✅ شروع دانلود...", alert=False)
+    asyncio.create_task(_imdb_iran_inline_download(event, user_id, url, label, srv, headers))
+
+
+async def _imdb_iran_inline_download(event, user_id, url, quality_label, server_name, headers):
+    """🆕 z23 — دانلود مستقیم از منبع ایرانی انتخاب‌شده در اینلاین (FJ 🇮🇷 / دوستی‌ها / ...)."""
+    out_dir = os.path.join(IMDB_OUTPUT_FOLDER, f"iran_inl_{user_id}_{int(time.time())}")
+    os.makedirs(out_dir, exist_ok=True)
+    dl_id = f"iran_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+    video_path = None
+    status_msg = None
+
+    def check_cancel():
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError()
+
+    try:
+        try:
+            status_msg = await event.client.send_message(
+                event.chat_id, f"🇮🇷 دانلود {quality_label} از {server_name}...")
+        except Exception:
+            status_msg = await event.edit(f"🇮🇷 دانلود {quality_label}...", buttons=cancel_btn)
+
+        # پسوند از خود URL (منابع ایرانی بعضاً MKV می‌دن)
+        _ext = ".mp4"
+        _m = re.search(r"\.(mp4|mkv|avi|mov)(?:[?#]|$)", (url or "").lower())
+        if _m:
+            _ext = _m.group(1)
+        video_path = os.path.join(out_dir, f"{int(time.time())}{_ext}")
+
+        _hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        _hdrs.update(headers or {})
+
+        from curl_cffi.requests import AsyncSession
+        async with AsyncSession() as s:
+            r = await s.get(url, impersonate="chrome", timeout=600, headers=_hdrs, stream=True)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code} از {server_name}")
+            total = int(r.headers.get("content-length", 0))
+            done = 0
+            last_edit = 0.0
+            with open(video_path, "wb") as f:
+                async for chunk in r.aiter_content(chunk_size=1024 * 256):
+                    check_cancel()
+                    f.write(chunk)
+                    done += len(chunk)
+                    _now = time.time()
+                    if status_msg and _now - last_edit > 3:
+                        last_edit = _now
+                        try:
+                            _pct = f" ({done * 100 // total}%)" if total else ""
+                            await status_msg.edit(
+                                f"🇮🇷 دانلود {quality_label} از {server_name}: "
+                                f"{done / 1048576:.1f} MB{_pct}",
+                                buttons=cancel_btn,
+                            )
+                        except Exception:
+                            pass
+
+        if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+            raise RuntimeError("فایل خالی دانلود شد")
+
+        size_mb = os.path.getsize(video_path) / 1048576
+        try:
+            await status_msg.edit(f"✅ دانلود شد ({size_mb:.1f} MB) — در حال ارسال به تلگرام...")
+        except Exception:
+            pass
+
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=event.chat_id,
+            filepath=video_path,
+            caption=f"🇮🇷 **{server_name}** | 🎯 {quality_label}\n💾 {size_mb:.1f} MB",
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=f"iran_ul_{dl_id}",
+        )
+        active_downloads.pop(dl_id, None)
+    except asyncio.CancelledError:
+        active_downloads.pop(dl_id, None)
+        try:
+            await status_msg.edit("❌ دانلود لغو شد.", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        active_downloads.pop(dl_id, None)
+        logger.error(f"[IRAN-INLINE] download failed: {e}", exc_info=True)
+        try:
+            await status_msg.edit(f"❌ خطا: `{str(e)[:150]}`", buttons=None)
+        except Exception:
+            pass
+    finally:
+        if video_path and os.path.exists(video_path):
+            try:
+                os.unlink(video_path)
+            except Exception:
+                pass
+        try:
+            os.rmdir(out_dir)
+        except Exception:
+            pass
 
 
 async def imdb_cb_episode(event):
@@ -17424,8 +17666,27 @@ async def xnxx_inline_handler(event):
         source = "IMDB" if is_imd else ("IRAN" if is_iran else ("EP" if is_ep else ("WH" if is_wh else ("XV" if is_xv else ("PH" if is_ph else "XNXX")))))
         logger.info(f"[INLINE] {source}: q='{query}' page={page} sort={sort}")
 
+        iran_inline_entries: list = []  # 🆕 z23 — فقط برای سرچر IMDB پر می‌شه
         if is_imd:
-            results = await search_imdb(query, limit=INLINE_RESULTS_LIMIT)
+            # 🆕 z23 — سرچ IMDB و پروب منابع ایرانی (FJ 🇮🇷 / دوستی‌ها / فارسی‌لند / F2M)
+            # همزمان شروع می‌شن تا هیچ تاخیری به imdb اضافه نشه
+            imdb_task = asyncio.create_task(search_imdb(query, limit=INLINE_RESULTS_LIMIT))
+            iran_task = asyncio.create_task(_imdb_inline_iran_probe(query))
+            try:
+                results = await imdb_task
+            except Exception as _srch_e:
+                logger.warning(f"[INLINE] IMDB search failed: {_srch_e}")
+                results = []
+            # نتایج ایرانی با سقف زمانی جواب داده می‌شن؛ اگه دیر بجوشن (مثل FJ
+            # که لاگین/کپچا می‌خواد)، تسک بک‌گراند ادامه می‌ده و نتیجه‌ش کش می‌شه —
+            # تایپ بعدی همون کلمه فوری جواب می‌گیره
+            try:
+                _done, _pending = await asyncio.wait({iran_task}, timeout=IMDB_IRAN_INLINE_WAIT)
+                if _done and not iran_task.exception():
+                    iran_inline_entries = iran_task.result() or []
+            except Exception as _iran_e:
+                logger.warning(f"[INLINE] iran inline wait error: {_iran_e}")
+                iran_inline_entries = []
         elif is_ph:
             if page == 0:
                 results = await search_pornhub_multi_page(
@@ -17468,13 +17729,46 @@ async def xnxx_inline_handler(event):
                     query, page=xnxx_page, limit=INLINE_RESULTS_LIMIT, sort=sort
                 )
 
-        if not results:
+        if not results and not (is_imd and iran_inline_entries):
             await event.answer([], cache_time=30)
             return
 
         if is_imd:
             imdb_results = []
             builder = event.builder
+
+            # ── 🆕 z23 — نتایج منابع ایرانی اول لیست میان (با تگ 🇮🇷 و اسم سرور) ──
+            for entry in (iran_inline_entries or [])[:4]:
+                try:
+                    _meta = entry.get("iran_meta") or {}
+                    _srv = entry.get("server", "IR")
+                    _title = str(_meta.get("post_title") or _srv)[:100]
+                    _labels = [str(q.get("label", "")) for q in entry.get("qualities", [])]
+                    _labels = [l for l in _labels if l][:6]
+                    _post_url = _meta.get("post_url", "")
+                    _tok = _store_iran_pick(entry)
+                    _desc = f"🇮🇷 {_srv} | 🎯 {' · '.join(_labels) if _labels else 'Auto'}"
+                    _text = (
+                        f"🎬 **{_title}**\n\n"
+                        f"🇮🇷 منبع: **{_srv}**\n"
+                        + (f"🎯 کیفیت‌ها: {' · '.join(_labels)}\n" if _labels else "")
+                        + (f"🔗 {_post_url}\n" if _post_url else "")
+                        + f"\n⬇️ روی دکمه بزن، کیفیت رو انتخاب کن و دانلود شروع می‌شه."
+                    )
+                    imdb_results.append(
+                        builder.article(
+                            title=f"🇮🇷 {_title}",
+                            description=_desc,
+                            text=_text,
+                            buttons=[[Button.inline(f"📥 دانلود از {_srv}", f"imdir_{_tok}")]],
+                            parse_mode="md",
+                            link_preview=False,
+                        )
+                    )
+                except Exception as _ir_art_e:
+                    logger.warning(f"[INLINE] iran article build failed: {_ir_art_e}")
+                    continue
+
             for i, item in enumerate(results):
                 title = item.get("title", "Untitled")[:128]
                 imdb_id = item.get("imdb_id", "")
@@ -23025,6 +23319,9 @@ async def main():
     # 🆕 انتخاب سرور (بعد از کیفیت) + انتخاب مقصد خروجی (تلگرام / ابری)
     client.add_event_handler(imdb_cb_server, events.CallbackQuery(pattern=r"imd_esrv_"))
     client.add_event_handler(imdb_cb_server, events.CallbackQuery(pattern=r"imd_srv_"))
+    # 🆕 z23 — منابع ایرانی در نتایج اینلاین IMDB
+    client.add_event_handler(imdb_iran_cb_menu, events.CallbackQuery(pattern=r"^imdir_"))
+    client.add_event_handler(imdb_iran_cb_quality, events.CallbackQuery(pattern=r"^imirq_"))
     client.add_event_handler(imdb_cb_dest, events.CallbackQuery(pattern=r"imd_dest_"))
 
     me = await client.get_me()
