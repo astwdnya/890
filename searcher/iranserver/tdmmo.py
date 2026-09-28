@@ -205,6 +205,29 @@ _LOGIN_LOCK: Optional[asyncio.Lock] = None
 # کپچا/لاگین نایاب‌سازی نشه — لاگین دوباره بعد از خطای کپچا هم اینجا هندل می‌شه
 _PAGE_CACHE: Dict[str, dict] = {}      # m_id → page dict (TTL 30min)
 _RESOLVE_CACHE: Dict[str, dict] = {}   # token → {"url","season_path"} (TTL 90min — لینک ~2h اعتبار داره)
+_SEARCH_CACHE: Dict[str, tuple] = {}   # 🆕 z24 کوئری سرچ → (ts, results) — TTL 10min
+
+# 🆕 z24 — سشن keep-alive مشترک: قبلاً برای «هر» درخواست یه TLS هندشیک جدید
+# ساخته می‌شد (لاگین = ۴ راند‌تراپ پشت‌سرهم → ~۱۰ثانیه!). با سشن مشترک
+# هر ریکوئست فقط یه RTT می‌شه.
+_SESSION: Optional[AsyncSession] = None
+
+
+def _session() -> AsyncSession:
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = AsyncSession()
+    return _SESSION
+
+
+async def _reset_session() -> None:
+    global _SESSION
+    try:
+        if _SESSION is not None:
+            await _SESSION.close()
+    except Exception:
+        pass
+    _SESSION = None
 
 
 def _now() -> float:
@@ -221,28 +244,28 @@ def _login_lock() -> asyncio.Lock:
 async def _req(url: str, *, data: Optional[dict] = None,
                timeout: float = 15.0, allow_redirects: bool = True,
                referer: Optional[str] = None):
-    """GET/POST با کوکی‌های سشن → (status, text, final_url, headers) یا None."""
+    """GET/POST با سشن keep-alive مشترک → (status, text, final_url, headers) یا None."""
     try:
-        async with AsyncSession() as s:
-            for k, v in _COOKIES.items():
-                s.cookies.set(k, v)
-            headers = {"User-Agent": _USER_AGENT,
-                       "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
-            if referer:
-                headers["Referer"] = referer
-            if data is not None:
-                r = await s.post(url, data=data, headers=headers, timeout=timeout,
-                                 impersonate="chrome", allow_redirects=allow_redirects)
-            else:
-                r = await s.get(url, headers=headers, timeout=timeout,
-                                impersonate="chrome", allow_redirects=allow_redirects)
-            try:
-                _COOKIES.update({k: v for k, v in s.cookies.items()})
-            except Exception:
-                pass
-            return r.status_code, r.text, str(r.url), r.headers
+        s = _session()
+        headers = {"User-Agent": _USER_AGENT,
+                   "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+        if referer:
+            headers["Referer"] = referer
+        if data is not None:
+            r = await s.post(url, data=data, headers=headers, timeout=timeout,
+                             impersonate="chrome", allow_redirects=allow_redirects)
+        else:
+            r = await s.get(url, headers=headers, timeout=timeout,
+                            impersonate="chrome", allow_redirects=allow_redirects)
+        try:
+            _COOKIES.update({k: v for k, v in s.cookies.items()})
+        except Exception:
+            pass
+        return r.status_code, r.text, str(r.url), r.headers
     except Exception as e:
         logger.debug("[Tdmmo] req %s failed: %s", url[:90], e)
+        # 🆕 z24 — سشن خراب/تایم‌اوت → دور بریز که ریکوئست بعدی تمیز شروع کنه
+        await _reset_session()
         return None
 
 
@@ -296,22 +319,21 @@ async def ensure_login(force: bool = False) -> bool:
 async def _req_bytes(url: str, *, referer: Optional[str] = None,
                      timeout: float = 15.0) -> Optional[bytes]:
     try:
-        async with AsyncSession() as s:
-            for k, v in _COOKIES.items():
-                s.cookies.set(k, v)
-            headers = {"User-Agent": _USER_AGENT}
-            if referer:
-                headers["Referer"] = referer
-            r = await s.get(url, headers=headers, timeout=timeout, impersonate="chrome")
-            try:
-                _COOKIES.update({k: v for k, v in s.cookies.items()})
-            except Exception:
-                pass
-            if r.status_code == 200:
-                return r.content
-            return None
+        s = _session()
+        headers = {"User-Agent": _USER_AGENT}
+        if referer:
+            headers["Referer"] = referer
+        r = await s.get(url, headers=headers, timeout=timeout, impersonate="chrome")
+        try:
+            _COOKIES.update({k: v for k, v in s.cookies.items()})
+        except Exception:
+            pass
+        if r.status_code == 200:
+            return r.content
+        return None
     except Exception as e:
         logger.debug("[Tdmmo] bytes req %s failed: %s", url[:90], e)
+        await _reset_session()
         return None
 
 
@@ -323,9 +345,11 @@ _FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567
 
 _ITEM_RE = re.compile(
     r'<a href="movie\?m=(\d+)"\s*target="_blank">\s*'
-    r'<img[^>]*class="movie_item_img"/><span class="movie_item_year">([^<]*)</span>'
+    r'<img([^>]*?)class="movie_item_img"([^>]*?)/?>\s*'
+    r'<span class="movie_item_year">([^<]*)</span>'
     r'<span class="movie_item_imdb">([^<]*)</span><span class="movie_item_title">([^<]*)</span>',
     re.S)
+_IMG_SRC_RE = re.compile(r'src="([^"]+)"')
 _LINK_RE = re.compile(
     r'<a href="(?:https?://tdmmo\.xyz)?/play\?a=([pd])&i=([\w\-]+)&f=([^"]+)">'
     r'(.*?)</a>', re.S)
@@ -481,7 +505,11 @@ def _score_page(title: str, year_raw: str, names: List[str],
 # ═══════════════════════════════════════════════════════════
 
 async def _search(query: str, limit: int = 10) -> List[dict]:
-    """سرچ سایت → [{id, year_raw, rating, title}] — None/خطا → []"""
+    """سرچ سایت → [{id, year_raw, rating, title, thumb}] — None/خطا → [] (کش ۱۰ دقیقه‌ای)."""
+    key = f"{str(query).strip().lower()}|{limit}"
+    c = _SEARCH_CACHE.get(key)
+    if c and _now() - c[0] < 600:
+        return c[1]
     if not await ensure_login():
         return []
     q = urllib.parse.quote(str(query).strip())
@@ -493,19 +521,37 @@ async def _search(query: str, limit: int = 10) -> List[dict]:
         return []
     out = []
     for m in _ITEM_RE.finditer(text):
-        out.append({"id": m.group(1), "year_raw": m.group(2).strip(),
-                    "rating": m.group(3).strip(), "title": m.group(4).strip()})
+        attrs = (m.group(2) or "") + " " + (m.group(3) or "")
+        _sm = _IMG_SRC_RE.search(attrs)
+        out.append({"id": m.group(1), "year_raw": m.group(4).strip(),
+                    "rating": m.group(5).strip(), "title": m.group(6).strip(),
+                    "thumb": (_sm.group(1) if _sm else "")})
         if len(out) >= limit:
             break
+    if out:
+        _SEARCH_CACHE[key] = (_now(), out)
+        if len(_SEARCH_CACHE) > 128:
+            for k2 in list(_SEARCH_CACHE)[:64]:
+                _SEARCH_CACHE.pop(k2, None)
     return out
 
 
 def _parse_page(text: str) -> dict:
-    """صفحه‌ی movie → {title, files:[{a, token, fname, size_mb, quality, label, season, episode}]}"""
+    """صفحه‌ی movie → {title, thumb, files:[{a, token, fname, size_mb, quality, label, season, episode}]}"""
     title = ""
     m = re.search(r'DetilesTitlesLarg">([^<]+)<', text)
     if m:
         title = m.group(1).strip()
+    # 🆕 z24 — پوستر (کلاس DetitlesImgMain/DetitlesBgImg یا هر img از CDN پیکچر سایت)
+    thumb = ""
+    for _pm in (re.search(r'<img[^>]*class="[^"]*DetitlesImgMain[^"]*"[^>]*>', text),
+                re.search(r'<img[^>]*class="[^"]*DetitlesBgImg[^"]*"[^>]*>', text),
+                re.search(r'<img[^>]*src="([^"]*pic-list[^"]*)"[^>]*>', text)):
+        if _pm:
+            _sm = _IMG_SRC_RE.search(_pm.group(0))
+            if _sm:
+                thumb = _sm.group(1)
+                break
     files, seen = [], set()
     for m in _LINK_RE.finditer(text):
         a, token, fname, inner = m.group(1), m.group(2), m.group(3), m.group(4)
@@ -521,7 +567,7 @@ def _parse_page(text: str) -> dict:
                       "size_mb": _size_mb(size_text),
                       "quality": _quality_of(fname, label), "label": label,
                       "season": season, "episode": episode})
-    return {"title": title, "files": files}
+    return {"title": title, "thumb": thumb, "files": files}
 
 
 async def _page(m_id: str) -> Optional[dict]:
@@ -612,10 +658,14 @@ async def _resolve_many(items: List[dict], concurrency: int = 8) -> List[Optiona
 
 async def probe_tdmmo(imdb_id: str, names: List[str], year: Optional[int],
                       is_series: bool, season: Optional[int] = None,
-                      episode: Optional[int] = None, timeout: float = 14.0) -> List[dict]:
+                      episode: Optional[int] = None, timeout: float = 14.0,
+                      lazy: bool = False) -> List[dict]:
     """
     سرچ موازی اسم‌ها در tdmmo → بهترین صفحه (اسم+سال، جریمه‌ی سال مخالف) →
     فیلم: همه‌ی کیفیت‌ها | سریال: فایل‌های (فصل،قسمت) دقیق → entry یا [].
+
+    🆕 z24 — lazy=True (اینلاین): ردیف‌ها بدون resolve برمی‌گردن (token دارن)؛
+    URL فقط وقتی ساخته می‌شه که کاربر روی همون قسمت/کیفیت کلیک کنه (resolve_row).
     """
     if not names:
         return []
@@ -674,48 +724,93 @@ async def probe_tdmmo(imdb_id: str, names: List[str], year: Optional[int],
             return []
 
         # ۳) انتخاب فایل‌ها
-        if is_series:
-            if not (season and episode):
-                return []  # سریال فقط در سطح قسمت سرو می‌شه (پروب بعد از انتخاب قسمت میاد)
-            pool = [f for f in files if f.get("episode") == episode]
-            if not pool:
-                logger.info("[Tdmmo] %s: S%sE%s not on page (%d files)",
-                            imdb_id, season, episode, len(files))
-                return []
-            explicit = [f for f in pool if f.get("season") == season]
-            ambiguous = [f for f in pool if f.get("season") is None]
-            picked = list(explicit)
-            resolved: Dict[str, Optional[dict]] = {}
-            if ambiguous:
-                # فصل واقعی از مسیر CDN (faslN) — حقیقت، نه حدس (یک بار resolve، بعد فیلتر)
-                rs_list = await _resolve_many(ambiguous)
-                for f, rs in zip(ambiguous, rs_list):
-                    resolved[f["token"]] = rs
-                    if rs and (rs.get("season_path") == season
-                               or (rs.get("season_path") is None and season == 1)):
-                        picked.append(f)
-            if not picked:
-                logger.info("[Tdmmo] %s: S%sE%s files exist but other season",
-                            imdb_id, season, episode)
-                return []
-            for f in picked:
-                if f["token"] not in resolved:
-                    resolved[f["token"]] = await _resolve(f["token"], f["fname"])
+        # 🆕 z24 — lazy=True (اینلاین): هیچ resolve اولیه‌ای نمی‌زنیم — قبلاً برای
+        # «هر» فایل یه ریکوئست resolve می‌شد (صفحه‌ی سریال با ۹۲ فایل → ۱۷ ثانیه
+        # → تایم‌اوت!). حالا فقط لیبل‌بندی می‌کنیم و resolve فقط برای همون
+        # قسمت/کیفیتی که کاربر کلیک کرد انجام می‌شه (۱ ریکوئست به‌جای ۹۲).
+        page_is_series = is_series or (
+            sum(1 for f in files if f.get("episode")) >= 3)
+        if page_is_series:
+            if season and episode:
+                # فلوی منوی IMDB — فقط همین قسمت
+                pool = [f for f in files if f.get("episode") == episode]
+                if not pool:
+                    logger.info("[Tdmmo] %s: S%sE%s not on page (%d files)",
+                                imdb_id, season, episode, len(files))
+                    return []
+                explicit = [f for f in pool if f.get("season") == season]
+                ambiguous = [f for f in pool if f.get("season") is None]
+                picked = list(explicit)
+                resolved: Dict[str, Optional[dict]] = {}
+                if ambiguous and not lazy:
+                    # فصل واقعی از مسیر CDN (faslN) — حقیقت، نه حدس
+                    rs_list = await _resolve_many(ambiguous)
+                    for f, rs in zip(ambiguous, rs_list):
+                        resolved[f["token"]] = rs
+                        if rs and (rs.get("season_path") == season
+                                   or (rs.get("season_path") is None and season == 1)):
+                            picked.append(f)
+                elif ambiguous and lazy:
+                    picked += ambiguous
+                if not picked:
+                    logger.info("[Tdmmo] %s: S%sE%s files exist but other season",
+                                imdb_id, season, episode)
+                    return []
+                if not lazy:
+                    for f in picked:
+                        if f["token"] not in resolved:
+                            resolved[f["token"]] = await _resolve(f["token"], f["fname"])
+                rows = []
+                for f in picked:
+                    rs = resolved.get(f["token"]) if not lazy else None
+                    if lazy or (rs and rs.get("url")):
+                        rows.append({"url": (rs or {}).get("url", "") if not lazy else "",
+                                     "label": f["quality"] or "Auto",
+                                     "size_mb": f["size_mb"], "fname": f["fname"],
+                                     "token": f["token"]})
+                return _mk_entry(rows, best, page, lazy=lazy)
+            # 🆕 z24 — اینلاین (بدون فصل/قسمت): لیست قسمت‌ها با لیبل فارسی
+            # «قسمت N» (+کیفیت اگه تو اسم/لیبل بود) — هر قسمت بزرگ‌ترین فایل
+            by_ep: Dict[int, dict] = {}
+            for f in files:
+                ep = f.get("episode")
+                if not ep:
+                    continue
+                cur = by_ep.get(ep)
+                if cur is None or f.get("size_mb", 0) > cur.get("size_mb", 0):
+                    by_ep[ep] = f
             rows = []
-            for f in picked:
-                rs = resolved.get(f["token"])
-                if rs and rs.get("url"):
-                    rows.append({"url": rs["url"], "label": f["quality"] or "Auto",
-                                 "size_mb": f["size_mb"], "fname": f["fname"]})
-            return _mk_entry(rows, best, page)
+            for ep in sorted(by_ep):
+                f = by_ep[ep]
+                lab = f"قسمت {ep}"
+                if f["quality"]:
+                    lab += f" · {f['quality']}"
+                rows.append({"url": "", "label": lab, "size_mb": f["size_mb"],
+                             "fname": f["fname"], "token": f["token"],
+                             "episode": ep})
+            return _mk_entry(rows, best, page, lazy=True)
         # فیلم
-        resolved = await _resolve_many(files)
+        # 🆕 z24 — ددوپ: هم‌کیفیت‌ها (منابع تکراری سایت) → بزرگ‌ترین فایل
+        best_by_q: Dict[str, dict] = {}
+        for f in files:
+            q = f["quality"] or "Auto"
+            cur = best_by_q.get(q)
+            if cur is None or f.get("size_mb", 0) > cur.get("size_mb", 0):
+                best_by_q[q] = f
+        uniq = list(best_by_q.values())
+        if lazy:
+            return _mk_entry([{"url": "", "label": f["quality"] or "Auto",
+                               "size_mb": f["size_mb"], "fname": f["fname"],
+                               "token": f["token"]} for f in uniq],
+                             best, page, lazy=True)
+        resolved = await _resolve_many(uniq)
         rows = []
-        for f, rs in zip(files, resolved):
+        for f, rs in zip(uniq, resolved):
             if rs and rs.get("url"):
                 rows.append({"url": rs["url"], "label": f["quality"] or "Auto",
-                             "size_mb": f["size_mb"], "fname": f["fname"]})
-        return _mk_entry(rows, best, page)
+                             "size_mb": f["size_mb"], "fname": f["fname"],
+                             "token": f["token"]})
+        return _mk_entry(rows, best, page, lazy=False)
 
     try:
         return await asyncio.wait_for(_guarded(), timeout + 10.0)
@@ -724,11 +819,19 @@ async def probe_tdmmo(imdb_id: str, names: List[str], year: Optional[int],
         return []
 
 
-def _mk_entry(rows: List[dict], cand: dict, page: dict) -> List[dict]:
-    """entry استاندارد (شکل سرورهای CDN) — لیبل کیفیت یکتا؛ تکراری → پسوند سایز."""
+def _mk_entry(rows: List[dict], cand: dict, page: dict, lazy: bool = False) -> List[dict]:
+    """entry استاندارد (شکل سرورهای CDN) — 🆕 z24: lazy/تامبنیل/لیبل قسمت.
+
+    lazy=True → rows هنوز URL ندارن (token/fname دارن)؛ کلیک کاربر → resolve_row.
+    لیبل‌های «قسمت N» صعودی مرتب می‌شن؛ کیفیت‌ها نزولی (۱۰۸۰ اول).
+    """
     if not rows:
         return []
-    rows.sort(key=lambda r: -(int(re.sub(r"\D", "", r["label"] or "0") or 0)))
+    is_ep = all(r.get("episode") for r in rows)
+    if is_ep:
+        rows.sort(key=lambda r: int(r.get("episode") or 0))          # قسمت ۱، ۲، ۳...
+    else:
+        rows.sort(key=lambda r: -(int(re.sub(r"\D", "", r["label"] or "0") or 0)))
     seen = set()
     quals = []
     for r in rows:
@@ -736,20 +839,46 @@ def _mk_entry(rows: List[dict], cand: dict, page: dict) -> List[dict]:
         if lab in seen and lab != "Auto":
             lab = f"{lab} ({r['size_mb']}MB)" if r.get("size_mb") else lab + " ∙"
         seen.add(lab)
-        quals.append({"label": lab, "url": r["url"], "bandwidth": 0,
-                      "resolution": ""})
+        quals.append({"label": lab, "url": r.get("url") or "", "bandwidth": 0,
+                      "resolution": "", "size_mb": r.get("size_mb", 0),
+                      "token": r.get("token", ""), "fname": r.get("fname", "")})
+    thumb = (page.get("thumb") if isinstance(page, dict) else "") or (cand.get("thumb") if isinstance(cand, dict) else "") or ""
+    n_eps = sum(1 for q in quals if str(q.get("label", "")).startswith("قسمت"))
     return [{
         "server": "FJ",
         "type": "mp4",
         "headers": {"User-Agent": _USER_AGENT, "Referer": f"{_BASE}/"},
-        "url": quals[0]["url"],
+        "url": quals[0]["url"] if not lazy else "",
         "qualities": quals,
         "unverified": False,
+        "lazy": bool(lazy),
+        "thumb": thumb,
         "iran": True,
         "iran_meta": {"post_url": f"{_BASE}/movie?m={cand['id']}",
                       "post_title": page.get("title") or cand["title"],
+                      "thumb": thumb,
+                      "is_series": bool(n_eps >= 3),
+                      "episodes": n_eps or None,
                       "source": "fj"},
     }]
+
+
+async def resolve_row(row: dict) -> Optional[str]:
+    """🆕 z24 — رزولوشن تنبل یک ردیف FJ (token+fname) → URL مستقیم CDN یا None.
+
+    برای دکمه‌های دانلود اینلاین: به‌جای resolve همه‌ی فایل‌های صفحه (که پروب
+    رو ۱۷ ثانیه‌ای می‌کرد)، فقط همون یکی که کاربر انتخاب کرده resolve می‌شه.
+    """
+    if not isinstance(row, dict):
+        return None
+    if row.get("url"):
+        return row["url"]
+    token = row.get("token")
+    fname = row.get("fname")
+    if not token or not fname:
+        return None
+    rs = await _resolve(token, fname)
+    return (rs or {}).get("url")
 
 
 # ═══════════════════════════════════════════════════════════

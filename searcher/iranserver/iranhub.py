@@ -578,12 +578,15 @@ async def probe_iran_sources(
     season: Optional[int] = None,
     episode: Optional[int] = None,
     timeout: float = 12.0,
+    lazy: bool = False,
 ) -> List[dict]:
     """
     🆕 z20 — سرچ همزمان منابع ایرانی برای اسم‌ها → انتخاب بهترین پست (tt دقیق
     اولویت مطلق) → لینک‌های مستقیم کیفیت/قسمت → entry های هم‌شکل سرورهای CDN.
     🆕 z21 — سرور FJ (tdmmo.xyz، اکانت‌دار + کپچای ریاضی) همزمان با زنجیره‌ی بالا
     پروب می‌شه (تسک موازی — صفر تاخیر اضافه) و entry های خودش رو با برچسب FJ 🇮🇷 اضافه می‌کنه.
+    🆕 z24 — lazy=True: FJ بدون resolve اولیه جواب می‌ده (برای اینلاین — سریع؛
+    resolve فقط موقع کلیک کاربر انجام می‌شه).
     """
     if not names:
         return []
@@ -591,7 +594,7 @@ async def probe_iran_sources(
 
     # 🆕 z21: FJ از همین لحظه به‌صورت موازی شروع می‌شه — با فلوی legacy تداخل زمانی نداره
     tdmmo_task = asyncio.create_task(_probe_tdmmo_safe(
-        imdb_id, names, year, is_series, season, episode, timeout))
+        imdb_id, names, year, is_series, season, episode, timeout, lazy))
 
     legacy = []
     try:
@@ -601,7 +604,12 @@ async def probe_iran_sources(
         logger.warning("[IranHub] legacy iran probe failed: %s", e)
 
     try:
-        fj_entries = await asyncio.wait_for(tdmmo_task, timeout=max(6.0, timeout))
+        # 🆕 z24 — wait به‌جای wait_for: تایم‌اوت تسک FJ رو «نمی‌کشه» — بک‌گراند
+        # ادامه می‌ده و کش سرچ/صفحه/لاگین tdmmo رو گرم می‌کنه (کوئری بعدی فوریه).
+        # لاگین FJ بار اول ~۵-۱۰ ثانیه می‌بره؛ بعدش با سشن keep-alive فقط ۲-۴ ثانیه.
+        _done, _pending = await asyncio.wait({tdmmo_task}, timeout=max(8.0, timeout))
+        if tdmmo_task in _done and not tdmmo_task.exception():
+            fj_entries = tdmmo_task.result() or []
     except Exception as e:
         logger.warning("[IranHub] FJ probe dropped: %s", e)
         fj_entries = []
@@ -619,12 +627,14 @@ async def _probe_tdmmo_safe(
     season: Optional[int],
     episode: Optional[int],
     timeout: float,
+    lazy: bool = False,
 ) -> List[dict]:
     """پروب FJ با عایق خطا — هرگز exception به بالا نمی‌ده."""
     try:
         from searcher.iranserver.tdmmo import probe_tdmmo
         return await probe_tdmmo(imdb_id, names, year, is_series,
-                                 season=season, episode=episode, timeout=timeout)
+                                 season=season, episode=episode, timeout=timeout,
+                                 lazy=lazy)
     except Exception as e:
         logger.warning("[IranHub] FJ probe failed: %s", e)
         return []
