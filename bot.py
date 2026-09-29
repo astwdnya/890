@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z27"  # نشانگر نسخه — تو لاگ استارت باید z27 دیده بشه (🆕 z27: سافت‌ساب زرد استایل‌دار — ASS داخل MKV؛ VLC بدون تنظیمات زرد نشون می‌ده)
+BOT_BUILD = "z28"  # نشانگر نسخه — تو لاگ استارت باید z28 دیده بشه (🆕 z28: زیرنویس زرد پایین‌تر آمد — MarginV 45→15؛ z27: سافت‌ساب زرد استایل‌دار — ASS داخل MKV)
 
 # ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
 # 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
