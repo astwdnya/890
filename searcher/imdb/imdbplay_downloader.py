@@ -84,6 +84,13 @@ SEG_RETRIES         = int(os.environ.get("IMDB_SEG_RETRIES", "5"))        # تل
 #   3) concat بلاک‌کننده‌ی event loop (subprocess.run چند دقیقه‌ای) → بات مرده به نظر می‌رسه
 SEG_HARD_BACKSTOP   = float(os.environ.get("IMDB_SEG_BACKSTOP", "15"))    # ⏱ سقف سخت wait_for روی هر درخواست (SEG_TIMEOUT + این)
 SEG_STALL_TIMEOUT   = float(os.environ.get("IMDB_SEG_STALL", "150"))      # ⏱ اگه این‌قدر ثانیه هیچ پیشرفتی نبود → راند force-finish می‌شه
+# 🆕 z29 — استریم + Resume بایتی:
+# لاگ Avengers (Vidzee/cdn2.ngcorp.dad) نشون داد سگمنت‌های ۱-۱۳ مگابایتی با throttle
+# ~۸۰-۱۳۰KB/s به‌ازای هر کانکشن، در سقف SEG_TIMEOUT=45s هیچ‌وقت کامل نمی‌شن و
+# بایت‌های دریافت‌شده در هر تلاش دور ریخته می‌شن → سگمنت همیشه fail می‌شه.
+# راه‌حل: استریم چانک‌به‌چانک روی دیسک (.part) + ادامه با «Range: bytes=<دریافتی>-»
+SEG_ATTEMPT_CAP = float(os.environ.get("IMDB_SEG_ATTEMPT_CAP", "300"))  # 🆕 z29: سقف زمان هر تلاش استریم (ثانیه)
+SEG_STALL_READ  = float(os.environ.get("IMDB_SEG_STALL_READ", "20"))   # 🆕 z29: بدون پیشرفت در خواندن چانک → تلاش قطع، بعداً resume
 ALLOW_REENCODE      = os.environ.get("IMDB_ALLOW_REENCODE", "0") == "1"   # re-encode چندساعته پیش‌فرض خاموشه
 
 # TMDB API key که vidzee و چند سرور دیگه استفاده می‌کنن (به صورت embedded در JS اون‌هاست).
@@ -1528,6 +1535,26 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
     return entries
 
 
+def _resp_header(hs, name: str) -> str:
+    """🆕 z29: خواندن case-insensitive یک هدر از response (curl_cffi Headers)."""
+    if not hs:
+        return ""
+    try:
+        v = hs.get(name)
+        if v is not None and str(v):
+            return str(v)
+    except Exception:
+        pass
+    try:
+        for k in list(hs.keys()):
+            if str(k).lower() == name.lower():
+                v = hs.get(k)
+                return str(v) if v is not None else ""
+    except Exception:
+        pass
+    return ""
+
+
 async def _hls_segment_engine(
     segments: List[Tuple[str, float]],
     variant_url: str,
@@ -1584,47 +1611,138 @@ async def _hls_segment_engine(
                 pass
 
     async def _fetch_one(idx: int, url: str, tries: int):
+        """🆕 z29: دانلود سگمنت با استریم + Resume بایتی (Range).
+
+        مشکل قبلی (لاگ Avengers/Vidzee): sess.get غیر‌استریم باید «کل بدنه» رو داخل
+        SEG_TIMEOUT=45s می‌گرفت؛ سگمنت‌های ۱-۱۳ مگابایتی روی CDNهای throttleشده
+        هیچ‌وقت کامل نمی‌شدن، تلاش fail می‌شد و بایت‌های گرفته‌شده دور ریخته می‌شد.
+        حالا:
+          - استریم چانک‌به‌چانک مستقیم روی فایل .part → بایت‌ها همون لحظه شمرده
+            می‌شن (آمار throughput کنترلر تطبیقی واقعی می‌شه)
+          - گیر/تایم‌اوت/قطع‌شدن → تلاش بعدی با «Range: bytes=<دریافتی>-» ادامه می‌ده
+            (هیچ بایتی دوباره دانلود نمی‌شه)
+          - هدر Content-Length/Content-Range چک می‌شه تا استریم ناقص شناسایی بشه
+        """
         abs_url = _make_absolute(variant_url, url)
         sess = state.get("session") or shared_session
+        ext = "m4s" if init_path else "ts"
+        final_path = os.path.join(out_dir, f"seg_{idx:05d}.{ext}")
+        part_path = final_path + ".part"
+
+        # بایت‌های جمع‌شده از تلاش‌های قبلی (همون راند یا راندهای بعدی)
+        have = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+        expected = 0  # اندازه‌ی کل سگمنت وقتی از هدر معلومه (0 = نامعلوم)
+
+        async def _finish():
+            os.replace(part_path, final_path)
+            seg_paths[idx] = final_path
+            counters["done"] += 1
+            _report()
+
         for attempt in range(max(1, tries)):
             if state["abort"] or state.get("stall"):
                 return
+            w = None
             try:
-                # 🛡 z17: backstop سخت — حتی اگه curl_cffi گیر کنه یا event loop شلوغ باشه،
-                # این wait_for بعد از SEG_TIMEOUT+SEG_HARD_BACKSTOP ثانیه حتماً برمی‌گرده.
-                # بدون این، یک درخواست گیرکرده = فریز ابدی در ۹۹٪!
-                r = await asyncio.wait_for(
+                req_headers = dict(headers)
+                if have > 0:
+                    req_headers["Range"] = f"bytes={have}-"
+                w = await asyncio.wait_for(
                     sess.get(
                         abs_url, impersonate=_BROWSER_IMPERSONATE,
-                        timeout=SEG_TIMEOUT, headers=headers,
+                        timeout=SEG_ATTEMPT_CAP, headers=req_headers,
+                        stream=True,
                     ),
-                    timeout=SEG_TIMEOUT + SEG_HARD_BACKSTOP,
+                    # فقط تا رسیدن هدرها — بدنه با SEG_STALL_READ کنترل می‌شه
+                    timeout=min(60.0, SEG_ATTEMPT_CAP) + SEG_HARD_BACKSTOP,
                 )
-                if r.status_code == 200 and r.content:
-                    data = r.content
-                    ext = "m4s" if init_path else "ts"
-                    seg_path = os.path.join(out_dir, f"seg_{idx:05d}.{ext}")
-                    with open(seg_path, "wb") as f:
-                        f.write(data)
-                    seg_paths[idx] = seg_path
-                    counters["done"] += 1
-                    counters["bytes"] += len(data)
-                    _report()
+                if w.status_code == 416:
+                    # بازه‌ی درخواستی خارج از محدوده — یا part کامل شده یا خرابه
+                    m416 = re.search(r"\*/(\d+)", _resp_header(w.headers, "Content-Range"))
+                    total416 = int(m416.group(1)) if m416 else 0
+                    if (not total416 and have > 0) or (total416 and have >= total416):
+                        await _finish()
+                        return
+                    have = 0
+                    expected = 0
+                    try:
+                        os.unlink(part_path)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(min(2.0, 0.4 * (attempt + 1)))
+                    continue
+                if w.status_code not in (200, 206):
+                    # 403/429/502/… → backoff کوتاه و تلاش دوباره
+                    await asyncio.sleep(min(2.0, 0.4 * (attempt + 1)))
+                    continue
+                # سرور به Range توجه نکرد (200 با part موجود) → از صفر
+                if have > 0 and w.status_code == 200:
+                    have = 0
+                    expected = 0
+                # اندازه‌ی کل سگمنت از هدر
+                if w.status_code == 206:
+                    m206 = re.search(r"/(\d+)\s*$", _resp_header(w.headers, "Content-Range"))
+                    if m206:
+                        expected = int(m206.group(1))
+                else:
+                    cl = _resp_header(w.headers, "Content-Length")
+                    if cl.isdigit():
+                        expected = have + int(cl)
+
+                # ─── استریم چانک‌به‌چانک روی دیسک (هیچ بایتی دور ریخته نمی‌شه) ───
+                mode = "ab" if have > 0 else "wb"
+                chunks_it = w.aiter_content(chunk_size=65536).__aiter__()
+                with open(part_path, mode) as f:
+                    while True:
+                        chunk = await asyncio.wait_for(
+                            chunks_it.__anext__(), timeout=SEG_STALL_READ)
+                        f.write(chunk)
+                        have += len(chunk)
+                        counters["bytes"] += len(chunk)  # 🆕 z29: آمار زنده‌ی واقعی
+                if (not expected) or have >= expected:
+                    await _finish()
                     return
-                # 403/429/502/… → backoff کوتاه و تلاش دوباره
-                await asyncio.sleep(min(2.0, 0.4 * (attempt + 1)))
+                # استریم بدون خطا ولی ناقص بسته شد → تلاش بعدی ادامه می‌ده
+                logger.debug("seg %d attempt %d truncated (%d/%d) — will resume",
+                             idx, attempt + 1, have, expected)
+                await asyncio.sleep(min(1.5, 0.3 * (attempt + 1)))
+            except StopAsyncIteration:
+                # بدنه سالم به انتها رسید
+                if (not expected) or have >= expected:
+                    try:
+                        await _finish()
+                    except FileNotFoundError:
+                        pass
+                    return
+                logger.debug("seg %d attempt %d eof-truncated (%d/%d) — will resume",
+                             idx, attempt + 1, have, expected)
+                await asyncio.sleep(min(1.5, 0.3 * (attempt + 1)))
             except asyncio.TimeoutError:
-                # ⏱ z17: تایم‌اوت سخت wait_for — مثل یک تلاش ناموفق حساب کن
-                logger.debug("seg %d attempt %d hard-backstop timeout", idx, attempt + 1)
+                # ⏱ گیر (بدون پیشرفت) — بایت‌های گرفته‌شده در .part موندن
+                logger.debug("seg %d attempt %d stalled at %d bytes — resume later",
+                             idx, attempt + 1, have)
                 await asyncio.sleep(min(3.0, 0.5 * (attempt + 1)))
             except asyncio.CancelledError:
                 state["abort"] = True
                 raise
             except Exception as e:
-                logger.debug("seg %d attempt %d failed: %s", idx, attempt + 1, e)
+                logger.debug("seg %d attempt %d failed at %d bytes: %s",
+                             idx, attempt + 1, have, e)
                 await asyncio.sleep(min(3.0, 0.5 * (attempt + 1)))
+            finally:
+                if w is not None:
+                    _close = getattr(w, "aclose", None) or getattr(w, "close", None)
+                    if _close:
+                        try:
+                            res = _close()
+                            if hasattr(res, "__await__"):
+                                await asyncio.wait_for(res, timeout=5)
+                        except Exception:
+                            pass
+
         counters["failed"] += 1
-        logger.warning("[SEG] seg %d failed after %d attempts", idx, max(1, tries))
+        logger.warning("[SEG] seg %d incomplete after %d attempts — kept %d bytes for resume",
+                       idx, max(1, tries), have)
 
     async def _worker():
         try:
