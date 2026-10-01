@@ -161,32 +161,38 @@ async def get_server_info(
         return None
 
 
-def burn_subtitle_local(video_path: str, subtitle_path: str, out_path: str) -> Optional[str]:
+def burn_subtitle_local(video_path: str, subtitle_path: str, out_path: str,
+                        sync_info: Optional[dict] = None) -> Optional[str]:
     """Alias for embed_subtitle_soft (softsub, not hardcode)"""
     try:
         from imdbplay_downloader import embed_subtitle_soft as _embed
-        return _embed(video_path, subtitle_path, out_path)
+        return _embed(video_path, subtitle_path, out_path, sync_info=sync_info)
     except Exception as e:
         logger.error("embed_subtitle_soft failed: %s", e)
         return None
 
 
-def embed_subtitle_soft(video_path: str, subtitle_path: str, out_path: str) -> Optional[str]:
+def embed_subtitle_soft(video_path: str, subtitle_path: str, out_path: str,
+                        sync_info: Optional[dict] = None) -> Optional[str]:
     """
     قرار دادن زیرنویس به‌صورت softsub داخل فایل ویدیو (بدون re-encode).
     این کار خیلی سریع هست (فقط remux) و زیرنویس قابل روشن/خاموش شدن در VLC هست.
+
+    🆕 z34: sync_info (dict اختیاری) بعد از اجرا با نتیجه‌ی همگام‌سازی خودکار
+    زیرنویس پر می‌شه: {applied, factor, reason, ...}
 
     Args:
         video_path: مسیر فایل ویدیو
         subtitle_path: مسیر فایل زیرنویس (VTT یا SRT)
         out_path: مسیر فایل خروجی
+        sync_info: dict اختیاری برای گرفتن نتیجه‌ی sync
 
     Returns:
         مسیر فایل خروجی اگه موفق، None در غیر این صورت.
     """
     try:
         from imdbplay_downloader import embed_subtitle_soft as _embed
-        return _embed(video_path, subtitle_path, out_path)
+        return _embed(video_path, subtitle_path, out_path, sync_info=sync_info)
     except Exception as e:
         logger.error("embed_subtitle_soft failed: %s", e)
         return None

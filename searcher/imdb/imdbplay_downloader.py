@@ -3210,7 +3210,12 @@ def _styled_ass_from_subtitle(subtitle_path: str, out_dir: str) -> Optional[str]
         return None
 
 
-def embed_subtitle_soft(video_path: str, subtitle_path: str, out_path: str) -> Optional[str]:
+def embed_subtitle_soft(
+    video_path: str,
+    subtitle_path: str,
+    out_path: str,
+    sync_info: Optional[dict] = None,
+) -> Optional[str]:
     """
     قرار دادن زیرنویس به‌صورت softsub داخل فایل ویدیو (بدون re-encode).
     این کار خیلی سریع هست (فقط remux) و زیرنویس قابل روشن/خاموش شدن در VLC هست.
@@ -3220,15 +3225,31 @@ def embed_subtitle_soft(video_path: str, subtitle_path: str, out_path: str) -> O
     روی هر دستگاهی زرد دیده می‌شه (بدون نیاز به تغییر تنظیمات VLC).
     اگه این مسیر شکست خورد، به روش‌های قدیمی (MP4/mov_text و MKV/srt) برمی‌گرده.
 
+    🆕 z34: قبل از جاسازی، زیرنویس به‌طور خودکار با ویدیو همگام می‌شه
+    (ویدیوهای PAL-spun/تندتر سرورها vs ساب‌های 23.976-timed → درِیف تجمعی).
+    جزئیات تصمیم در sync_info پر می‌شه (applied/factor/reason).
+
     Args:
         video_path: مسیر فایل ویدیو
         subtitle_path: مسیر فایل زیرنویس (VTT یا SRT)
         out_path: مسیر فایل خروجی (پسوند نهایی خروجی ممکنه .mkv باشه)
+        sync_info: dict اختیاری — بعد از اجرا با نتیجه‌ی sync پر می‌شه
 
     Returns:
         مسیر فایل خروجی اگه موفق، None در غیر این صورت.
     """
     try:
+        # ─── 🆕 z34: همگام‌سازی خودکار زیرنویس با ویدیو ───
+        try:
+            try:
+                from searcher.imdb.subtitle_sync import auto_sync_subtitle
+            except ImportError:
+                from subtitle_sync import auto_sync_subtitle
+            subtitle_path, _sync_factor, _sync_reason = auto_sync_subtitle(
+                video_path, subtitle_path, sync_info=sync_info)
+        except Exception as _sync_err:
+            logger.warning("[z34] subtitle auto-sync skipped: %s", _sync_err)
+
         out_dir = os.path.dirname(out_path) or "."
         os.makedirs(out_dir, exist_ok=True)
 

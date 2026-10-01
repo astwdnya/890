@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z33"  # نشانگر نسخه — تو لاگ استارت باید z33 دیده بشه (🆕 z33: رله‌ی Wayback Machine (اسنپ‌شات+Save-Page-Now) برای سایت‌هایی که CF آی‌پی دیتاسنتر رو بلاک کرده — cartoonprn/pornhex + پیام مرحله‌ای استخراج)
+BOT_BUILD = "z34"  # نشانگر نسخه — تو لاگ استارت باید z34 دیده بشه (🆕 z34: همگام‌سازی خودکار زیرنویس با ویدیو — فیکس درِیف تایمینگ روی ویدیوهای PAL-spun/تندتر سرورهای imdbplay)
 
 # ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
 # 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
@@ -15653,12 +15653,22 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                     softsub_out = os.path.join(out_dir, f"softsub_{int(time.time())}.mkv")
                     # 🛡 z17: embed_subtitle_soft قبلاً subprocess.run بلاک‌کننده بود و
                     # event loop رو حین remux فریز می‌کرد — حالا در thread جدا اجرا می‌شه
+                    # 🆕 z34: همگام‌سازی خودکار زیرنویس با ویدیو (فیکس درِیف تایمینگ)
+                    _sync_info: dict = {}
                     embedded = await asyncio.to_thread(
-                        embed_subtitle_soft, video_path, persian_sub_path, softsub_out)
+                        embed_subtitle_soft, video_path, persian_sub_path, softsub_out, _sync_info)
                     if embedded and os.path.exists(embedded):
                         final_path = embedded
                         if not sub_name:
                             sub_name = "Persian (softsub)"
+                        # 🆕 z34: اگه بازتایم شد، تو کپشن نشون بده
+                        try:
+                            _sf = _sync_info.get("factor")
+                            if _sf and abs(float(_sf) - 1.0) > 1e-6:
+                                sub_name = f"{sub_name} | ⏱️ sync ×{float(_sf):.4f}"
+                                logger.info(f"[IMDB] subtitle auto-synced ×{_sf:.5f}: {_sync_info.get('reason')}")
+                        except Exception:
+                            pass
                         try:
                             await status_msg.edit("✅ زیرنویس داخل ویدیو قرار گرفت!")
                         except Exception:
@@ -15739,12 +15749,25 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
         # If separate subtitle (not softsub), send subtitle file after video
         if do_separate_sub:
             if persian_sub_path and os.path.exists(persian_sub_path):
+                # 🆕 z34: همگام‌سازی خودکار ساب جداگانه هم با همین ویدیو انجام می‌شه
+                try:
+                    from searcher.imdb.subtitle_sync import auto_sync_subtitle as _a_sync
+                    _sp, _sf2, _sr2 = await asyncio.to_thread(
+                        _a_sync, video_path, persian_sub_path)
+                    if _sp and os.path.exists(_sp) and abs(_sf2 - 1.0) > 1e-6:
+                        persian_sub_path = _sp
+                        sub_caption_suffix = f"\n⏱️ زیرنویس با ویدیو همگام شد (×{_sf2:.4f})"
+                    else:
+                        sub_caption_suffix = ""
+                except Exception as _sync_err2:
+                    logger.warning(f"[IMDB] separate-sub auto-sync skipped: {_sync_err2}")
+                    sub_caption_suffix = ""
                 # Already downloaded — just send it
                 sub_size_kb = os.path.getsize(persian_sub_path) / 1024
                 if season and episode:
-                    sub_caption = f"📄 زیرنویس فارسی | **{title}** - S{season:02d}E{episode:02d}"
+                    sub_caption = f"📄 زیرنویس فارسی | **{title}** - S{season:02d}E{episode:02d}{sub_caption_suffix}"
                 else:
-                    sub_caption = f"📄 زیرنویس فارسی | **{title}**"
+                    sub_caption = f"📄 زیرنویس فارسی | **{title}**{sub_caption_suffix}"
                 await event.client.send_file(
                     entity=event.chat_id,
                     file=persian_sub_path,
@@ -15770,11 +15793,22 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                         title=title,
                     )
                     if persian_sub_path and os.path.exists(persian_sub_path):
+                        # 🆕 z34: همگام‌سازی خودکار ساب جداگانه با همین ویدیو
+                        _sync_note2 = ""
+                        try:
+                            from searcher.imdb.subtitle_sync import auto_sync_subtitle as _a_sync2
+                            _sp2, _sf3, _sr3 = await asyncio.to_thread(
+                                _a_sync2, video_path, persian_sub_path)
+                            if _sp2 and os.path.exists(_sp2) and abs(_sf3 - 1.0) > 1e-6:
+                                persian_sub_path = _sp2
+                                _sync_note2 = f"\n⏱️ زیرنویس با ویدیو همگام شد (×{_sf3:.4f})"
+                        except Exception as _sync_err3:
+                            logger.warning(f"[IMDB] separate-sub auto-sync skipped: {_sync_err3}")
                         sub_size_kb = os.path.getsize(persian_sub_path) / 1024
                         if season and episode:
-                            sub_caption = f"📄 زیرنویس فارسی | **{title}** - S{season:02d}E{episode:02d}\n\n📀 از سرورهای imdbplay"
+                            sub_caption = f"📄 زیرنویس فارسی | **{title}** - S{season:02d}E{episode:02d}{_sync_note2}\n\n📀 از سرورهای imdbplay"
                         else:
-                            sub_caption = f"📄 زیرنویس فارسی | **{title}**\n\n📀 از سرورهای imdbplay"
+                            sub_caption = f"📄 زیرنویس فارسی | **{title}**{_sync_note2}\n\n📀 از سرورهای imdbplay"
                         await event.client.send_file(
                             entity=event.chat_id,
                             file=persian_sub_path,

@@ -314,10 +314,24 @@ async def burn_subtitles(
     """
     اجرای کامل: آپلود + burn + دانلود.
 
+    🆕 z34: قبل از آپلود، زیرنویس به‌طور خودکار با ویدیو همگام می‌شه
+    (ویدیوهای PAL-spun/تندتر vs ساب‌های 23.976-timed → درِیف تجمعی).
+
     Returns:
         path ویدیوی نهایی با subtitle هاردکد شده، یا None
     """
     os.makedirs(out_dir, exist_ok=True)
+
+    # ─── 🆕 z34: همگام‌سازی خودکار زیرنویس با ویدیو (non-fatal) ───
+    try:
+        try:
+            from searcher.imdb.subtitle_sync import auto_sync_subtitle
+        except ImportError:
+            from subtitle_sync import auto_sync_subtitle
+        subtitle_path, _sync_factor, _sync_reason = auto_sync_subtitle(video_path, subtitle_path)
+        logger.info("[z34] videotext burn sub-sync: factor=%.5f (%s)", _sync_factor, _sync_reason)
+    except Exception as _sync_err:
+        logger.warning("[z34] videotext burn sub-sync skipped: %s", _sync_err)
 
     # 1. upload
     if on_upload_progress:
