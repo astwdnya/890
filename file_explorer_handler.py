@@ -142,6 +142,65 @@ LITTERBOX_MAX_BYTES = 1000 * 1024 * 1024            # ۱ گیگ — سقف بد�
 # توکن ثبت می‌کنه و Flask (keep-alive) با پشتیبانی Range سروش میده.
 SELF_MAX_BYTES = int(os.environ.get("SELF_MAX_MB", "10000")) * 1024 * 1024
 SELF_EXPIRY_HOURS = float(os.environ.get("SELF_EXPIRY_HOURS", "6"))
+
+# ── 🆕 z30: دستور /time — اعتبار آپلودهای «سرور خودمون» به‌ازای هر کاربر ──
+# /time 12  → آپلودهای بعدی این کاربر ۱۲ ساعت اعتبار دارن
+# /time 999 → بدون انقضا ♾ (تا وقتی خودش با /clean پاکش نکنه)
+# /time 0   → برگشت به پیش‌فرض (SELF_EXPIRY_HOURS)
+# تنظیم هر کاربر جدا تو user_expiry.json ذخیره می‌شه (بعد از ری‌استارت هم می‌مونه)
+# و فقط روی هاست «سرور خودمون» اثر داره؛ بقیه‌ی هاست‌ها سیاست خودشون رو دارن.
+SELF_NO_EXPIRY_TOKEN = 999            # عدد جادویی «بدون انقضا»
+_USER_EXPIRY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_expiry.json")
+_USER_EXPIRY: Dict[str, float] = {}
+
+
+def _load_user_expiry() -> None:
+    global _USER_EXPIRY
+    try:
+        with open(_USER_EXPIRY_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            _USER_EXPIRY = {
+                str(k): float(v)
+                for k, v in raw.items()
+                if isinstance(v, (int, float)) and float(v) > 0
+            }
+    except Exception:
+        pass
+
+
+def _save_user_expiry() -> None:
+    try:
+        tmp = _USER_EXPIRY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_USER_EXPIRY, f, ensure_ascii=False)
+        os.replace(tmp, _USER_EXPIRY_PATH)
+    except Exception as e:
+        logger.warning(f"[FileExplorer] user-expiry save failed: {e}")
+
+
+_load_user_expiry()
+
+
+def get_self_expiry_hours(user_id) -> Optional[float]:
+    """اعتبار (ساعت) آپلودهای «سرور خودمون»یِ این کاربر.
+
+    None = بدون انقضا ♾ (/time 999) | عدد = ساعت | بدون تنظیم = SELF_EXPIRY_HOURS"""
+    h = _USER_EXPIRY.get(str(user_id))
+    if h is None:
+        return SELF_EXPIRY_HOURS if SELF_EXPIRY_HOURS > 0 else None
+    if h >= SELF_NO_EXPIRY_TOKEN:
+        return None
+    return float(h)
+
+
+def _self_expiry_note(hours: Optional[float]) -> str:
+    """متن «اعتبار لینک» برای هاست سرور خودمون — hours=None یعنی ♾"""
+    if hours is None:
+        return "♾ اعتبار لینک: بدون انقضا — تا وقتی خودت با /clean پاکش نکنی"
+    return f"⏳ اعتبار لینک: {hours:g} ساعت (هاست: سرور خودت)"
+
+
 CATBOX_MAX_BYTES = 200 * 1024 * 1024                # سقف catbox.moe (دائمی)
 UGUU_BASE = os.environ.get("UGUU_BASE", "https://uguu.se/upload")
 UGUU_MAX_BYTES = 128 * 1024 * 1024                  # سقف uguu.se (۳ ساعت)
@@ -432,19 +491,32 @@ def _self_server_base() -> str:
     return base if base.startswith(("http://", "https://")) else ""
 
 
-def _self_upload(remote_name: str, local_path: str, prog) -> dict:
+# sentinel — «پارامتر ندادی» با «None = بدون انقضا» فرق داره
+_UNSET = object()
+
+
+def _self_upload(remote_name: str, local_path: str, prog,
+                 expires_hours=_UNSET) -> dict:
     """ثبت فایل روی file_server → لینک پابلیک از دامنه‌ی خودم (سرور خودت).
 
     بدون آپلود شبکه‌ای — فقط هارد‌لینک + توکن (فوری). Flask مسیر /f/<token>
     رو با پشتیبانی Range سرو می‌کنه (همون چیزی که VLC برای Seek لازم داره).
     🆕 هارد‌لینکه نه symlink — یعنی حتی اگه پوشه‌ی فایل اصلی بعد از آپلود
     پاک بشه (work_dir یا کلین‌آپ ۲۰ ثانیه‌ای)، لینک زنده می‌مونه.
-    فایل بعد از SELF_EXPIRY_HOURS (پیش‌فرض ۶ ساعت) خودکار پاک میشه."""
+
+    🆕 z30: expires_hours — عدد = ساعت اعتبار | None = بدون انقضا ♾ (/time 999)
+    | بدون مقدار = SELF_EXPIRY_HOURS (رفتار قدیمی)."""
     from file_server import serve_file
+    if expires_hours is _UNSET:
+        expires_hours = SELF_EXPIRY_HOURS
+    if expires_hours is None or float(expires_hours) >= SELF_NO_EXPIRY_TOKEN:
+        hours = None                    # ♾ بدون انقضا
+    else:
+        hours = float(expires_hours)
     info = serve_file(
         local_path,
         title=remote_name,
-        expires_in_hours=SELF_EXPIRY_HOURS,
+        expires_in_hours=hours,
         public_base_url=_self_server_base(),
     )
     return {"name": remote_name, "play_url": info["url"], "dl_url": info["url"], "page_url": ""}
@@ -459,7 +531,7 @@ class _ChainNullProg:
 
 async def upload_file_via_chain(local_path: str, remote_name: str,
                                 prog=None, status_cb=None,
-                                only: str = "") -> dict:
+                                only: str = "", user_id=None) -> dict:
     """🆕 آپلود فایل به بهترین هاست موجود (زنجیره‌ی fallback) — برای جریان IMDb.
 
     زنجیره: سرور خودم (PUBLIC_BASE_URL) → پیکسل‌درین → Litterbox → Catbox
@@ -471,6 +543,8 @@ async def upload_file_via_chain(local_path: str, remote_name: str,
         remote_name: نام فایل روی هاست
         prog: شیء دارای .cb(done, total) برای پیشرفت آپلود (اختیاری)
         status_cb: async callable(text) برای نمایش وضعیت (اختیاری)
+        user_id: 🆕 z30 آیدی کاربر — اعتبار «سرور خودمون» از /time همون کاربر
+            گرفته میشه (None = پیش‌فرض SELF_EXPIRY_HOURS)
 
     Returns:
         {"provider": id هاست, "fa": نام فارسی, "res": dict نتیجه,
@@ -535,6 +609,9 @@ async def upload_file_via_chain(local_path: str, remote_name: str,
             chain.append("uguu")
         chain.append("gofile")
 
+    # 🆕 z30: اعتبار «سرور خودمون» به‌ازای کاربر (/time) — None = بدون انقضا ♾
+    self_hours = get_self_expiry_hours(user_id) if user_id is not None else SELF_EXPIRY_HOURS
+
     prov_fa = {
         "self": "سرور خودت",
         "pixeldrain": "پیکسل‌درین",
@@ -544,7 +621,7 @@ async def upload_file_via_chain(local_path: str, remote_name: str,
         "gofile": "Gofile",
     }
     expiry_note = {
-        "self": f"⏳ اعتبار لینک: {SELF_EXPIRY_HOURS:g} ساعت (هاست: سرور خودت)",
+        "self": _self_expiry_note(self_hours),
         "pixeldrain": (
             f"⏳ اعتبار لینک: {PIXELDRAIN_AUTO_DELETE_HOURS:g} ساعت (بعدش خودکار پاک میشه)"
             if PIXELDRAIN_AUTO_DELETE_HOURS > 0
@@ -571,7 +648,7 @@ async def upload_file_via_chain(local_path: str, remote_name: str,
             await _status(f"⬆️ در حال آپلود به <b>{_esc(label)}</b>...")
             try:
                 if prov == "self":
-                    res = _self_upload(remote_name, local_path, prog)
+                    res = _self_upload(remote_name, local_path, prog, expires_hours=self_hours)
                 else:
                     if prov == "pixeldrain":
                         coro = _pixeldrain_upload(remote_name, local_path, prog, api_key)
@@ -1083,6 +1160,32 @@ _CLEAN_SHOW = 20                    # حداکثر دکمه‌ی فایل در �
 _CLEAN_MAX_FILES = 200              # سقف فایل‌های لودشده در هر سشن
 
 
+def _disk_stats_lines() -> str:
+    """📊 z30: خطوط آمار حافظه برای /clean — حجم درگیر/کل سرور + فایل‌های هاست‌شده."""
+    try:
+        from file_server import storage_stats
+        s = storage_stats()
+    except Exception:
+        return ""
+    lines = []
+    try:
+        if s.get("total"):
+            used, total, free = s["used"], s["total"], s["free"]
+            pct = used * 100.0 / total
+            lines.append(
+                f"💾 حافظه سرور: {_fmt_size(used)} از {_fmt_size(total)} ({pct:.0f}%) — آزاد: {_fmt_size(free)}"
+            )
+    except Exception:
+        pass
+    try:
+        lines.append(
+            f"📦 فایل‌های هاست‌شده (سرور خودمون): {s.get('count', 0)} فایل — {_fmt_size(s.get('bytes', 0))}"
+        )
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
 def _clean_host_rows():
     return [
         [Button.inline("🟣 پیکسل‌درین", "fclnh_pd")],
@@ -1133,7 +1236,10 @@ async def _clean_fetch(host: str) -> list:
 def _clean_remaining_secs(f: dict, host: str) -> str:
     """برچسب زمانی کوچک برای هر فایل."""
     if host == "self":
-        left = int(f.get("expires_at", 0) - time.time())
+        exp = f.get("expires_at")
+        if exp is None:                      # 🆕 z30: بدون انقضا ♾ (/time 999)
+            return "♾ بدون انقضا"
+        left = int(exp - time.time())
         if left > 0:
             h = left // 3600
             m = (left % 3600) // 60
@@ -1158,7 +1264,11 @@ def _clean_render(sess: dict) -> tuple:
         f"📄 تعداد کل: <b>{len(files)}</b>",
     ]
     if host == "self":
-        lines.append(f"⏳ این فایل‌ها بعد از {SELF_EXPIRY_HOURS:g} ساعت خودکار پاک میشن")
+        lines.append(f"⏳ فایل‌های بدون تنظیم /time بعد از {SELF_EXPIRY_HOURS:g} ساعت خودکار پاک میشن")
+        # 🆕 z30: آمار حافظه سرور — حجم درگیر/کل + فایل‌های هاست‌شده
+        disk_txt = _disk_stats_lines()
+        if disk_txt:
+            lines.extend(["", disk_txt])
     elif host == "pd" and PIXELDRAIN_AUTO_DELETE_HOURS > 0:
         lines.append(f"⏳ فایل‌های ربات بعد از {PIXELDRAIN_AUTO_DELETE_HOURS:g} ساعت خودکار پاک میشن")
     lines.append("")
@@ -1215,9 +1325,12 @@ async def fe_clean_cmd(event):
     except Exception:
         pass
     _clean_gc()
+    # 🆕 z30: همیشه آمار حافظه سرور نشون بده — حجم درگیر/کل + فایل‌های هاست‌شده
+    disk_txt = _disk_stats_lines()
     await event.respond(
         "🧹 <b>پاکسازی فایل‌های ابری</b>\n\n"
-        "فایل‌های کدوم هاست رو می‌خوای ببینی و پاک کنی؟",
+        + (disk_txt + "\n\n" if disk_txt else "")
+        + "فایل‌های کدوم هاست رو می‌خوای ببینی و پاک کنی؟",
         buttons=_clean_host_rows(),
         parse_mode="html",
     )
@@ -1354,9 +1467,12 @@ async def fe_clean_cb(event):
             if sid in _CLEAN_SESSIONS:
                 _CLEAN_SESSIONS.pop(sid, None)
             await event.answer()
+            disk_txt = _disk_stats_lines()
             await _safe_edit(
                 event,
-                "🧹 <b>پاکسازی فایل‌های ابری</b>\n\nفایل‌های کدوم هاست رو می‌خوای ببینی و پاک کنی؟",
+                "🧹 <b>پاکسازی فایل‌های ابری</b>\n\n"
+                + (disk_txt + "\n\n" if disk_txt else "")
+                + "فایل‌های کدوم هاست رو می‌خوای ببینی و پاک کنی؟",
                 _clean_host_rows(),
             )
             return
@@ -1380,6 +1496,103 @@ async def fe_clean_cb(event):
             await event.answer("❌ خطای غیرمنتظره", alert=True)
         except Exception:
             pass
+
+
+# ═══════════ 🆕 z30 دستور /time — اعتبار آپلودهای «سرور خودمون» (هر کاربر) ═══════════
+async def fe_time_cmd(event):
+    """دستور /time — تنظیم مدت اعتبار فایل‌های «سرور خودمون» برای خود کاربر.
+
+    /time          → نمایش تنظیم فعلی + راهنما
+    /time 12       → آپلودهای بعدی این کاربر ۱۲ ساعت اعتبار دارن
+    /time 0.5      → ۳۰ دقیقه
+    /time 999      → ♾ بدون انقضا (تا وقتی خودش با /clean پاکش نکنه)
+    /time 0        → برگشت به پیش‌فرض (SELF_EXPIRY_HOURS)
+
+    فقط روی هاست «سرور خودمون» اثر داره و برای آپلودهای بعدیه؛ تنظیم تو
+    user_expiry.json ذخیره میشه و بعد از ری‌استارت هم می‌مونه."""
+    try:
+        if not _is_authorized(event.sender_id):
+            return  # غیرمجاز — بی‌صدا نادیده
+    except Exception:
+        pass
+    uid = str(event.sender_id)
+    raw = (getattr(event, "raw_text", "") or "")
+    parts = raw.split()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    cur = get_self_expiry_hours(event.sender_id)
+    cur_txt = "♾ بدون انقضا" if cur is None else f"{cur:g} ساعت"
+
+    if not arg:
+        await event.respond(
+            "⏱ <b>اعتبار فایل‌های «سرور خودمون»</b>\n\n"
+            f"⚙️ تنظیم فعلی تو: <b>{cur_txt}</b>\n"
+            f"🌍 پیش‌فرض: {SELF_EXPIRY_HOURS:g} ساعت\n\n"
+            "📅 برای تغییر:\n"
+            "<code>/time 12</code> → ۱۲ ساعت\n"
+            "<code>/time 0.5</code> → ۳۰ دقیقه\n"
+            "<code>/time 999</code> → ♾ بدون انقضا\n"
+            "<code>/time 0</code> → برگشت به پیش‌فرض\n\n"
+            "⚠️ فقط روی «سرور خودمون» اثر داره و برای آپلودهای بعدیه؛ فایل‌هایی که "
+            "قبلاً آپلود شدن با اعتبار قبلی‌شون می‌مونن.",
+            parse_mode="html",
+        )
+        return
+
+    arg = arg.replace("،", ".").replace(",", ".")
+    try:
+        val = float(arg)
+    except ValueError:
+        await event.respond(
+            "❌ عدد نامعتبره. مثال: <code>/time 12</code> یا <code>/time 999</code>",
+            parse_mode="html",
+        )
+        return
+
+    if val <= 0:
+        _USER_EXPIRY.pop(uid, None)
+        _save_user_expiry()
+        await event.respond(
+            f"🔄 برگشت به پیش‌فرض:\n⏳ اعتبار آپلودهای «سرور خودمون»یِ تو: <b>{SELF_EXPIRY_HOURS:g} ساعت</b>",
+            parse_mode="html",
+        )
+        return
+
+    if val < 0.05:
+        await event.respond(
+            "❌ کمترین مقدار ۰٫۰۵ ساعته (۳ دقیقه) هست.",
+            parse_mode="html",
+        )
+        return
+
+    val = min(val, float(SELF_NO_EXPIRY_TOKEN))
+    if val >= SELF_NO_EXPIRY_TOKEN:
+        _USER_EXPIRY[uid] = SELF_NO_EXPIRY_TOKEN
+        _save_user_expiry()
+        await event.respond(
+            "♾ <b>بدون انقضا فعال شد!</b>\n\n"
+            "فایل‌های «سرور خودمون»ی که از الان آپلود می‌کنی تا وقتی خودت پاکشون نکنی می‌مونن.\n"
+            "🧹 هر وقت خواستی پاکشون کنی: <code>/clean</code> → 🖥 سرور خودمون\n\n"
+            "⏱ برگشت به حالت ساعتی: <code>/time 6</code>",
+            parse_mode="html",
+        )
+        return
+
+    _USER_EXPIRY[uid] = val
+    _save_user_expiry()
+    h = int(val)
+    m = int(round((val - h) * 60))
+    if h == 0:
+        dur = f"{m} دقیقه"
+    elif m == 0:
+        dur = f"{h} ساعت"
+    else:
+        dur = f"{h} ساعت و {m} دقیقه"
+    await event.respond(
+        f"✅ <b>ثبت شد!</b>\n\n⏳ آپلودهای «سرور خودمون»یِ تو از الان <b>{dur}</b> اعتبار دارن.\n"
+        "♾ هر وقت خواستی دائمی بشه: <code>/time 999</code>",
+        parse_mode="html",
+    )
 
 
 async def _cloud_gc_loop():
@@ -2792,7 +3005,10 @@ async def fe_vlc_cb(event):
                 try:
                     if prov == "self":
                         try:
-                            res = _self_upload(remote_name, got, prog_up)
+                            res = _self_upload(
+                                remote_name, got, prog_up,
+                                expires_hours=get_self_expiry_hours(event.sender_id),
+                            )
                         except Exception as e:
                             raise _FeError(
                                 f"ثبت روی سرور خودم ناموفق: {_esc(str(e)[:150])}"
@@ -2838,7 +3054,7 @@ async def fe_vlc_cb(event):
         vlc_hint = "🎬 پخش تو VLC: Media → Open Network Stream (Ctrl+N) → لینک رو Paste کن"
         # 🆕 پیام موفقیت یکسان برای همه‌ی هاست‌ها + نکته‌ی اعتبار لینک
         exp_note = {
-            "self": f"⏳ اعتبار لینک: {SELF_EXPIRY_HOURS:g} ساعت (هاست: سرور خودت — لینک پابلیک)",
+            "self": _self_expiry_note(get_self_expiry_hours(event.sender_id)),
             # 🆕 پیکسل‌درین هم دیفالت بعد از چند ساعت خودکار پاک میشه
             "pixeldrain": (
                 f"⏳ اعتبار لینک: {PIXELDRAIN_AUTO_DELETE_HOURS:g} ساعت (بعدش خودکار از پیکسل‌درین پاک میشه)"
@@ -2971,8 +3187,10 @@ def register_file_explorer_handlers(
     # 🆕 دستور /clean — پاکسازی پیکسل‌درین / گوفایل / سرور خودمون
     client.add_event_handler(fe_clean_cmd, events.NewMessage(pattern=r"^/clean(@\w+)?\s*$"))
     client.add_event_handler(fe_clean_cb, events.CallbackQuery(pattern=r"^fcln[a-z0-9_]*$"))
+    # 🆕 z30 دستور /time — تنظیم اعتبار آپلودهای «سرور خودمون» (هر کاربر جدا)
+    client.add_event_handler(fe_time_cmd, events.NewMessage(pattern=r"^/time(@\w+)?( .*)?$"))
 
     asyncio.ensure_future(_session_gc_loop())
     # 🆕 حلقه‌ی حذف خودکار ابری (پیکسل‌درین/گوفایل) + گاربیج سشن /clean
     asyncio.ensure_future(_cloud_gc_loop())
-    logger.info("[FileExplorer] handlers registered (zip/apk/tar/7z/rar + rename + filebin + vlc + cancel + /clean + autodel)")
+    logger.info("[FileExplorer] handlers registered (zip/apk/tar/7z/rar + rename + filebin + vlc + cancel + /clean + /time + autodel)")

@@ -19,9 +19,11 @@ file_server.py
     # → returns 'https://your-host/f/abc123'
 """
 import asyncio
+import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -45,21 +47,90 @@ _CLEANUP_STARTED = False
 _STORAGE_DIR = os.environ.get("FILE_SERVER_DIR") or os.path.join(os.getcwd(), "bot_files_storage")
 os.makedirs(_STORAGE_DIR, exist_ok=True)
 
+# 🆕 z30: رجیستری توکن‌ها روی دیسک هم ذخیره می‌شه (registry.json) تا بعد از
+# ری‌استارت/دیپلوی جدید فایل‌های هاست‌شده همچنان سرو بشن — وگرنه فایلِ
+# «بدون انقضا» (/time 999) بعد از اولین ری‌استارت بی‌صاحب و قربانی
+# orphan-purge می‌شد. فایل‌های منقضی حین آفلاین بودن موقع لود پاک می‌شن.
+_REGISTRY_PATH = os.path.join(_STORAGE_DIR, "registry.json")
+
+
+def _save_registry_locked():
+    """ذخیره‌ی رجیستری روی دیسک — باید با _LOCK گرفته شده صدا زده بشه."""
+    try:
+        tmp = _REGISTRY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_FILES, f, ensure_ascii=False)
+        os.replace(tmp, _REGISTRY_PATH)
+    except Exception as e:
+        logger.warning("[FileServer] registry save failed: %s", e)
+
+
+def _load_registry() -> dict:
+    """لود رجیستری از دیسک (بعد از ری‌استارت) — ورودی‌های بدون فایل/منقضی حذف."""
+    loaded = {}
+    try:
+        with open(_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return loaded
+        now = time.time()
+        for tok, v in raw.items():
+            try:
+                p = v.get("path") or ""
+                if not p or not os.path.isfile(p):
+                    continue
+                exp = v.get("expires_at")
+                if exp is not None and float(exp) < now:
+                    # حین آفلاین بودن منقضی شده — پاک کن
+                    try:
+                        os.unlink(p)
+                    except Exception:
+                        pass
+                    continue
+                loaded[str(tok)] = {
+                    "path": p,
+                    "original_name": v.get("original_name") or "",
+                    "title": v.get("title") or v.get("original_name") or "",
+                    "expires_at": (None if exp is None else float(exp)),
+                    "content_type": v.get("content_type") or "application/octet-stream",
+                    "size": int(v.get("size") or os.path.getsize(p)),
+                }
+            except Exception:
+                continue
+        if loaded:
+            logger.info("[FileServer] registry loaded from disk: %d file(s)", len(loaded))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning("[FileServer] registry load failed: %s", e)
+    return loaded
+
+
+with _LOCK:
+    for _tok, _val in _load_registry().items():
+        _FILES[_tok] = _val
+
 
 def _purge_orphans(max_age_hours: float = None):
     """🆕 پاک‌سازی فایل‌های یتیم استوریج بعد از ری‌استارت ربات.
 
-    رجیستری توکن‌ها تو حافظه‌ست؛ بعد از ری‌استارت دیگه کسی فایل‌های
-    استوریج رو صاحب نیست. هر فایلی که از زمان ساختش (mtime) بیشتر از
-    سقف عمر (env FILE_SERVER_MAX_AGE، دیفالت ۶ ساعت) گذشته باشه پاک میشه
-    تا استوریج (مخصوصاً با Railway Volume) بی‌حد نپره."""
+    🆕 z30: رجیستری حالا روی دیسک ذخیره/لود می‌شه؛ فایل‌های ثبت‌شده
+    (مخصوصاً «بدون انقضا»ی /time 999) از پاک‌سازی معاف هستن و فقط
+    فایل‌های واقعاً بی‌صاحب که از FILE_SERVER_MAX_AGE (دیفالت ۶ ساعت)
+    قدیمی‌ترن حذف می‌شن."""
     try:
         if max_age_hours is None:
             max_age_hours = float(os.environ.get("FILE_SERVER_MAX_AGE", "6"))
         cutoff = time.time() - max_age_hours * 3600
         n = 0
+        # 🆕 z30: فایل‌های ثبت‌شده تو رجیستری (مخصوصاً «بدون انقضا») و خودِ
+        # registry.json نباید orphan حساب بشن — فقط فایل‌های واقعاً بی‌صاحب
+        with _LOCK:
+            registered = {v.get("path") for v in _FILES.values()}
         for name in os.listdir(_STORAGE_DIR):
             p = os.path.join(_STORAGE_DIR, name)
+            if p == _REGISTRY_PATH or p in registered:
+                continue
             try:
                 if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
                     os.unlink(p)
@@ -88,7 +159,11 @@ def _ensure_cleanup_started():
                 time.sleep(60)  # هر دقیقه
                 now = time.time()
                 with _LOCK:
-                    expired = [t for t, v in _FILES.items() if v["expires_at"] < now]
+                    # 🆕 z30: expires_at=None یعنی «بدون انقضا» (/time 999) — هیچوقت پاک نشه
+                    expired = [
+                        t for t, v in _FILES.items()
+                        if v["expires_at"] is not None and v["expires_at"] < now
+                    ]
                     for t in expired:
                         v = _FILES.pop(t)
                         # هارد‌لینک/کپی استوریج پاک میشه — فایل اصلی (اگه هنوز
@@ -99,7 +174,13 @@ def _ensure_cleanup_started():
                                 os.unlink(path)
                         except Exception:
                             pass
-                logger.info("[FileServer] Cleanup: removed %d expired files", len(expired))
+                    if expired:
+                        _save_registry_locked()
+                logger.info(
+                    "[FileServer] Cleanup: removed %d expired file(s) — active: %d (permanent: %d)",
+                    len(expired), len(_FILES),
+                    sum(1 for v in _FILES.values() if v["expires_at"] is None),
+                )
             except Exception as e:
                 logger.warning("[FileServer] Cleanup error: %s", e)
 
@@ -141,7 +222,7 @@ def _guess_content_type(filename: str) -> str:
 def serve_file(
     file_path: str,
     title: str = "",
-    expires_in_hours: float = 6.0,
+    expires_in_hours: Optional[float] = 6.0,
     public_base_url: Optional[str] = None,
     copy: bool = False,
 ) -> dict:
@@ -151,7 +232,9 @@ def serve_file(
     Args:
         file_path: مسیر فایل روی دیسک
         title: عنوان نمایشی (مثلاً "Inception 2010")
-        expires_in_hours: مدت زمان سرو شدن
+        expires_in_hours: مدت زمان سرو شدن — 🆕 z30: None = بدون انقضا ♾
+            (تا وقتی خود کاربر با /clean پاکش نکنه؛ رجیستری روی دیسک ذخیره
+            می‌شه پس بعد از ری‌استارت هم زنده می‌مونه)
         public_base_url: URL پایه عمومی (مثلاً 'https://my-bot.example.com')
             اگه None باشه، از متغیر محیطی PUBLIC_BASE_URL استفاده می‌شه.
         copy: اگه True، فایل کپی می‌شه (به‌جای symlink). برای فایل‌های موقت مناسب‌تره.
@@ -171,7 +254,6 @@ def serve_file(
     token = uuid.uuid4().hex[:16]
     storage_path = os.path.join(_STORAGE_DIR, f"{token}_{os.path.basename(file_path)}")
     abs_src = os.path.abspath(file_path)
-    import shutil
 
     # 🆕 FIX «File deleted from disk»:
     # قبلاً symlink می‌ساختیم که به فایل اصلی اشاره می‌کرد؛ هر وقت پوشه‌ی
@@ -194,7 +276,8 @@ def serve_file(
             pass
         shutil.copy2(abs_src, storage_path)
 
-    expires_at = time.time() + (expires_in_hours * 3600)
+    # 🆕 z30: expires_in_hours=None → بدون انقضا (expires_at=None)
+    expires_at = None if expires_in_hours is None else time.time() + (float(expires_in_hours) * 3600)
     original_name = os.path.basename(file_path)
     content_type = _guess_content_type(original_name)
 
@@ -207,6 +290,7 @@ def serve_file(
             "content_type": content_type,
             "size": os.path.getsize(storage_path),
         }
+        _save_registry_locked()
 
     base = public_base_url or os.environ.get("PUBLIC_BASE_URL", "")
     # 🆕 نرمال‌سازی: کتیشن/فاصله حذف + اسکییم https:// خودکار
@@ -245,7 +329,8 @@ def get_file_info(token: str) -> Optional[dict]:
         v = _FILES.get(token)
         if not v:
             return None
-        if time.time() > v["expires_at"]:
+        # 🆕 z30: expires_at=None = بدون انقضا
+        if v["expires_at"] is not None and time.time() > v["expires_at"]:
             return None
         return {
             "token": token,
@@ -254,7 +339,10 @@ def get_file_info(token: str) -> Optional[dict]:
             "size": v["size"],
             "content_type": v["content_type"],
             "expires_at": v["expires_at"],
-            "expires_in_seconds": int(v["expires_at"] - time.time()),
+            "never_expires": v["expires_at"] is None,
+            "expires_in_seconds": (
+                None if v["expires_at"] is None else int(v["expires_at"] - time.time())
+            ),
         }
 
 
@@ -266,7 +354,8 @@ def list_files() -> list:
     with _LOCK:
         out = []
         for t, v in _FILES.items():
-            if v["expires_at"] < now:
+            # 🆕 z30: expires_at=None = بدون انقضا — همیشه فعاله
+            if v["expires_at"] is not None and v["expires_at"] < now:
                 continue
             out.append({
                 "token": t,
@@ -274,9 +363,13 @@ def list_files() -> list:
                 "title": v["title"],
                 "size": v["size"],
                 "expires_at": v["expires_at"],
+                "never_expires": v["expires_at"] is None,
             })
-    # جدیدترین‌ها اول
-    out.sort(key=lambda x: x["expires_at"], reverse=True)
+    # جدیدترین‌ها اول — «بدون انقضا»ها بالای لیست
+    out.sort(
+        key=lambda x: (x["expires_at"] is None, x["expires_at"] or 0),
+        reverse=True,
+    )
     return out
 
 
@@ -286,6 +379,7 @@ def delete_file(token: str) -> bool:
         v = _FILES.pop(token, None)
         if not v:
             return False
+        _save_registry_locked()  # 🆕 z30: رجیستری سینک بمونه
     try:
         if os.path.islink(v["path"]):
             os.unlink(v["path"])
@@ -303,9 +397,11 @@ def get_served_file(token: str) -> Optional[dict]:
         v = _FILES.get(token)
         if not v:
             return None
-        if time.time() > v["expires_at"]:
+        # 🆕 z30: expires_at=None = بدون انقضا
+        if v["expires_at"] is not None and time.time() > v["expires_at"]:
             # انقضا شده — پاک کن
             _FILES.pop(token, None)
+            _save_registry_locked()
             try:
                 if os.path.islink(v["path"]) or os.path.exists(v["path"]):
                     os.unlink(v["path"])
@@ -313,6 +409,31 @@ def get_served_file(token: str) -> Optional[dict]:
                 pass
             return None
         return v
+
+
+def storage_stats() -> dict:
+    """📊 z30: آمار حافظه برای /clean — فایل‌های هاست‌شده + دیسک کل سرور.
+
+    Returns:
+        {count, bytes, total, used, free} — مقادیر دیسک 0 هستن اگه خوندن شکست بخوره."""
+    now = time.time()
+    total_bytes = 0
+    count = 0
+    with _LOCK:
+        for v in _FILES.values():
+            if v["expires_at"] is not None and v["expires_at"] < now:
+                continue
+            count += 1
+            try:
+                total_bytes += os.path.getsize(v["path"])
+            except Exception:
+                total_bytes += int(v.get("size") or 0)
+    try:
+        du = shutil.disk_usage(_STORAGE_DIR)
+        disk = {"total": du.total, "used": du.used, "free": du.free}
+    except Exception:
+        disk = {"total": 0, "used": 0, "free": 0}
+    return {"count": count, "bytes": total_bytes, **disk}
 
 
 def register_flask_routes(flask_app):

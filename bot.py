@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z29"  # نشانگر نسخه — تو لاگ استارت باید z29 دیده بشه (🆕 z29: موتور سگمنت با استریم+Resume بایتی — سگمنت‌های بزرگ Vidzee دیگه تایم‌اوت نمی‌شن)
+BOT_BUILD = "z30"  # نشانگر نسخه — تو لاگ استارت باید z30 دیده بشه (🆕 z30: دستور /time — اعتبار «سرور خودمون» به‌ازای هر کاربر، 999=♾ بدون انقضا + رجیستری فایل‌ها روی دیسک (بعد ری‌استارت می‌مونه) + /clean حجم درگیر/کل سرور رو نشون میده)
 
 # ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
 # 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
@@ -15038,7 +15038,8 @@ async def _imdb_cloud_deliver(event, status_msg, state, final_path, title,
         up_task = asyncio.create_task(_updater())
         try:
             out = await upload_file_via_chain(final_path, disp, prog=prog,
-                                              status_cb=_status, only=only_provider)
+                                              status_cb=_status, only=only_provider,
+                                              user_id=getattr(event, "sender_id", None))
         finally:
             up_task.cancel()
 
@@ -15082,6 +15083,7 @@ async def _imdb_cloud_deliver(event, status_msg, state, final_path, title,
                     os.path.basename(separate_sub_path),
                     status_cb=_status,
                     only=only_provider,
+                    user_id=getattr(event, "sender_id", None),
                 )
                 sres = sub_out["res"]
                 lines.append("")
