@@ -839,7 +839,7 @@ async def _2embed_get_stream(tmdb_id: str, imdb_id: str, season: Optional[int], 
                         })
                     # vidlink provider has built-in captions
                     if stream.get("captions"):
-                        return {
+                        result = {
                             "url": streams[0]["url"] if streams else None,
                             "headers": streams[0].get("headers", {}) if streams else {},
                             "server": "2Embed",
@@ -847,6 +847,14 @@ async def _2embed_get_stream(tmdb_id: str, imdb_id: str, season: Optional[int], 
                             "qualities": streams,
                             "subtitles": stream.get("captions", []),
                         }
+                        # 🆕 z37 — provider سالم: پروب قبل از بازگشت
+                        _pok, _pdet = await _probe_stream_health(result)
+                        if _pok:
+                            logger.info("2Embed/%s %s -> HEALTHY (%s)", provider, tmdb_id, _pdet)
+                            return result
+                        logger.info("2Embed/%s %s -> probe FAIL (%s) — provider بعدی",
+                                    provider, tmdb_id, _pdet)
+                        continue
                 elif "url" in decrypted:
                     streams.append({
                         "quality": "auto",
@@ -881,13 +889,23 @@ async def _2embed_get_stream(tmdb_id: str, imdb_id: str, season: Optional[int], 
 
                 if streams:
                     logger.info("2Embed/%s %s -> %s", provider, tmdb_id, streams[0]["url"][:80])
-                    return {
+                    result = {
                         "url": streams[0]["url"],
                         "headers": streams[0].get("headers", {}),
                         "server": "2Embed",
                         "type": streams[0].get("type", "mp4"),
                         "qualities": streams,
                     }
+                    # 🆕 z37 — پروب سلامت هر provider؛ زنجیره‌ی «پلی‌لیست سالم ولی
+                    # سگمنت 403» (مثل videasy/streamvaultsrc) اینجا رد می‌شه و
+                    # provider بعدی (hollymoviehd/nextgencloudfabric) امتحان می‌شه.
+                    _pok, _pdet = await _probe_stream_health(result)
+                    if _pok:
+                        logger.info("2Embed/%s %s -> HEALTHY (%s)", provider, tmdb_id, _pdet)
+                        return result
+                    logger.info("2Embed/%s %s -> probe FAIL (%s) — provider بعدی",
+                                provider, tmdb_id, _pdet)
+                    continue
         except Exception as e:
             logger.debug("2Embed provider %s failed: %s", provider, e)
             continue
@@ -1085,6 +1103,13 @@ async def _get_first_working_stream(tmdb_id: str, imdb_id: str, season: Optional
                         stream, expected_s, f"auto:{server['name']}"):
                     stream = None
             if stream and stream.get("url"):
+                # 🆕 z37 — پروب سلامت: زنجیره‌هایی که پلی‌لیست می‌دهند ولی
+                # سگمنت‌شان 403/خالی است اینجا رد می‌شوند (نه وسط دانلود!)
+                _ok, _det = await _probe_stream_health(stream)
+                if not _ok:
+                    logger.info("[IMDBPlay] ✗ Server %s probe FAIL: %s", server["name"], _det)
+                    stream = None
+            if stream and stream.get("url"):
                 logger.info("[IMDBPlay] ✓ Server %s succeeded", server["name"])
                 return stream
             else:
@@ -1247,6 +1272,208 @@ def _compute_gap_spans(segments: List[Tuple[str, float]],
 class _EmptySegmentError(Exception):
     """🆕 z36 — سگمنت HTTP 200 با بدنه‌ی خالی/چندبایتی (CDN خراب)."""
     pass
+
+
+class _SourceBrokenError(Exception):
+    """🆕 z37 — زنجیره/منبع قطعاً خراب است (مدارشکن موتور سگمنت).
+
+    مثال واقعی (لاگ Avengers 720): زنجیره‌ی 2Embed/videasy پلی‌لیست سالم
+    می‌داد ولی هر ۱۷۹۱ سگمنت با 403 bad signature رد می‌شد → ۴ راند retry
+    بی‌فایده ≈ ۱۵ دقیقه گیر + فایل صفر/خراب. با این خطا وسط کار قطع می‌شیم
+    و مثل گیت سلامت، سرور بعدی امتحان می‌شه."""
+    pass
+
+
+# ═══════════════════════════════════════════════════════════
+#   🆕 z37 — پروب سلامت انتها-به-انتها (قبل از پذیرش استریم)
+#   ریشه‌ی رجریشن «130MB خراب»: زنجیره‌ی 2Embed/videasy پلی‌لیست سالم می‌داد
+#   (مدتش هم OK بود) ولی سگمنت‌هایش با «403 bad signature» رد می‌شدند.
+#   پروب = fetch واقعی یک سگمنت؛ اگه سالم نبود، استریم قبل از هر تعهدی رد می‌شه.
+# ═══════════════════════════════════════════════════════════
+
+_PROBE_MAX_BYTES = 1_572_864  # حداکثر ~1.5MB برای سگمنت پروب
+_PROBE_MIN_BYTES = 65_536     # کمتر از این = سگمنت «عملاً خالی»
+
+
+def _label_height(label: str) -> int:
+    """'720p' → 720 (برای انتخاب واریانت متناظر در master)."""
+    try:
+        return int(re.match(r"(\d{3,4})p", (label or "").lower()).group(1))
+    except Exception:
+        return 0
+
+
+async def _probe_stream_health(stream: dict, want_label: str = "",
+                               require_match: bool = False) -> Tuple[bool, str]:
+    """پروب سلامت استریم: پلی‌لیست → (واریانت) → دانلود واقعی یک سگمنت.
+
+    Args:
+        stream: کاندید (url/headers/type)
+        want_label: کیفیت هدف مثل "720p" — فقط برای لاگ/مقایسه
+        require_match: True → اگه رزولوشن واقعی سگمنت قابل تشخیص باشه باید
+            با want_label بخونه (برای سرورهای «فقط Auto» که برچسبی ندارند —
+            تضمین «720 خواستی، 720 می‌گیری» بدون باگ 431MB).
+            LABELED streams (has_q/master-variant) این چک رو لازم ندارند چون
+            برچسب API/master مرجع است؛ پروب فقط سلامت زنجیره رو ثابت می‌کنه.
+
+    Returns:
+        (ok, توضیح) — ok=False یعنی این کاندید را رد کن و برو سراغ بعدی.
+    """
+    url = (stream or {}).get("url") or ""
+    if not url:
+        return False, "بدون URL"
+    headers = {"User-Agent": _USER_AGENT}
+    headers.update((stream or {}).get("headers") or {})
+    stype = (stream or {}).get("type", "hls")
+    wl = (want_label or "").lower()
+
+    def _ffprobe_wh(path: str) -> Tuple[Optional[int], Optional[int]]:
+        try:
+            proc = subprocess.run(
+                ["ffprobe", "-v", "error", "-print_format", "json",
+                 "-show_streams", path], capture_output=True, timeout=30)
+            if proc.returncode != 0:
+                return None, None
+            info = json.loads(proc.stdout.decode("utf-8", errors="replace"))
+            for st in info.get("streams") or []:
+                if st.get("codec_type") == "video" and st.get("width"):
+                    return int(st["width"]), int(st.get("height") or 0)
+        except Exception:
+            pass
+        return None, None
+
+    tmp_path = None
+    try:
+        async with AsyncSession() as s:
+            if stype != "hls":
+                # ─── فایل مستقیم (MP4/MKV) — فقط سلامت + تلاش برای رزولوشن ───
+                r = await s.get(url, impersonate=_BROWSER_IMPERSONATE, timeout=30,
+                                headers={**headers, "Range": "bytes=0-1048575"},
+                                stream=True)
+                if r.status_code not in (200, 206):
+                    return False, f"HTTP {r.status_code} روی هدر/بایت اول"
+                n = 0
+                tmp_path = os.path.join(tempfile.gettempdir(), f"probe_{int(time.time()*1000)}.bin")
+                with open(tmp_path, "wb") as f:
+                    async for ch in r.aiter_content(65536):
+                        f.write(ch)
+                        n += len(ch)
+                        if n >= _PROBE_MAX_BYTES:
+                            break
+                try:
+                    await r.aclose()
+                except Exception:
+                    pass
+                if n < _PROBE_MIN_BYTES:
+                    return False, f"فقط {n} بایت آمد (منبع خالی/خراب)"
+                w, h = _ffprobe_wh(tmp_path)
+                if w and h:
+                    lbl = _resolution_to_label(f"{w}x{h}", 0)
+                    if require_match and wl and lbl.lower() != wl:
+                        return False, f"کیفیت واقعی {lbl} است نه {want_label} ({w}x{h})"
+                    return True, f"direct OK ({n//1024}KB، {lbl} {w}x{h})"
+                if require_match and wl:
+                    return False, "رزولوشن فایل مستقیم قابل تشخیص نیست"
+                return True, f"direct OK ({n//1024}KB)"
+
+            # ─── HLS ───
+            r = await s.get(url, impersonate=_BROWSER_IMPERSONATE, timeout=20,
+                            headers=headers)
+            if r.status_code != 200:
+                return False, f"playlist HTTP {r.status_code}"
+            txt = r.text
+            if "#EXT-X-STREAM-INF" in txt:
+                # master: اول واریانتِ دقیقاً هم‌label، وگرنه نزدیک‌ترین height
+                var_url = None
+                try:
+                    for u, _bw, res in (_parse_master_m3u8(txt) or []):
+                        if wl and _resolution_to_label(res, _bw).lower() == wl:
+                            var_url = _make_absolute(url, u)
+                            break
+                except Exception:
+                    pass
+                if not var_url:
+                    var_url = _pick_variant_url(txt, url, _label_height(wl) or 720)
+                if not var_url:
+                    return False, "master بدون واریانت قابل استفاده"
+                r2 = await s.get(var_url, impersonate=_BROWSER_IMPERSONATE, timeout=20,
+                                 headers=headers)
+                if r2.status_code != 200:
+                    return False, f"variant HTTP {r2.status_code}"
+                txt = r2.text
+                pl_base = var_url
+            else:
+                pl_base = url
+
+            segments, init_url = _parse_variant_m3u8(txt)
+            if not segments:
+                return False, "پلی‌لیست بدون سگمنت"
+            # سگمنت شماره‌ی ۳ (نه صفرم — بعضی CDNها ایندکس/تبلیغ آتیپیک دارند)
+            idx = min(3, len(segments) - 1)
+            seg_abs = _make_absolute(pl_base, segments[idx][0])
+
+            init_bytes = b""
+            if init_url:
+                try:
+                    ri = await s.get(_make_absolute(pl_base, init_url),
+                                     impersonate=_BROWSER_IMPERSONATE, timeout=20,
+                                     headers=headers)
+                    if ri.status_code == 200:
+                        init_bytes = ri.content
+                except Exception:
+                    pass
+
+            w = await s.get(seg_abs, impersonate=_BROWSER_IMPERSONATE, timeout=30,
+                            headers=headers, stream=True)
+            if w.status_code not in (200, 206):
+                body = ""
+                try:
+                    body = (w.text or "")[:40]
+                except Exception:
+                    pass
+                return False, f"سگمنت HTTP {w.status_code} {body!r}"
+            n = 0
+            buf = bytearray()
+            async for ch in w.aiter_content(65536):
+                buf.extend(ch)
+                n += len(ch)
+                if n >= _PROBE_MAX_BYTES:
+                    break
+            try:
+                await w.aclose()
+            except Exception:
+                pass
+            if n < _PROBE_MIN_BYTES:
+                return False, f"سگمنت فقط {n} بایت (منبع خالی/خراب)"
+
+            # رزولوشن واقعی: فقط برای TS خام (بدون init) قابل ffprobe مستقیم است
+            if not init_url:
+                tmp_path = os.path.join(tempfile.gettempdir(), f"probe_{int(time.time()*1000)}.ts")
+                with open(tmp_path, "wb") as f:
+                    f.write(bytes(buf))
+                vw, vh = _ffprobe_wh(tmp_path)
+                if vw and vh:
+                    lbl = _resolution_to_label(f"{vw}x{vh}", 0)
+                    if require_match and wl and lbl.lower() != wl:
+                        return False, (f"کیفیت واقعی {lbl} است نه {want_label} "
+                                       f"({vw}x{vh})")
+                    return True, (f"سگمنت سالم ({n//1024}KB، {lbl} {vw}x{vh})"
+                                  + (f" [هدف: {want_label}]" if wl else ""))
+                if require_match and wl:
+                    return False, "رزولوشن سگمنت قابل تشخیص نیست (پذیرش بدون اثبات رد شد)"
+                return True, f"سگمنت سالم ({n//1024}KB، رزولوشن نامعلوم)"
+            # fMP4 — رزولوشن بدون init قابل تشخیص نیست
+            if require_match and wl:
+                return False, "fMP4 — رزولوشن قابل اثبات نیست (پذیرش بدون اثبات رد شد)"
+            return True, f"سگمنت سالم ({n//1024}KB، fMP4)"
+    except Exception as e:
+        return False, f"probe exception: {type(e).__name__}: {str(e)[:80]}"
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════
@@ -2282,6 +2509,16 @@ async def _hls_segment_engine(
     stats_out["phase"] = "download"
     await _drain([(i, u) for i, (u, _d) in enumerate(segments)], SEG_RETRIES, True)
 
+    # 🆕 z37 — مدارشکن: اگه بعد از راند کاملِ اصلی عملاً هیچی نگرفتیم، منبع/زنجیره
+    # قطعاً خراب است (لاگ Avengers: هر ۱۷۹۱ سگمنت 403 bad signature) — راندهای
+    # ۲-۴ روی همین منبع خراب فقط ده‌ها دقیقه «گیرِ به‌ظاهر بی‌پایان» می‌سازد.
+    if total > 0 and counters["done"] < max(1, int(total * 0.02)):
+        state["abort"] = True
+        raise _SourceBrokenError(
+            f"فقط {counters['done']} سگمنت از {total} گرفته شد "
+            f"({counters['failed']} رد‌شده، {counters['bytes']//1024}KB) — "
+            "زنجیره/منبع خراب است (مثل 403 bad signature)")
+
     # ─── راند دوم: شانس برای سگمنت‌های از دست رفته ───
     missing = [i for i, p in enumerate(seg_paths) if not p]
     if missing:
@@ -2520,8 +2757,16 @@ async def download_with_quality(
                                 f"q:{server['name']}:{quality_label}"):
                             stream = None
                             continue
+                        # 🆕 z37 — پروب سلامت: برچسب API داریم، فقط سلامت زنجیره
+                        _pok, _pdet = await _probe_stream_health(candidate, want_label=quality_label)
+                        if not _pok:
+                            logger.info("[IMDBPlay] ✗ Server %s quality-%s probe FAIL: %s",
+                                        server["name"], quality_label, _pdet)
+                            stream = None
+                            continue
                         stream = candidate
-                        logger.info("[IMDBPlay] ✓ Server %s has quality %s", server["name"], quality_label)
+                        logger.info("[IMDBPlay] ✓ Server %s has quality %s (%s)",
+                                    server["name"], quality_label, _pdet)
                         break
                     else:
                         # 🆕 z36 — لیستِ خودِ سرور برچسب هدف رو نداره؛ شاید master
@@ -2536,9 +2781,16 @@ async def download_with_quality(
                                     candidate, _expected_s,
                                     f"q:{server['name']}:{quality_label} (master)"):
                                 continue
+                            # 🆕 z37 — پروب سلامت (ریشه‌ی رجریشن: همین شاخه
+                            # زنجیره‌ی خراب videasy را بدون آزمون سگمنت می‌پذیرفت)
+                            _pok, _pdet = await _probe_stream_health(candidate, want_label=quality_label)
+                            if not _pok:
+                                logger.info("[IMDBPlay] ✗ Server %s master-variant probe FAIL: %s",
+                                            server["name"], _pdet)
+                                continue
                             stream = candidate
-                            logger.info("[IMDBPlay] ✓ z36 master-variant %s on %s",
-                                        quality_label, server["name"])
+                            logger.info("[IMDBPlay] ✓ z37 master-variant %s on %s (%s)",
+                                        quality_label, server["name"], _pdet)
                             break
                         logger.info("[IMDBPlay] ✗ Server %s doesn't have quality %s (has: %s)",
                                     server["name"], quality_label,
@@ -2557,13 +2809,28 @@ async def download_with_quality(
                                 candidate, _expected_s,
                                 f"q:{server['name']}:{quality_label} (master)"):
                             continue
+                        # 🆕 z37 — پروب سلامت master-variant
+                        _pok, _pdet = await _probe_stream_health(candidate, want_label=quality_label)
+                        if not _pok:
+                            logger.info("[IMDBPlay] ✗ Server %s master-variant probe FAIL: %s",
+                                        server["name"], _pdet)
+                            continue
                         stream = candidate
-                        logger.info("[IMDBPlay] ✓ z36 master-variant %s on %s",
-                                    quality_label, server["name"])
+                        logger.info("[IMDBPlay] ✓ z37 master-variant %s on %s (%s)",
+                                    quality_label, server["name"], _pdet)
                         break
-                    # سرور فقط Auto داره (مثل Vidzee) — اگه کیفیت Auto خواستیم، خوبه
-                    # اگه نه، این سرور رو رد کن
-                    logger.info("[IMDBPlay] ✗ Server %s only has Auto quality", server["name"])
+                    # 🆕 z37 — سرور «فقط Auto» (مثل Vidzee) دیگر کورکورانه رد نمی‌شه:
+                    # پروب می‌شه؛ اگه زنجیره سالم بود و رزولوشن واقعی سگمنت با
+                    # کیفیت هدف بخوند (Vidzee 1920x804 → 720p ✓)، قبوله — همون
+                    # رفتار قدیمیِ «فایل 1800MB» با تضمین کیفیت (بدون باگ 431MB).
+                    _pok, _pdet = await _probe_stream_health(
+                        candidate, want_label=quality_label, require_match=True)
+                    if _pok:
+                        stream = candidate
+                        logger.info("[IMDBPlay] ✓ z37 probe-verified %s on %s (%s)",
+                                    quality_label, server["name"], _pdet)
+                        break
+                    logger.info("[IMDBPlay] ✗ Server %s auto-only/probe fail: %s", server["name"], _pdet)
                     continue
             except Exception as e:
                 logger.warning("[IMDBPlay] ✗ Server %s exception: %s", server["name"], e)
@@ -2891,11 +3158,26 @@ async def download_with_quality(
                 logger.error("Init segment failed to download after 5 attempts — concat will likely fail")
 
         # 🚀 موتور تطبیقی: تعداد کانکشن همزمان رو بر اساس throughput واقعی تنظیم می‌کنه
-        await _hls_segment_engine(
-            segments, variant_url, headers, out_dir, shared_session,
-            seg_paths, init_path,
-            progress_cb=progress_cb, stats_out=stats_out,
-        )
+        try:
+            await _hls_segment_engine(
+                segments, variant_url, headers, out_dir, shared_session,
+                seg_paths, init_path,
+                progress_cb=progress_cb, stats_out=stats_out,
+            )
+        except _SourceBrokenError as _sbe:
+            # 🆕 z37 — منبع قطعاً خراب؛ مثل گیت سلامت: سرور بعدی، بدون اتلاف وقت
+            _srv = stream.get("server") or "?"
+            if _depth < 2 and _srv != "?":
+                logger.warning("[z37] source broken on %s → retry با سرور بعدی: %s",
+                               _srv, _sbe)
+                _exclude.add(_srv)
+                return await download_with_quality(
+                    imdb_id, quality_label, out_dir, season, episode,
+                    progress_cb=progress_cb, preferred_server=preferred_server,
+                    strict_quality=strict_quality, stats_out=stats_out,
+                    title=title, year=year, _exclude=_exclude, _depth=_depth + 1,
+                )
+            raise RuntimeError(str(_sbe))
 
     missing = [i for i, p in enumerate(seg_paths) if not p]
     if missing:

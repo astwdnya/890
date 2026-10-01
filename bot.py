@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z36"  # نشانگر نسخه — تو لاگ استارت باید z36 دیده بشه (🆕 z36: ریشه‌یابی نهایی درِیف ساب — سگمنت‌های CDN ~۰.۸٪ بلندتر از EXTINF اعلامی decode می‌شن؛ ساب حالا با نسبت مدت واقعی/اعلامی بازتایم می‌شه + گیت سلامت فایل خروجی (فایل خراب/صوتی/بریده تحویل نمی‌شه) + رد سگمنت پوچ + retry خودکار سرور بعدی + رفع ناسازگاری منو/دانلودر برای کیفیت خاص)
+BOT_BUILD = "z37"  # نشانگر نسخه — تو لاگ استارت باید z37 دیده بشه (🆕 z37: فیکس رجریشن 720p — ریشه: زنجیره‌ی 2Embed/videasy پلی‌لیست سالم می‌داد ولی همه‌ی سگمنت‌هایش 403 bad signature؛ حالا هر کاندید قبل از پذیرش «پروب سلامت» می‌شه (fetch واقعی سگمنت) + providerهای vidnest به‌ترتیب پروب می‌شن (hollymoviehd/nextgen سالم → جایگزین videasy) + سرورهای فقط-Auto با اثبات رزولوشن واقعی ffprobe قبول می‌شن (بازگشت فایل ~1800MB برای 720p) + مدارشکن موتور سگمنت (پیشرفت <2% → قطع فوری و سرور بعدی به‌جای گیر ۱۵ دقیقه‌ای))
 
 # ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
 # 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
