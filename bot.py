@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z34"  # نشانگر نسخه — تو لاگ استارت باید z34 دیده بشه (🆕 z34: همگام‌سازی خودکار زیرنویس با ویدیو — فیکس درِیف تایمینگ روی ویدیوهای PAL-spun/تندتر سرورهای imdbplay)
+BOT_BUILD = "z35"  # نشانگر نسخه — تو لاگ استارت باید z35 دیده بشه (🆕 z35: فیکس ریشه‌ای درِیف ساب — بازتایم ساب با نقشه‌ی پرش‌های سگمنت گم‌شده + sync ساب جداگانه در مسیر حافظه ابری + sanity-check مدت استریم + fallback جستجوی TMDB)
 
 # ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
 # 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
@@ -15321,6 +15321,20 @@ async def _imdb_cloud_deliver(event, status_msg, state, final_path, title,
             disp += f" S{season:02d}E{episode:02d}"
         disp += os.path.splitext(final_path)[1] or ".mp4"
 
+        # 🆕 z35 — ساب جداگانه هم قبل از آپلود ابری با ویدیو همگام می‌شه
+        # (قبلاً فقط مسیر تلگرام sync می‌شد و مسیر ابری سابِ خام می‌فرستاد!)
+        if separate_sub_path and os.path.exists(separate_sub_path) and \
+                final_path and os.path.exists(final_path):
+            try:
+                from searcher.imdb.subtitle_sync import auto_sync_subtitle as _a_sync_c
+                _spc, _sfc, _srcc = await asyncio.to_thread(
+                    _a_sync_c, final_path, separate_sub_path)
+                if _spc and os.path.exists(_spc) and abs(_sfc - 1.0) > 1e-6:
+                    separate_sub_path = _spc
+                    logger.info("[IMDB] z35 cloud separate-sub auto-synced ×%.5f (%s)", _sfc, _srcc)
+            except Exception as _sync_err:
+                logger.warning("[IMDB] cloud separate-sub auto-sync skipped: %s", _sync_err)
+
         prog = _IMDBUploadProg()
 
         async def _status(text):
@@ -15582,6 +15596,8 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
             video_path = await download_with_quality(
                 imdb_id, quality, out_dir, season, episode, progress_cb=vid_progress,
                 preferred_server=preferred_server, strict_quality=True, stats_out=seg_stats,
+                # 🆕 z35 — برای fallback جستجوی TMDB وقتی find خالیه
+                title=info.get("title"), year=info.get("year"),
             )
         except Exception as dl_err:
             logger.error(f"[IMDB] video download error: {dl_err}", exc_info=True)
@@ -15609,6 +15625,26 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
 
         vid_size = os.path.getsize(video_path) / 1024 / 1024
         await status_msg.edit(f"✅ ویدیو دانلود شد ({vid_size:.1f} MB)")
+
+        # 🆕 z35 — فیکس ریشه‌ای درِیف ساب: اگه سگمنت‌هایی گم شده بودن (پرش محتوایی
+        # تو ویدیوی خروجی)، تایم‌استمپ‌های ساب با نقشه‌ی دقیق همون پرش‌ها جابه‌جا
+        # می‌شن — ساب حتی روی ویدیوی دارای پرش هم برای کل فیلم دقیق می‌مونه.
+        _gap_spans = (seg_stats or {}).get("gap_spans") or []
+        if _gap_spans and persian_sub_path and os.path.exists(persian_sub_path):
+            try:
+                try:
+                    await status_msg.edit("⏱ همگام‌سازی ساب با پرش‌های ویدیو...")
+                except Exception:
+                    pass
+                from searcher.imdb.subtitle_sync import resync_subtitle_to_gaps as _rs_gap
+                _gpath = await asyncio.to_thread(_rs_gap, persian_sub_path, _gap_spans)
+                if _gpath and os.path.exists(_gpath):
+                    persian_sub_path = _gpath
+                    if sub_path:
+                        sub_path = _gpath
+                    logger.info("[IMDB] z35 gap-resync: %d gap(s) → %s", len(_gap_spans), _gpath)
+            except Exception as _gerr:
+                logger.warning("[IMDB] z35 gap-resync skipped: %s", _gerr)
 
         final_path = video_path
 

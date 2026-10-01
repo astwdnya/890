@@ -16,6 +16,15 @@ subtitle_sync.py
   (fps ویدیو ≠ fps زیرنویس)، کل تایم‌استمپ‌ها با ضریب درست مقیاس می‌شن:
       t_video = t_sub × (fps_زیرنویس / fps_ویدیو)
 
+🆕 z35: resync_subtitle_to_gaps — فیکس ریشه‌ای درِیف ناشی از «سگمنت گم‌شده»
+  موتور دانلود HLS وقتی بعد از ۴ راند هنوز سگمنت‌هایی نداشته باشه (تا ۱٪ تحمل
+  می‌شه)، ویدیوی خروجی تو نقطه‌ی اون سگمنت‌ها «پرش محتوایی» داره — تایم‌لاین
+  ادامه پیدا می‌کنه ولی محتوا پریده. ساب خطی روی این ویدیو از هر پرش به بعد
+  برای همیشه جا می‌مونه (همون «هر چند دقیقه باید عقب/جلو کنم»).
+  چون لیست سگمنت‌ها و طول هر کدوم از خود playlist داریم، نقشه‌ی دقیق پرش‌ها
+  معلومه → هر cue در زمان t به t − (مجموع طول پرش‌های قبل از t) منتقل می‌شه.
+  نتیجه: ساب حتی روی ویدیوی دارای پرش هم دقیق می‌مونه.
+
 گاردها (که سابِ سالم دست نخوره):
   - اگه آخرین cue ≤ 45 ثانیه قبل از پایان ویدیو باشه → ساب جفته، دست نمی‌خوره
   - کلیپ < 5 دقیقه، ساب با cue کم، یا سابی که < 50% ویدیو رو پوشش می‌ده → رد
@@ -27,9 +36,14 @@ subtitle_sync.py
   sub_path, factor, reason = auto_sync_subtitle(video_path, sub_path)
   # factor != 1.0 یعنی بازتایم شد
 
+  from searcher.imdb.subtitle_sync import resync_subtitle_to_gaps
+  new_path = resync_subtitle_to_gaps(sub_path, [(120.5, 8.1), (640.0, 9.7)])
+  # هر tuple = (شروع پرش در زمان‌محور محتوا, طول پرش)
+
 غیرفعال‌سازی:  SUB_AUTOSYNC=0
 """
 
+import bisect
 import json
 import logging
 import os
@@ -300,7 +314,14 @@ def _fps_candidates(fps: float) -> List[Tuple[float, str]]:
     لیست ضریب‌های کاندید بر اساس fps ویدیو — به‌ترتیب اولویت (t_v = f × t_s):
       - ویدیو 25/50fps → محتوا PAL-spun شده؛ ساب برای 23.976/24 تایم شده → f < 1
       - ویدیو fps غیراستاندارد → speedup دستی سرور؛ f = fps_اصلی / fps_ویدیو
-      - ویدیو 23.976/24 و ساب PAL-timed → f > 1
+      - ویدیو NTSC-spun 29.97 → f = 23.976/29.97
+
+    🆕 z35 — کاندیدهای «ساب PAL-timed روی ویدیوی 23.976» (f ≈ 1.0427) حذف شدن!
+    تستِ واقعی نشون داد این شاخه برای جفت‌های سالمِ 23.976+23.976 (که فقط کردیت
+    بلند دارن — gap بین 45s و 15% طول ویدیو) هم فعال می‌شد و سابِ سالم رو خراب
+    می‌کرد (false-positive). جهت امن فقط اینه که «ویدیو» غیراستاندارد باشه،
+    چون fps ویدیو مستقیم اندازه‌گیری می‌شه و ساب‌های وب تقریباً همیشه
+    23.976/24-timed هستن.
     """
     cands: List[Tuple[float, str]] = []
     if 24.6 <= fps <= 25.4 or 49.2 <= fps <= 50.8:
@@ -313,9 +334,6 @@ def _fps_candidates(fps: float) -> List[Tuple[float, str]]:
     elif 29.5 <= fps <= 30.5:
         cands.append((_FPS_23976 / _FPS_2997, "ویدیو NTSC-spun 29.97fps"))
         cands.append((24.0 / _FPS_2997, "ویدیو NTSC-spun (ساب 24-timed)"))
-    elif 23.7 <= fps <= 24.2:
-        cands.append((25.0 / _FPS_23976, "ساب PAL-timed روی ویدیو 23.976"))
-        cands.append((25.0 / 24.0, "ساب 25-timed روی ویدیو 24"))
     return cands
 
 
@@ -441,3 +459,140 @@ def auto_sync_subtitle(
         except Exception:
             pass
         return sub_path, 1.0, f"خطا: {e}"
+
+
+# ═══════════════════════════════════════════════════════════
+#   🆕 z35: Gap resync — بازتایم ساب با پرش‌های سگمنت گم‌شده
+# ═══════════════════════════════════════════════════════════
+
+# cue دقیقاً روی شروع پرش هم «بعد از پرش» حساب می‌شه
+_GAP_EPS_S = 0.05
+# مجموع پرش کمتر از این باشه → دست نزن (عملاً محسوس نیست)
+_MIN_TOTAL_GAP_S = 1.0
+
+
+def build_gap_index(gap_spans) -> Tuple[List[float], List[float]]:
+    """
+    [(start, dur), ...] → (starts مرتب‌شده, prefix_durs)
+    prefix_durs[i] = مجموع طول پرش‌های ایندکس < i (برای جستجوی دودویی سریع).
+    """
+    spans = sorted(
+        ((float(s), float(d)) for s, d in (gap_spans or []) if d and float(d) > 0.0),
+        key=lambda x: x[0],
+    )
+    starts = [s for s, _ in spans]
+    pref = [0.0]
+    for _, d in spans:
+        pref.append(pref[-1] + d)
+    return starts, pref
+
+
+def gap_shift_at(t: float, starts: List[float], pref: List[float]) -> float:
+    """کل شیفت محتوایی برای زمان t = مجموع طول پرش‌هایی که در/قبل از t افتادن."""
+    return pref[bisect.bisect_right(starts, t + _GAP_EPS_S)]
+
+
+def _shift_line_ts(ta: float, tb: float, starts: List[float], pref: List[float]) -> Tuple[float, float]:
+    sa = gap_shift_at(ta, starts, pref)
+    sb = gap_shift_at(tb, starts, pref)
+    return max(0.0, ta - sa), max(0.0, tb - sb)
+
+
+def shift_srt_text(text: str, starts: List[float], pref: List[float]) -> str:
+    out = []
+    for line in text.splitlines():
+        if "-->" in line:
+            left, _, right = line.partition("-->")
+            ta = _parse_srt_vtt_ts(left)
+            tb = _parse_srt_vtt_ts(right)
+            if ta is not None and tb is not None:
+                sep = "," if "," in left else "."
+                na, nb = _shift_line_ts(ta, tb, starts, pref)
+                out.append(f"{_fmt_srt_vtt(na, sep)} --> {_fmt_srt_vtt(nb, sep)}")
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def shift_vtt_text(text: str, starts: List[float], pref: List[float]) -> str:
+    out = []
+    for line in text.splitlines():
+        if "-->" in line:
+            left, _, right = line.partition("-->")
+            ta = _parse_srt_vtt_ts(left)
+            tb = _parse_srt_vtt_ts(right)
+            if ta is not None and tb is not None:
+                sep = "," if "," in left else "."
+                na, nb = _shift_line_ts(ta, tb, starts, pref)
+                out.append(f"{_fmt_srt_vtt(na, sep)} --> {_fmt_srt_vtt(nb, sep)}")
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def shift_ass_text(text: str, starts: List[float], pref: List[float]) -> str:
+    out = []
+    for line in text.splitlines():
+        if line.startswith("Dialogue:"):
+            head, sep, rest = line.partition("Dialogue:")
+            fields = rest.split(",")
+            if len(fields) >= 3:
+                ta = _parse_ass_ts(fields[1])
+                tb = _parse_ass_ts(fields[2])
+                if ta is not None and tb is not None:
+                    na, nb = _shift_line_ts(ta, tb, starts, pref)
+                    fields[1] = _fmt_ass(na)
+                    fields[2] = _fmt_ass(nb)
+                    out.append(head + "Dialogue:" + ",".join(fields))
+                    continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def resync_subtitle_to_gaps(sub_path: str, gap_spans, out_suffix: str = "_gapfix") -> Optional[str]:
+    """
+    🆕 z35 — بازتایم زیرنویس با نقشه‌ی «پرش‌های محتوایی» ویدیوی خروجی.
+
+    gap_spans: [(start_sec, dur_sec), ...] — از stats_out موتور سگمنت
+        (stats_out["gap_spans"])؛ زمان‌ها روی زمان‌محورِ محتوای اصلی (playlist) هستن.
+    منطق: cue در زمان t از محتوا، در ویدیوی خروجی روی t − (مجموع پرش‌های قبل از t)
+        قرار می‌گیره. پس همون شیفت رو روی ساب اعمال می‌کنیم.
+
+    Returns:
+        مسیر فایل جدید ({base}{suffix}.ext)، یا None اگه اعمال نشد
+        (ساب اصلی دست‌نخورده می‌مونه — non-fatal).
+    """
+    try:
+        if not gap_spans or not sub_path or not os.path.exists(sub_path):
+            return None
+        starts, pref = build_gap_index(gap_spans)
+        if not starts:
+            return None
+        total_gap = pref[-1]
+        if total_gap < _MIN_TOTAL_GAP_S:
+            logger.info("[z35] gap-resync skipped: total gap %.2fs < %.1fs", total_gap, _MIN_TOTAL_GAP_S)
+            return None
+
+        ext = os.path.splitext(sub_path)[1].lower()
+        if ext not in _SUPPORTED_EXT:
+            return None
+        with open(sub_path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+
+        if ext == ".srt":
+            new_text = shift_srt_text(text, starts, pref)
+        elif ext == ".vtt":
+            new_text = shift_vtt_text(text, starts, pref)
+        else:  # .ass / .ssa
+            new_text = shift_ass_text(text, starts, pref)
+
+        base, ext_real = os.path.splitext(sub_path)
+        out_path = f"{base}{out_suffix}{ext_real}"
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        logger.info("[z35] gap-resync applied: %d gap(s) %.1fs total → %s",
+                    len(starts), total_gap, os.path.basename(out_path))
+        return out_path
+    except Exception as e:
+        logger.warning("[z35] resync_subtitle_to_gaps failed (non-fatal): %s", e, exc_info=True)
+        return None

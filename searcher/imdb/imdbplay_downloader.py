@@ -271,36 +271,103 @@ async def _probe_vidsrcme_hosts(imdb_id: str, season=None, episode=None) -> List
 # ═══════════════════════════════════════════════════════════
 
 
-async def _get_tmdb_id(imdb_id: str) -> Optional[str]:
-    """تبدیل imdb_id به tmdb_id با استفاده از TMDB API."""
+_TMDB_ID_CACHE: Dict[str, Optional[str]] = {}
+
+
+async def _tmdb_search_id(title: str, year=None, is_tv: bool = False) -> Optional[str]:
+    """🆕 z35: جستجوی TMDB بر اساس عنوان — fallback وقتی find خالیه
+    (TMDB find برای بعضی ttها مثل tt4154795/Infinity War خالی برمی‌گرده!)."""
+    if not title or not str(title).strip():
+        return None
+    endpoint = "search/tv" if is_tv else "search/movie"
+    params = {"api_key": _TMDB_API_KEY, "query": str(title).strip(), "include_adult": "false"}
+    if year:
+        try:
+            y = int(re.match(r"(\d{4})", str(year)).group(1))
+            params["year" if not is_tv else "first_air_date_year"] = str(y)
+        except (AttributeError, ValueError):
+            pass
+    try:
+        async with AsyncSession() as s:
+            r = await s.get(f"https://api.themoviedb.org/3/{endpoint}", params=params,
+                            impersonate=_BROWSER_IMPERSONATE, timeout=15,
+                            headers={"User-Agent": _USER_AGENT})
+            if r.status_code != 200:
+                logger.warning("TMDB %s HTTP %d for '%s'", endpoint, r.status_code, title)
+                return None
+            results = r.json().get("results") or []
+            if not results:
+                # بدون سال یک بار دیگه امتحان کن (سال ذکرشده گاهی با سال TMDB نمی‌خونه)
+                if year:
+                    params.pop("year", None)
+                    params.pop("first_air_date_year", None)
+                    r = await s.get(f"https://api.themoviedb.org/3/{endpoint}", params=params,
+                                    impersonate=_BROWSER_IMPERSONATE, timeout=15,
+                                    headers={"User-Agent": _USER_AGENT})
+                    if r.status_code != 200:
+                        return None
+                    results = r.json().get("results") or []
+            if not results:
+                return None
+            # ترجیح: اولین نتیجه (TMDB خودش بر اساس popularity مرتب می‌کنه) —
+            # برای جستجوی عنوانِ دقیقِ فیلم، اولین نتیجه تقریباً همون هست
+            pick = results[0]
+            tmdb_id = str(pick.get("id", "") or "")
+            if tmdb_id:
+                logger.info("TMDB %s '%s' (%s) -> %s (%s)",
+                            endpoint, title, year or "-", tmdb_id, pick.get("title") or pick.get("name"))
+            return tmdb_id or None
+    except Exception as e:
+        logger.warning("TMDB search failed for '%s': %s", title, e)
+        return None
+
+
+async def _get_tmdb_id(imdb_id: str, title: str = None, year=None,
+                       is_tv: bool = False) -> Optional[str]:
+    """تبدیل imdb_id به tmdb_id — 🆕 z35: find → (fallback) search با عنوان.
+
+    TMDB find برای بعضی آیدی‌ها (مثلاً tt4154795 = Avengers: Infinity War)
+    پاسخ «خالی» می‌ده؛ اونجا با عنوان+سال جستجو می‌کنیم.
+    """
     if not imdb_id:
         return None
     if not imdb_id.startswith("tt"):
         imdb_id = f"tt{imdb_id}"
+
+    # 🆕 z35 — کش مثبت درون-پردازشی
+    if imdb_id in _TMDB_ID_CACHE and _TMDB_ID_CACHE[imdb_id]:
+        return _TMDB_ID_CACHE[imdb_id]
+
     url = f"https://api.themoviedb.org/3/find/{imdb_id}?api_key={_TMDB_API_KEY}&external_source=imdb_id"
     try:
         async with AsyncSession() as s:
             r = await s.get(url, impersonate=_BROWSER_IMPERSONATE, timeout=15,
                             headers={"User-Agent": _USER_AGENT})
-            if r.status_code != 200:
+            if r.status_code == 200:
+                d = r.json()
+                movies = d.get("movie_results", [])
+                tv = d.get("tv_results", [])
+                if movies:
+                    tmdb_id = str(movies[0].get("id", ""))
+                    logger.info("TMDB find %s -> movie %s", imdb_id, tmdb_id)
+                    _TMDB_ID_CACHE[imdb_id] = tmdb_id
+                    return tmdb_id
+                if tv:
+                    tmdb_id = str(tv[0].get("id", ""))
+                    logger.info("TMDB find %s -> tv %s", imdb_id, tmdb_id)
+                    _TMDB_ID_CACHE[imdb_id] = tmdb_id
+                    return tmdb_id
+                logger.warning("TMDB find %s: no results", imdb_id)
+            else:
                 logger.warning("TMDB find HTTP %d for %s", r.status_code, imdb_id)
-                return None
-            d = r.json()
-            movies = d.get("movie_results", [])
-            tv = d.get("tv_results", [])
-            if movies:
-                tmdb_id = str(movies[0].get("id", ""))
-                logger.info("TMDB find %s -> movie %s", imdb_id, tmdb_id)
-                return tmdb_id
-            if tv:
-                tmdb_id = str(tv[0].get("id", ""))
-                logger.info("TMDB find %s -> tv %s", imdb_id, tmdb_id)
-                return tmdb_id
-            logger.warning("TMDB find %s: no results", imdb_id)
-            return None
     except Exception as e:
         logger.warning("TMDB find failed: %s", e)
-        return None
+
+    # 🆕 z35 — fallback: جستجو با عنوان (اگه caller عنوان رو داده باشه)
+    tmdb_id = await _tmdb_search_id(title, year, is_tv)
+    if tmdb_id:
+        _TMDB_ID_CACHE[imdb_id] = tmdb_id
+    return tmdb_id
 
 
 # ═══════════════════════════════════════════════════════════
@@ -995,15 +1062,23 @@ async def _get_stream_for_server(server: dict, tmdb_id: str, imdb_id: str, seaso
     return None
 
 
-async def _get_first_working_stream(tmdb_id: str, imdb_id: str, season: Optional[int], episode: Optional[int]) -> Optional[dict]:
+async def _get_first_working_stream(tmdb_id: str, imdb_id: str, season: Optional[int],
+                                    episode: Optional[int],
+                                    expected_s: Optional[float] = None) -> Optional[dict]:
     """
     امتحان همه سرورها به ترتیب و برگرداندن اولین نتیجه موفق.
     سرورها به ترتیب اولویت در _SERVERS تعریف شدن.
+    🆕 z35: اگه expected_s داده شده باشه، استریم‌هایی که مدتشون با runtime مرجع
+    نمی‌خونه (فیلم اشتباه/کات متفاوت) رد می‌شن و سرور بعدی امتحان می‌شه.
     """
     for server in _SERVERS:
         try:
             logger.info("[IMDBPlay] Trying server %s (%s)...", server["id"], server["name"])
             stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+            if stream and stream.get("url"):
+                if expected_s and not await _stream_duration_ok(
+                        stream, expected_s, f"auto:{server['name']}"):
+                    stream = None
             if stream and stream.get("url"):
                 logger.info("[IMDBPlay] ✓ Server %s succeeded", server["name"])
                 return stream
@@ -1020,6 +1095,148 @@ async def _get_first_working_stream(tmdb_id: str, imdb_id: str, season: Optional
             logger.info("[IMDBPlay] ✓ Iran server %s (cached) succeeded", _nm)
             return _e
     return None
+
+
+# ═══════════════════════════════════════════════════════════
+#   🆕 z35 — Sanity-check مدت استریم + runtime مرجع TMDB
+#   بعضی سرورها/منابع گاهی فیلم اشتباه یا کات متفاوت می‌دن؛ مدتِ playlist
+#   (جمع EXTINF) باید با runtime مرجع TMDB بخونه — وگرنه سرور رد می‌شه.
+# ═══════════════════════════════════════════════════════════
+
+_RUNTIME_CACHE: Dict[tuple, Optional[float]] = {}
+_DURATION_TOL_S = 90.0  # runtime در TMDB دقیقه‌گرد شده؛ ±90s امنه
+
+
+async def _expected_runtime_seconds(tmdb_id, season: Optional[int] = None,
+                                    episode: Optional[int] = None) -> Optional[float]:
+    """runtime مرجع (ثانیه) از TMDB — فیلم یا قسمت سریال. کش‌شده."""
+    if not tmdb_id:
+        return None
+    key = (str(tmdb_id), int(season or 0), int(episode or 0))
+    if key in _RUNTIME_CACHE:
+        return _RUNTIME_CACHE[key]
+    sec: Optional[float] = None
+    try:
+        async with AsyncSession() as s:
+            if season is not None and episode is not None:
+                url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{int(season)}/episode/{int(episode)}"
+            else:
+                url = f"https://api.themoviedb.org/3/movie/{tmdb_id}"
+            r = await s.get(url, params={"api_key": _TMDB_API_KEY},
+                            impersonate=_BROWSER_IMPERSONATE, timeout=15,
+                            headers={"User-Agent": _USER_AGENT})
+            if r.status_code == 200:
+                d = r.json()
+                rt = d.get("runtime")
+                if isinstance(rt, list):  # بعضی قسمت‌ها episode_run_time لیست برمی‌گردونن
+                    rt = rt[0] if rt else None
+                if not rt:
+                    rt = d.get("episode_run_time") if isinstance(d.get("episode_run_time"), int) else None
+                if rt and float(rt) > 0:
+                    sec = float(rt) * 60.0
+    except Exception as e:
+        logger.debug("[z35] runtime fetch failed for tmdb=%s: %s", tmdb_id, e)
+    _RUNTIME_CACHE[key] = sec
+    return sec
+
+
+def _sum_media_playlist_durations(text: str) -> float:
+    """جمع EXTINF های یک media playlist (پایه‌ی چک مدت)."""
+    total = 0.0
+    pending: Optional[float] = None
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.startswith("#EXTINF:"):
+            try:
+                pending = float(line.split(":", 1)[1].split(",")[0])
+            except (ValueError, IndexError):
+                pending = None
+        elif line and not line.startswith("#"):
+            if pending is not None:
+                total += pending
+                pending = None
+    return total
+
+
+def _pick_variant_url(master_text: str, base_url: str, prefer_height: int = 720) -> Optional[str]:
+    """انتخاب نزدیک‌ترین variant به ارتفاع خواسته از master playlist (URL مطلق)."""
+    variants = _parse_master_m3u8(master_text)
+    if not variants:
+        return None
+
+    def _h(resolution: str) -> int:
+        m = re.search(r"(\d+)x(\d+)", resolution or "")
+        return int(m.group(2)) if m else 0
+
+    best = min(variants, key=lambda v: abs(_h(v[2]) - (prefer_height or 720)))
+    return _make_absolute(base_url, best[0])
+
+
+async def _probe_stream_duration(url: str, headers: Optional[dict],
+                                 prefer_height: int = 720) -> Optional[float]:
+    """مدت استریم HLS (ثانیه) فقط با fetch پلی‌لیست — بدون دانلود محتوا.
+    🆕 z35: ۲ تلاش (CDNها گاهی یک‌بار 5xx/timeout می‌دن)."""
+    for attempt in range(2):
+        try:
+            async with AsyncSession() as s:
+                r = await s.get(url, impersonate=_BROWSER_IMPERSONATE, timeout=25,
+                                headers=headers or {})
+                if r.status_code != 200:
+                    raise RuntimeError(f"HTTP {r.status_code}")
+                txt = r.text
+                if "#EXT-X-STREAM-INF" in txt:
+                    vurl = _pick_variant_url(txt, url, prefer_height)
+                    if not vurl:
+                        raise RuntimeError("no variant")
+                    r2 = await s.get(vurl, impersonate=_BROWSER_IMPERSONATE, timeout=25,
+                                     headers=headers or {})
+                    if r2.status_code != 200:
+                        raise RuntimeError(f"variant HTTP {r2.status_code}")
+                    txt = r2.text
+                total = _sum_media_playlist_durations(txt)
+                if total > 0:
+                    return total
+                raise RuntimeError("empty playlist")
+        except Exception as e:
+            if attempt == 0:
+                logger.debug("[z35] _probe_stream_duration retry: %s", e)
+                await asyncio.sleep(0.8)
+            else:
+                logger.debug("[z35] _probe_stream_duration failed: %s", e)
+    return None
+
+
+async def _stream_duration_ok(stream: dict, expected_s: Optional[float], label: str = "") -> bool:
+    """🆕 z35 — اگه مدت استریم با runtime مرجع نخونه (فیلم اشتباه/کات متفاوت)، رد."""
+    if not expected_s or expected_s <= 0:
+        return True
+    if not stream or not stream.get("url"):
+        return True
+    if stream.get("type", "hls") != "hls":
+        return True  # MP4 مستقیم — پروب ارزون نداریم، بلاک نکن
+    dur = await _probe_stream_duration(stream["url"], stream.get("headers") or {})
+    if not dur or dur <= 0:
+        return True  # نشد بخونیم → مانع دانلود نشو
+    dev = abs(dur - expected_s)
+    ok = dev <= _DURATION_TOL_S
+    logger.info("[z35] duration check %s: stream=%.0fs expected=%.0fs (dev=%.0fs) → %s",
+                label or stream.get("server", "?"), dur, expected_s, dev,
+                "OK" if ok else "REJECT ✗")
+    return ok
+
+
+def _compute_gap_spans(segments: List[Tuple[str, float]],
+                       seg_paths: list) -> List[Tuple[float, float]]:
+    """🆕 z35 — نقشه‌ی «پرش محتوایی» از سگمنت‌های گم‌شده:
+    [(شروع پرش در زمان‌محور playlist، طول پرش), ...] — ورودی برای gap-resync ساب."""
+    spans: List[Tuple[float, float]] = []
+    t = 0.0
+    for i, (_u, d) in enumerate(segments):
+        dd = float(d or 0.0)
+        if i < len(seg_paths) and not seg_paths[i]:
+            spans.append((round(t, 2), round(dd, 2)))
+        t += dd
+    return spans
 
 
 # متدهای استخراج برای نمایش به کاربر
@@ -2041,6 +2258,8 @@ async def download_with_quality(
     preferred_server: Optional[str] = None,
     strict_quality: bool = False,
     stats_out: Optional[dict] = None,
+    title: Optional[str] = None,
+    year=None,
 ) -> Optional[str]:
     """
     دانلود فیلم یا قسمت سریال با کیفیت انتخابی.
@@ -2055,7 +2274,9 @@ async def download_with_quality(
         strict_quality: 🆕 اگه True، وقتی هیچ سروری کیفیت رو نداره به‌جای
             دانلود اشتباه با Auto (باگ 480p→431MB)، خطای واضح میده.
         stats_out: 🆕 z16 دیکشنری اختیاری که موتور سگمنت آمار زنده توش می‌ریزه
-            ({"mbps": سرعت لحظه‌ای, "concurrency": تعداد کانکشن فعلی})
+            ({"mbps": سرعت لحظه‌ای, "concurrency": تعداد کانکشن فعلی،
+             🆕 z35 "gap_spans": نقشه‌ی پرش‌های سگمنت گم‌شده})
+        title, year: 🆕 z35 — برای fallback جستجوی TMDB وقتی find خالیه
 
     Returns:
         مسیر فایل دانلود شده، یا None در صورت خطا.
@@ -2067,9 +2288,15 @@ async def download_with_quality(
 
     os.makedirs(out_dir, exist_ok=True)
 
-    tmdb_id = await _get_tmdb_id(imdb_id)
+    # 🆕 z35 — find گاهی برای بعضی ttها خالیه (مثل tt4154795/Infinity War)
+    # → با عنوان+سال هم جستجو می‌شه
+    tmdb_id = await _get_tmdb_id(imdb_id, title=title, year=year,
+                                 is_tv=bool(season and episode))
     if not tmdb_id:
         raise RuntimeError(f"Cannot resolve tmdb_id for {imdb_id}")
+
+    # 🆕 z35 — runtime مرجع برای sanity-check مدت هر استریم
+    _expected_s = await _expected_runtime_seconds(tmdb_id, season, episode)
 
     # اگه کیفیت خاصی درخواست شده، سروری رو پیدا کن که اون کیفیت رو داشته باشه
     # اگه "Auto" درخواست شده، اولین سرور موفق کافیه
@@ -2092,13 +2319,18 @@ async def download_with_quality(
                     try:
                         logger.info("[IMDBPlay] Auto + preferred server %s...", preferred_server)
                         stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
+                        # 🆕 z35 — چک مدت قبل از پذیرش سرور انتخابی
+                        if stream and not await _stream_duration_ok(
+                                stream, _expected_s, f"auto-preferred:{preferred_server}"):
+                            stream = None
                     except Exception as e:
                         logger.warning("[IMDBPlay] preferred server %s failed: %s", preferred_server, e)
                         stream = None
                     break
         if not stream:
             # برای Auto، اولین سرور موفق کافیه
-            stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
+            stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode,
+                                                     expected_s=_expected_s)
     else:
         # برای کیفیت خاص، سرورها رو به ترتیب امتحان کن تا سروری پیدا بشه که اون کیفیت رو داشته باشه
         # 🆕 سرور انتخابی کاربر «اول» امتحان میشه؛ اگه این کیفیت رو نداشت،
@@ -2135,6 +2367,12 @@ async def download_with_quality(
                             if q.get("label", "").lower() == target_quality:
                                 candidate["url"] = q["url"]
                                 break
+                        # 🆕 z35 — چک مدت قبل از پذیرش سرور
+                        if not await _stream_duration_ok(
+                                candidate, _expected_s,
+                                f"q:{server['name']}:{quality_label}"):
+                            stream = None
+                            continue
                         stream = candidate
                         logger.info("[IMDBPlay] ✓ Server %s has quality %s", server["name"], quality_label)
                         break
@@ -2172,7 +2410,8 @@ async def download_with_quality(
                     f"کیفیت‌های موجود: {', '.join(avail) if avail else 'هیچ'}"
                 )
             logger.warning("[IMDBPlay] No server has quality %s, falling back to Auto", quality_label)
-            stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode)
+            stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode,
+                                                     expected_s=_expected_s)
             # وقتی fallback می‌کنیم، quality_label رو هم به Auto تغییر بده
             quality_label = "Auto"
 
@@ -2467,6 +2706,11 @@ async def download_with_quality(
             if stats_out is not None:
                 stats_out["missing"] = len(missing)
                 stats_out["missing_tol"] = True
+                # 🆕 z35 — نقشه‌ی دقیق پرش‌ها برای بازتایم ساب (فیکس ریشه‌ای درِیف)
+                try:
+                    stats_out["gap_spans"] = _compute_gap_spans(segments, seg_paths)
+                except Exception as _gexp:
+                    logger.warning("[SEG] gap_spans computation failed: %s", _gexp)
         else:
             raise RuntimeError(
                 f"{len(missing)} سگمنت از {total} دانلود نشد ({miss_pct:.1f}٪) — "
