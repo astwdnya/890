@@ -42,6 +42,8 @@ from ._common import (
     download_with_ytdlp as _download_ytdlp_impl,
     extract_title_from_html,
     fetch_html,
+    fetch_html_via_wayback,
+    unwrap_wayback_urls,
     quality_sort_key,
 )
 
@@ -130,6 +132,9 @@ def _is_excluded(url: str) -> bool:
 
 def _extract_from_html(html: str, page_url: str) -> Tuple[List[dict], str]:
     """استخراج لینک MP4 مستقیم و عنوان از HTML صفحه‌ی BB Pimp Player."""
+    # 🆕 z33: اگه HTML از Wayback آمده، پیشوند web.archive.org رو بردار تا
+    # الگوهای عادی (و هاست‌های مجاز) روی URLهای اصلی کار کنن
+    html = unwrap_wayback_urls(html)
     title = extract_title_from_html(html, "CartoonPRN")
 
     qualities: List[dict] = []
@@ -276,15 +281,27 @@ async def _extract_with_ytdlp(url: str) -> Tuple[List[dict], str]:
 # ─── Main extraction ───────────────────────────────────────
 
 
-async def extract_cartoonprn_qualities(url: str) -> Tuple[List[dict], str]:
+async def extract_cartoonprn_qualities(
+    url: str,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> Tuple[List[dict], str]:
     """استخراج کیفیت‌های ویدیو از cartoonprn.com.
 
-    ز32:
-      - بدون visit_homepage_first (نصف شدن تاخیر — هوم‌پیج هیچ کمکی نمی‌کرد)
-      - دو impersonation پشت سر هم (chrome → chrome131)
-      - fallback yt-dlp با سقف زمانی و اعتبارسنجی (دیگه مسیر کند نمی‌افته)"""
+    ز33 — زنجیره:
+      ۱) HTML مستقیم (۲ impersonation) — سریع‌ترین مسیر
+      ۲) 🆕 Wayback Machine (اسنپ‌شات + Save-Page-Now) — وقتی CF آی‌پی سرور رو بلاک کرده
+      ۳) yt-dlp با سقف زمانی (آخرین راه)
+
+    progress_cb: اختیاری — برای پیام‌های مرحله‌ای («از آرشیو امتحان می‌کنم…»)."""
     if not is_cartoonprn_url(url):
         return [], "Invalid URL"
+
+    async def _stage(text: str):
+        if progress_cb:
+            try:
+                await progress_cb(text)
+            except Exception:
+                pass
 
     if not check_impersonation_support():
         logger.warning("[CartoonPrn] curl_cffi unavailable → yt-dlp")
@@ -309,9 +326,27 @@ async def extract_cartoonprn_qualities(url: str) -> Tuple[List[dict], str]:
             )
             return qualities, title
         logger.info("[CartoonPrn] HTML got but no direct mp4 → yt-dlp")
-    else:
-        logger.warning("[CartoonPrn] HTML fetch failed (status=%s) → yt-dlp", status)
 
+    # 🆕 z33: مستقیم نشد (احتمالاً CF بلاک کرده) → Wayback Machine
+    await _stage(
+        "☁️ <b>سایت مستقیم جواب نداد (Cloudflare)…</b>\n"
+        "📚 از آرشیو Wayback Machine امتحان می‌کنم — ممکنه ۱ تا ۲ دقیقه طول بکشه، صبر کن…"
+    )
+    wb_html, wb_status = await fetch_html_via_wayback(
+        url,
+        validator=lambda h: bool(_extract_from_html(h, url)[0]),
+    )
+    if wb_html:
+        qualities, title = _extract_from_html(wb_html, url)
+        if qualities:
+            logger.info(
+                "[CartoonPrn] Extracted %d quality(ies) from Wayback for: %s",
+                len(qualities), title[:60],
+            )
+            return qualities, title
+
+    # آخرین راه: yt-dlp (سقف‌دار — z32)
+    await _stage("🛠 هنوز پیدا نشد — استخراج با yt-dlp (سقف ۷۰ ثانیه)…")
     return await _extract_with_ytdlp(url)
 
 

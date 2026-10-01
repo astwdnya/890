@@ -40,6 +40,8 @@ from ._common import (
     download_with_ytdlp as _download_ytdlp_impl,
     extract_title_from_html,
     fetch_html,
+    fetch_html_via_wayback,
+    unwrap_wayback_urls,
     quality_sort_key,
 )
 
@@ -122,6 +124,8 @@ def _is_real_media_url(u: str) -> bool:
 
 def _extract_from_html(html: str, page_url: str) -> Tuple[List[dict], str]:
     """استخراج چند-الگویی لینک مدیا + عنوان از HTML."""
+    # 🆕 z33: HTML آرشیوی → URLها به شکل اصلی برمی‌گردن تا الگوها کار کنن
+    html = unwrap_wayback_urls(html)
     title = extract_title_from_html(html, "PornHex")
 
     qualities: List[dict] = []
@@ -271,10 +275,25 @@ async def _extract_with_ytdlp(url: str) -> Tuple[List[dict], str]:
 # ─── Main extraction ───────────────────────────────────────
 
 
-async def extract_pornhex_qualities(url: str) -> Tuple[List[dict], str]:
-    """استخراج کیفیت‌ها — HTML مستقیم (۲ impersonation) → yt-dlp سقف‌دار."""
+async def extract_pornhex_qualities(
+    url: str,
+    progress_cb: Optional[ProgressCallback] = None,
+) -> Tuple[List[dict], str]:
+    """استخراج کیفیت‌ها — زنجیره‌ی سه‌مرحله‌ای (🆕 z33):
+
+      ۱) HTML مستقیم (۲ impersonation)
+      ۲) Wayback Machine (اسنپ‌شات + Save-Page-Now) — برای CF-بلاک
+      ۳) yt-dlp سقف‌دار
+    """
     if not is_pornhex_url(url):
         return [], "Invalid URL"
+
+    async def _stage(text: str):
+        if progress_cb:
+            try:
+                await progress_cb(text)
+            except Exception:
+                pass
 
     if not check_impersonation_support():
         logger.warning("[PornHex] curl_cffi unavailable → yt-dlp")
@@ -299,9 +318,27 @@ async def extract_pornhex_qualities(url: str) -> Tuple[List[dict], str]:
             )
             return qualities, title
         logger.info("[PornHex] HTML got but no media URL → yt-dlp")
-    else:
-        logger.warning("[PornHex] HTML fetch failed (status=%s) → yt-dlp", status)
 
+    # 🆕 z33: مستقیم نشد → Wayback Machine (برای محتوای تازه SPN انجام می‌ده)
+    await _stage(
+        "☁️ <b>سایت مستقیم جواب نداد (Cloudflare)…</b>\n"
+        "📚 از آرشیو Wayback Machine امتحان می‌کنم — ممکنه ۱ تا ۲ دقیقه طول بکشه، صبر کن…"
+    )
+    wb_html, wb_status = await fetch_html_via_wayback(
+        url,
+        validator=lambda h: bool(_extract_from_html(h, url)[0]),
+    )
+    if wb_html:
+        qualities, title = _extract_from_html(wb_html, url)
+        if qualities:
+            logger.info(
+                "[PornHex] Extracted %d quality(ies) from Wayback for: %s",
+                len(qualities), title[:60],
+            )
+            return qualities, title
+
+    # آخرین راه: yt-dlp (سقف‌دار — z32)
+    await _stage("🛠 هنوز پیدا نشد — استخراج با yt-dlp (سقف ۷۰ ثانیه)…")
     return await _extract_with_ytdlp(url)
 
 

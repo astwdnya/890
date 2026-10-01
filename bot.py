@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z32"  # نشانگر نسخه — تو لاگ استارت باید z32 دیده بشه (🆕 z32: فیکس سرعت استخراج — yt-dlp fallback سقف‌دار ۷۵s + فیلتر «Auto via yt-dlp» + هندلر جدید pornhex.com)
+BOT_BUILD = "z33"  # نشانگر نسخه — تو لاگ استارت باید z33 دیده بشه (🆕 z33: رله‌ی Wayback Machine (اسنپ‌شات+Save-Page-Now) برای سایت‌هایی که CF آی‌پی دیتاسنتر رو بلاک کرده — cartoonprn/pornhex + پیام مرحله‌ای استخراج)
 
 # ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
 # 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
@@ -10331,7 +10331,14 @@ async def cartoonporn_cancel_callback(event):
 
 
 async def process_cartoonprn_request(event, url: str, status_msg):
-    qualities, title = await extract_cartoonprn_qualities(url)
+    # 🆕 z33: گزارش مراحل استخراج (مستقیم → آرشیو → yt-dlp) با HTML پارس
+    async def extract_progress(text):
+        try:
+            await status_msg.edit(text, parse_mode="html")
+        except Exception:
+            pass
+
+    qualities, title = await extract_cartoonprn_qualities(url, progress_cb=extract_progress)
     if not qualities:
         err = (title or "").strip()  # در حالت خطا، title پیام خطا هست
         await safe_edit(
@@ -10456,7 +10463,14 @@ async def cartoonprn_cancel_callback(event):
 
 
 async def process_pornhex_request(event, url: str, status_msg):
-    qualities, title = await extract_pornhex_qualities(url)
+    # 🆕 z33: گزارش مراحل استخراج (مستقیم → آرشیو → yt-dlp) با HTML پارس
+    async def extract_progress(text):
+        try:
+            await status_msg.edit(text, parse_mode="html")
+        except Exception:
+            pass
+
+    qualities, title = await extract_pornhex_qualities(url, progress_cb=extract_progress)
     if not qualities:
         err = (title or "").strip()  # در حالت خطا، title پیام خطا هست
         await safe_edit(

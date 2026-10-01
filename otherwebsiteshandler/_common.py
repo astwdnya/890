@@ -291,6 +291,118 @@ async def fetch_json(
         return None, 0
 
 
+# ─── 🆕 z33: Wayback Machine relay (برای سایت‌هایی که CF دیتاسنتر رو بلاک کرده) ───
+
+_WAYBACK_SNAP_TIMEOUT = int(os.environ.get("WAYBACK_SNAP_TIMEOUT", "40"))
+_WAYBACK_SAVE_TIMEOUT = int(os.environ.get("WAYBACK_SAVE_TIMEOUT", "90"))
+_WAYBACK_HOST_RE = re.compile(
+    r"https?://web\.archive\.org/web/\d+[a-z]{0,2}_?/(https?://)", re.I
+)
+_NOT_ARCHIVED_MARKERS = (
+    "wayback machine has not archived",
+    "doesn&#39;t have an archiving",
+    "cannot browse that url",
+    "page cannot be crawled",
+)
+
+
+def unwrap_wayback_urls(html: str) -> str:
+    """حذف پیشوند web.archive.org/web/<ts><flag>/ از URLهای داخل HTML آرشیو.
+
+    تو اسنپ‌شات‌ها لینک‌ها به شکل
+      https://web.archive.org/web/20230303055514im_/https://site.com/videos/x.mp4
+    هستن؛ بعد از unwrap به URL اصلی تبدیل می‌شن تا الگوهای استخراج عادی کار کنن."""
+    return _WAYBACK_HOST_RE.sub(r"\1", html or "")
+
+
+def _is_not_archived_page(html: str) -> bool:
+    low = (html or "").lower()
+    return any(m in low for m in _NOT_ARCHIVED_MARKERS)
+
+
+async def fetch_html_via_wayback(
+    url: str,
+    validator: Optional[Callable[[str], bool]] = None,
+    use_save_page: bool = True,
+) -> Tuple[Optional[str], int]:
+    """دریافت HTML صفحه از Wayback Machine — رله برای سایت‌های CF-بلاک‌کرده.
+
+    زنجیره:
+      ۱) اسنپ‌شات موجود:  web.archive.org/web/2/<url>
+      ۲) Save-Page-Now:   web.archive.org/save/<url>  (آرشیو خودش صفحه رو
+         با IP خودش می‌گیره — از CF رد می‌شه) و بعد دوباره اسنپ‌شات
+
+    Args:
+        url: URL اصلی صفحه
+        validator: callable(html)->bool — اگه داده بشه، HTML فقط وقتی قبوله
+            که این تابع True بده (مثلاً «لینک ویدیو داره»).
+        use_save_page: اگه False، فقط اسنپ‌شات موجود چک می‌شه (بدون SPN).
+
+    Returns:
+        (html, 200) اگه اسنپ‌شات مفید بود | (None, 404) اگه نبود | (None, 0) خطا.
+    """
+    if not check_impersonation_support():
+        return None, 0
+
+    snap_url = f"https://web.archive.org/web/2/{url}"
+
+    async def _get_snapshot(session) -> Tuple[Optional[str], int]:
+        try:
+            resp = await session.get(
+                snap_url,
+                impersonate="chrome",
+                headers={"User-Agent": _DEFAULT_UA, "Accept": "text/html,*/*"},
+                timeout=_WAYBACK_SNAP_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                return None, resp.status_code
+            html = resp.text
+            if _is_not_archived_page(html) or len(html) < 2000:
+                return None, 404
+            if validator is not None and not validator(html):
+                # اسنپ‌شات هست ولی محتواش مفید نیست (مثلاً بدون لینک ویدیو)
+                return None, 404
+            logger.info("[Wayback] snapshot hit: %s", url[:90])
+            return html, 200
+        except Exception as e:
+            logger.info("[Wayback] snapshot fetch error: %s", str(e)[:100])
+            return None, 0
+
+    try:
+        from curl_cffi.requests import AsyncSession
+
+        async with AsyncSession() as session:
+            # ۱) اسنپ‌شات موجود
+            html, status = await _get_snapshot(session)
+            if html:
+                return html, status
+
+            if not use_save_page:
+                return None, 404
+
+            # ۲) Save-Page-Now — آرشیو خودش fetch می‌کنه (IP تمیز)
+            logger.info("[Wayback] Save-Page-Now: %s", url[:90])
+            try:
+                await session.get(
+                    f"https://web.archive.org/save/{url}",
+                    impersonate="chrome",
+                    headers={"User-Agent": _DEFAULT_UA, "Accept": "text/html,*/*"},
+                    timeout=_WAYBACK_SAVE_TIMEOUT,
+                )
+            except Exception as e:
+                logger.info("[Wayback] SPN error (non-fatal): %s", str(e)[:100])
+            await asyncio.sleep(3)  # فرصت ایندکس شدن
+
+            # ۳) دوباره اسنپ‌شات
+            html, status = await _get_snapshot(session)
+            if html:
+                return html, status
+            return None, 404
+    except Exception as e:
+        logger.warning("[Wayback] relay failed for %s: %s", url[:90], e)
+        return None, 0
+
+
 # ─── yt-dlp download helper ───────────────────────────────
 
 
