@@ -23,8 +23,12 @@ cartoonprn_handler.py
 و اگه CDN اجازه‌ی Range نداد، خودکار به دانلود تک‌کانکشنه برمی‌گرده.
 """
 
+import asyncio
+import json
 import logging
+import os
 import re
+import shutil
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -36,7 +40,6 @@ from ._common import (
     download_direct as _download_direct_impl,
     download_direct_multi as _download_direct_multi_impl,
     download_with_ytdlp as _download_ytdlp_impl,
-    extract_qualities_with_ytdlp,
     extract_title_from_html,
     fetch_html,
     quality_sort_key,
@@ -187,12 +190,87 @@ def _extract_from_html(html: str, page_url: str) -> Tuple[List[dict], str]:
     return result, title
 
 
-# ─── Extraction: yt-dlp fallback ───────────────────────────
+# ─── Extraction: yt-dlp fallback (ز32 — با سقف زمانی + اعتبارسنجی) ───────────
+
+
+_YTDLP_EXTRACT_TIMEOUT = int(os.environ.get("YTDLP_EXTRACT_TIMEOUT", "70"))
+
+
+def _is_real_media_url(u: str) -> bool:
+    """فقط URLهای مدیای واقعی (mp4/m3u8) — نه URL خود صفحه (تله‌ی «Auto via yt-dlp»)."""
+    u = (u or "").split("?")[0].lower()
+    return u.endswith((".mp4", ".m3u8", ".mkv", ".webm", ".ts"))
 
 
 async def _extract_with_ytdlp(url: str) -> Tuple[List[dict], str]:
-    """Fallback: استخراج با yt-dlp (از _common)."""
-    return await extract_qualities_with_ytdlp(url, "CartoonPRN")
+    """Fallback: استخراج با yt-dlp — با سقف زمانی سخت و فیلتر URL واقعی.
+
+    🆕 ز32: قبلاً extract_qualities_with_ytdlp بدون timeout اجرا می‌شد (چند دقیقه
+    معطلی روی Cloudflare) و اگه فرمتی پیدا نمی‌کرد کیفیت ساختگی
+    «Auto (via yt-dlp)» با URL خودِ صفحه برمی‌گردوند که مسیر دانلود کند
+    yt-dlp رو فعال می‌کرد. الان: سقف ۷۰ ثانیه + فقط مدیای واقعی."""
+    if not shutil.which("yt-dlp"):
+        return [], "yt-dlp not installed"
+
+    cmd = [
+        "yt-dlp", "--no-warnings", "--no-check-certificates",
+        "--skip-download", "-J", url,
+    ]
+    if check_impersonation_support():
+        cmd.extend(["--impersonate", "chrome"])
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=_YTDLP_EXTRACT_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            await process.wait()
+            logger.warning("[CartoonPrn] yt-dlp extract timeout (%ds)", _YTDLP_EXTRACT_TIMEOUT)
+            return [], f"استخراج خیلی طول کشید (سقف {_YTDLP_EXTRACT_TIMEOUT} ثانیه)"
+
+        if process.returncode != 0:
+            err = stderr.decode(errors="replace").strip()[:160]
+            return [], err or "yt-dlp failed"
+
+        try:
+            data = json.loads(stdout.decode(errors="replace"))
+        except Exception:
+            return [], "yt-dlp output parse failed"
+
+        title = data.get("title", "") or "CartoonPRN"
+        qualities: List[dict] = []
+        seen: set = set()
+        for fmt in data.get("formats", []):
+            if (fmt.get("vcodec") or "") == "none":
+                continue
+            furl = fmt.get("url", "")
+            if not furl or furl in seen or not _is_real_media_url(furl):
+                continue
+            seen.add(furl)
+            height = fmt.get("height") or 0
+            ext = fmt.get("ext", "mp4")
+            method = "m3u8" if (ext == "m3u8" or ".m3u8" in furl) else "direct"
+            label = f"📺 {height}p ({ext.upper()})" if height else f"📡 {ext.upper()}"
+            qualities.append({"label": label, "url": furl, "method": method, "height": height or 0})
+
+        if not qualities:
+            # هیچ مدیای واقعی — یعنی Cloudflare جلوی استخراج رو گرفته
+            return [], "کیفیت واقعی پیدا نشد (احتمالاً Cloudflare صفحه رو بلاک کرده)"
+
+        qualities.sort(key=quality_sort_key, reverse=True)
+        return qualities, title
+    except Exception as e:
+        return [], str(e)[:160]
 
 
 # ─── Main extraction ───────────────────────────────────────
@@ -201,7 +279,10 @@ async def _extract_with_ytdlp(url: str) -> Tuple[List[dict], str]:
 async def extract_cartoonprn_qualities(url: str) -> Tuple[List[dict], str]:
     """استخراج کیفیت‌های ویدیو از cartoonprn.com.
 
-    اول HTML مستقیم (curl_cffi impersonate)، بعد fallback به yt-dlp."""
+    ز32:
+      - بدون visit_homepage_first (نصف شدن تاخیر — هوم‌پیج هیچ کمکی نمی‌کرد)
+      - دو impersonation پشت سر هم (chrome → chrome131)
+      - fallback yt-dlp با سقف زمانی و اعتبارسنجی (دیگه مسیر کند نمی‌افته)"""
     if not is_cartoonprn_url(url):
         return [], "Invalid URL"
 
@@ -211,27 +292,26 @@ async def extract_cartoonprn_qualities(url: str) -> Tuple[List[dict], str]:
 
     logger.info("[CartoonPrn] Fetching: %s", url[:100])
 
-    html, status = await fetch_html(
-        url=url,
-        referer=_SITE_REFERER,
-        visit_homepage_first=_SITE_URL,
-    )
+    html = None
+    status = 0
+    for imp in ("chrome", "chrome131"):
+        html, status = await fetch_html(url=url, referer=_SITE_REFERER, impersonate=imp)
+        if html and status == 200:
+            break
+        logger.info("[CartoonPrn] fetch failed (imp=%s status=%s) — trying next", imp, status)
 
-    if not html or status != 200:
-        logger.warning(
-            "[CartoonPrn] HTML fetch failed (status=%s) → yt-dlp", status
-        )
-        return await _extract_with_ytdlp(url)
+    if html and status == 200:
+        qualities, title = _extract_from_html(html, url)
+        if qualities:
+            logger.info(
+                "[CartoonPrn] Extracted %d quality(ies) from HTML for: %s",
+                len(qualities), title[:60],
+            )
+            return qualities, title
+        logger.info("[CartoonPrn] HTML got but no direct mp4 → yt-dlp")
+    else:
+        logger.warning("[CartoonPrn] HTML fetch failed (status=%s) → yt-dlp", status)
 
-    qualities, title = _extract_from_html(html, url)
-    if qualities:
-        logger.info(
-            "[CartoonPrn] Extracted %d quality(ies) from HTML for: %s",
-            len(qualities), title[:60],
-        )
-        return qualities, title
-
-    logger.info("[CartoonPrn] No direct mp4 in HTML → yt-dlp")
     return await _extract_with_ytdlp(url)
 
 

@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z31"  # نشانگر نسخه — تو لاگ استارت باید z31 دیده بشه (🆕 z31: هندلر جدید cartoonprn.com — BB Pimp Player → MP4 مستقیم، دانلود ۱۶ کانکشن موازی)
+BOT_BUILD = "z32"  # نشانگر نسخه — تو لاگ استارت باید z32 دیده بشه (🆕 z32: فیکس سرعت استخراج — yt-dlp fallback سقف‌دار ۷۵s + فیلتر «Auto via yt-dlp» + هندلر جدید pornhex.com)
 
 # ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
 # 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
@@ -305,6 +305,12 @@ from otherwebsiteshandler.cartoonprn_handler import (  # 🆕 z31: CartoonPRN (B
     extract_cartoonprn_qualities,
     download_cartoonprn_video,
     cartoonprn_sessions,
+)
+from otherwebsiteshandler.pornhex_handler import (  # 🆕 z32: PornHex (استخراج چند-الگویی + دانلود ۱۶ کانکشن)
+    is_pornhex_url,
+    extract_pornhex_qualities,
+    download_pornhex_video,
+    pornhex_sessions,
 )
 from otherwebsiteshandler.hihentaiporn_handler import (
     is_hihentaiporn_url,
@@ -6040,6 +6046,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_pornhex_url(target_url):
+        logger.info(f"[URL] PornHex detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج لینک ویدیو...")
+        try:
+            await process_pornhex_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_hihentaiporn_url(target_url):
         logger.info(f"[URL] HiHentaiPorn detected | url={target_url[:120]}")
         status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
@@ -10318,9 +10333,11 @@ async def cartoonporn_cancel_callback(event):
 async def process_cartoonprn_request(event, url: str, status_msg):
     qualities, title = await extract_cartoonprn_qualities(url)
     if not qualities:
+        err = (title or "").strip()  # در حالت خطا، title پیام خطا هست
         await safe_edit(
             status_msg,
-            "❌ کیفیتی پیدا نشد. لینک رو چک کن (باید لینک صفحه‌ی ویدیو باشه).",
+            "❌ کیفیتی پیدا نشد."
+            + (f"\n🔍 {err}" if err and err != "Invalid URL" else " لینک رو چک کن (باید لینک صفحه‌ی ویدیو باشه)."),
         )
         return
     session_id = f"cprn_{event.chat_id}_{event.id}_{int(time.time())}"
@@ -10428,6 +10445,144 @@ async def cartoonprn_cancel_callback(event):
     data = event.data.decode()
     session_id = data.replace("cprn_cancel_", "")
     cartoonprn_sessions.pop(session_id, None)
+    await event.answer("❌ لغو شد", alert=False)
+    try:
+        await event.edit("❌ **لغو شد.**", buttons=None)
+    except Exception:
+        pass
+
+
+# ====================== PORNHEX HANDLER (🆕 z32) ======================
+
+
+async def process_pornhex_request(event, url: str, status_msg):
+    qualities, title = await extract_pornhex_qualities(url)
+    if not qualities:
+        err = (title or "").strip()  # در حالت خطا، title پیام خطا هست
+        await safe_edit(
+            status_msg,
+            "❌ کیفیتی پیدا نشد."
+            + (f"\n🔍 {err}" if err and err != "Invalid URL" else " لینک رو چک کن (باید لینک صفحه‌ی ویدیو باشه)."),
+        )
+        return
+    session_id = f"phx_{event.chat_id}_{event.id}_{int(time.time())}"
+    pornhex_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+        "created_at": time.time(),
+    }
+    title_display = title[:60] if title else "ویدیو PornHex"
+    text = f"🎬 **{title_display}**\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"phx_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"phx_cancel_{session_id}")])
+    await safe_edit(status_msg, text, buttons=buttons)
+
+
+async def pornhex_quality_callback(event):
+    data = event.data.decode()
+    parts = data.split("_")
+    quality_index = int(parts[-1])
+    session_id = "_".join(parts[2:-1])
+    if session_id not in pornhex_sessions:
+        await event.answer("❌ Session منقضی شده. دوباره لینک بفرست.", alert=True)
+        return
+    entry = pornhex_sessions.pop(session_id)
+    qualities = entry["qualities"]
+    title = entry["title"] or "pornhex_video"
+    if quality_index >= len(qualities):
+        await event.answer("❌ خطا", alert=True)
+        return
+    chosen = qualities[quality_index]
+    await event.answer(f"✅ {chosen['label']}", alert=False)
+    safe_title = re.sub(r"[^\w\s\-]", "", title)[:60].strip() or "pornhex_video"
+
+    ext = ".mp4"
+    if ".m3u8" in (chosen.get("url") or "").lower() or chosen.get("method") == "m3u8":
+        ext = ".mp4"  # بعد از دانلود HLS هم mp4/مخلوط می‌شه — نام خروجی mp4 می‌ذاریم
+    filepath = os.path.join(OUTPUT_FOLDER, f"phx_{safe_title}_{int(time.time())}{ext}")
+
+    dl_id = f"phx_dl_{event.chat_id}_{event.id}_{int(time.time())}"
+    active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
+
+    try:
+        await event.edit(
+            f"⏬ **در حال دانلود...**\n🎚 {chosen['label']}",
+            buttons=cancel_btn,
+        )
+    except Exception:
+        pass
+    status_msg = await event.get_message()
+
+    async def progress_cb(text):
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        try:
+            await status_msg.edit(text, parse_mode="markdown", buttons=cancel_btn)
+        except Exception:
+            pass
+
+    try:
+        success, error, file_size = await download_pornhex_video(
+            video_url=chosen.get("url", ""),
+            filepath=filepath,
+            progress_cb=progress_cb,
+        )
+        if active_downloads.get(dl_id, {}).get("cancelled"):
+            raise asyncio.CancelledError("Download cancelled by user")
+        if not success:
+            err_msg = error or "Unknown error"
+            await safe_edit(status_msg, f"❌ دانلود ناموفق: `{err_msg}`")
+            return
+
+        # 🆕 اگه yt-dlp پسوند عوض کرده (mkv/webm)، فایل واقعی رو پیدا کن
+        actual = filepath
+        if not os.path.exists(actual):
+            base, _ = os.path.splitext(filepath)
+            for e in (".mp4", ".mkv", ".webm", ".ts"):
+                if os.path.exists(base + e):
+                    actual = base + e
+                    break
+        file_size = os.path.getsize(actual) if os.path.exists(actual) else file_size
+
+        ul_id = f"phx_ul_{event.chat_id}_{event.id}_{int(time.time())}"
+        await safe_edit(status_msg, "📤 **در حال آپلود...**")
+        caption = f"🎬 **{title[:80]}**\n🎚 {chosen['label']}\n📦 {human_readable_size(file_size)}"
+        await send_file_with_progress(
+            client=event.client,
+            chat_id=entry["chat_id"],
+            filepath=actual,
+            caption=caption,
+            status_msg=status_msg,
+            buttons=None,
+            supports_streaming=True,
+            ul_id=ul_id,
+        )
+    except asyncio.CancelledError:
+        try:
+            await status_msg.edit("🚫 **Cancelled.**", buttons=None)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[PornHex] Error: {e}", exc_info=True)
+        await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
+    finally:
+        active_downloads.pop(dl_id, None)
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
+
+
+async def pornhex_cancel_callback(event):
+    data = event.data.decode()
+    session_id = data.replace("phx_cancel_", "")
+    pornhex_sessions.pop(session_id, None)
     await event.answer("❌ لغو شد", alert=False)
     try:
         await event.edit("❌ **لغو شد.**", buttons=None)
@@ -22892,6 +23047,12 @@ async def main():
     )
     client.add_event_handler(
         cartoonprn_cancel_callback, events.CallbackQuery(pattern=r"cprn_cancel_.+")
+    )
+    client.add_event_handler(
+        pornhex_quality_callback, events.CallbackQuery(pattern=r"phx_q_.+")
+    )
+    client.add_event_handler(
+        pornhex_cancel_callback, events.CallbackQuery(pattern=r"phx_cancel_.+")
     )
     client.add_event_handler(
         rule34video_quality_callback, events.CallbackQuery(pattern=r"r34v_q_.+")

@@ -98,16 +98,27 @@ def find_output_file(filepath: str) -> Optional[str]:
 
 
 def quality_sort_key(q: dict) -> int:
-    """مرتب‌سازی کیفیت‌ها بر اساس resolution."""
-    nums = re.findall(r"\d+", q.get("label", ""))
+    """مرتب‌سازی کیفیت‌ها بر اساس resolution.
+
+    🆕 z32: اول الگوی «720p/2160p» رو تو لیبل می‌گرده — قبلاً آخرین عدد
+    لیبل گرفته می‌شد که با پسوند «(MP4)» همیشه ۴ می‌داد و مرتب‌سازی رو
+    بی‌اثر می‌کرد."""
+    label = q.get("label", "")
+    m = re.search(r"(\d{3,4})p", label, re.I)
+    if m:
+        return int(m.group(1))
+    nums = re.findall(r"\d+", label)
     return int(nums[-1]) if nums else 0
 
 
 def extract_title_from_html(html: str, site_name: str = "") -> str:
     """استخراج عنوان از HTML."""
-    # 1. og:title
+    # 1. og:title — 🆕 z32: دو regex جدا برای " و ' (قبلاً [^"\']+ روی
+    #    آپستروف وسط عنوان (مثل THESE'RE) قطع می‌شد)
     m = re.search(
-        r'<meta[^>]+og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.I
+        r'<meta[^>]+og:title[^>]+content="([^"]*)"', html, re.I
+    ) or re.search(
+        r"<meta[^>]+og:title[^>]+content='([^']*)'", html, re.I
     )
     if m:
         return html_lib.unescape(m.group(1).strip())
@@ -1005,6 +1016,10 @@ async def extract_qualities_with_ytdlp(
     if not shutil.which("yt-dlp"):
         return [], "yt-dlp not installed"
 
+    # 🆕 z32: سقف زمانی سخت برای استخراج yt-dlp — قبلاً بدون timeout بود و
+    # روی سایت‌های Cloudflare-چالش‌دار چند دقیقه معطل می‌شد (شکایت «خیلی طول داد»)
+    extract_timeout = int(os.environ.get("YTDLP_EXTRACT_TIMEOUT", "75"))
+
     try:
         # از -J برای JSON output استفاده می‌کنیم (نه --list-formats + --print-json)
         cmd = [
@@ -1023,7 +1038,21 @@ async def extract_qualities_with_ytdlp(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=extract_timeout
+            )
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except Exception:
+                pass
+            await process.wait()
+            logger.warning(
+                "extract_qualities_with_ytdlp: timed out after %ds for %s",
+                extract_timeout, url[:80],
+            )
+            return [], f"yt-dlp extraction timed out after {extract_timeout}s"
         if process.returncode != 0:
             err = stderr.decode()[:200]
             return [], err
