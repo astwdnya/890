@@ -1064,14 +1064,19 @@ async def _get_stream_for_server(server: dict, tmdb_id: str, imdb_id: str, seaso
 
 async def _get_first_working_stream(tmdb_id: str, imdb_id: str, season: Optional[int],
                                     episode: Optional[int],
-                                    expected_s: Optional[float] = None) -> Optional[dict]:
+                                    expected_s: Optional[float] = None,
+                                    exclude: Optional[set] = None) -> Optional[dict]:
     """
     امتحان همه سرورها به ترتیب و برگرداندن اولین نتیجه موفق.
     سرورها به ترتیب اولویت در _SERVERS تعریف شدن.
     🆕 z35: اگه expected_s داده شده باشه، استریم‌هایی که مدتشون با runtime مرجع
     نمی‌خونه (فیلم اشتباه/کات متفاوت) رد می‌شن و سرور بعدی امتحان می‌شه.
+    🆕 z36: exclude = نام سرورهایی که سلامت فایل‌شون قبلاً رد شده — دیگه امتحان نمی‌شن.
     """
+    _ex = exclude or set()
     for server in _SERVERS:
+        if server["name"] in _ex:
+            continue
         try:
             logger.info("[IMDBPlay] Trying server %s (%s)...", server["id"], server["name"])
             stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
@@ -1091,7 +1096,7 @@ async def _get_first_working_stream(tmdb_id: str, imdb_id: str, season: Optional
     # 🆕 z22 — آخرین شانس: entry های ایرانی کش‌شده (FJ 🇮🇷 / Film2Movie / ...)
     # برای عناوین ایرانی که فقط منابع ایرانی دارن، Auto هم باید کار کنه.
     for _nm, _e in _iran_cache_get(_vm_key(imdb_id, season, episode)).items():
-        if _e.get("url"):
+        if _e.get("url") and _nm not in _ex:
             logger.info("[IMDBPlay] ✓ Iran server %s (cached) succeeded", _nm)
             return _e
     return None
@@ -1237,6 +1242,111 @@ def _compute_gap_spans(segments: List[Tuple[str, float]],
             spans.append((round(t, 2), round(dd, 2)))
         t += dd
     return spans
+
+
+class _EmptySegmentError(Exception):
+    """🆕 z36 — سگمنت HTTP 200 با بدنه‌ی خالی/چندبایتی (CDN خراب)."""
+    pass
+
+
+# ═══════════════════════════════════════════════════════
+#   🆕 z36 — گیت سلامت فایل خروجی + رزولوشن variant از master playlist
+# ═══════════════════════════════════════════════════════
+
+def _validate_video_file(path: str, declared_duration: Optional[float] = None,
+                         expected_s: Optional[float] = None) -> Tuple[bool, str]:
+    """گیت سلامت فایل ویدیوی دانلودشده، قبل از تحویل به کاربر:
+
+    ۱) ffprobe باید فایل رو بخونه و استریم ویدیو داشته باشه
+       (فایل صرفاً-صوتی / فایل نصفه‌کاره = همون «۱۳۰مگ خراب» کاربر)
+    ۲) مدت واقعی vs جمع EXTINF پلی‌لیست (اگه هست): انحراف > ۵٪ و > 90s → رد
+    ۳) مدت واقعی vs runtime مرجع TMDB (اگه هست): فقط انحراف فاحش (>25٪) → رد
+       (runtime دقیقه‌گرده و کات‌ها فرق دارند → فقط خطاهای بزرگ)
+
+    Returns:
+        (ok, دلیل) — ok=False یعنی فایل باید دور ریخته شه و سرور بعدی امتحان بشه.
+        خطای خود ffprobe → fail-open (قبول) که محیطِ بدون ffprobe بلاتکلیف نمونه.
+    """
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json",
+             "-show_format", "-show_streams", path],
+            capture_output=True, timeout=120,
+        )
+    except Exception as e:
+        logger.warning("[z36] validate: ffprobe unavailable (%s) → fail-open", e)
+        return True, "ffprobe در دسترس نیست"
+    if proc.returncode != 0:
+        return False, "ffprobe فایل را نمی‌خواند (فایل ناقص/خراب)"
+    try:
+        info = json.loads(proc.stdout.decode("utf-8", errors="replace"))
+    except Exception:
+        return True, "پارس ffprobe ناموفق → fail-open"
+
+    vstreams = [s for s in (info.get("streams") or [])
+                if s.get("codec_type") == "video"]
+    if not vstreams:
+        return False, "هیچ استریم ویدیویی نیست (فایل صوتی/خراب)"
+
+    dur: Optional[float] = None
+    try:
+        dur = float((info.get("format") or {}).get("duration"))
+    except (TypeError, ValueError):
+        for s in vstreams:
+            try:
+                dur = float(s.get("duration"))
+                break
+            except (TypeError, ValueError):
+                continue
+    if not dur or dur <= 0:
+        return False, "مدت ویدیو قابل خواندن نیست"
+
+    if declared_duration and declared_duration > 0:
+        dev = abs(dur - float(declared_duration))
+        if dev / float(declared_duration) > 0.05 and dev > 90.0:
+            return False, (
+                f"مدت واقعی {dur:.0f}s با پلی‌لیست {declared_duration:.0f}s "
+                f"نمی‌خواند (انحراف {dev:.0f}s) — محتوای ناقص/بریده"
+            )
+
+    if expected_s and expected_s > 0:
+        dev2 = abs(dur - float(expected_s))
+        if dev2 > max(600.0, 0.25 * float(expected_s)):
+            return False, (
+                f"مدت واقعی {dur:.0f}s با runtime مرجع {expected_s:.0f}s "
+                f"فاحش فرق دارد — فیلم اشتباه/بریده"
+            )
+
+    return True, f"OK ({dur:.0f}s)"
+
+
+async def _resolve_variant_from_master(candidate: dict, target_quality: str) -> Optional[str]:
+    """🆕 z36 — اگه URL کاندید master playlist باشه، variant متناظر با کیفیتِ
+    هدف رو برمی‌گردونه (URL مطلق) — وگرنه None.
+
+    این ناسازگاریِ «منو کیفیت را از master می‌بیند ولی دانلودر لیست ندارد» رو
+    می‌بنده (کاربر 720 انتخاب می‌کرد ولی دانلودر سرور را «فقط Auto» رد می‌کرد)."""
+    try:
+        _h = {"User-Agent": _USER_AGENT}
+        _h.update(candidate.get("headers") or {})
+        async with AsyncSession() as s:
+            r = await s.get(candidate["url"], impersonate=_BROWSER_IMPERSONATE,
+                            timeout=15, headers=_h)
+        if r.status_code != 200:
+            return None
+        txt = r.text
+        if "#EXT-X-STREAM-INF:" not in txt:
+            return None
+        variants = _parse_master_m3u8(txt)
+        if not variants:
+            return None
+        tgt = (target_quality or "").lower()
+        for u, bw, res in variants:
+            if _resolution_to_label(res, bw).lower() == tgt:
+                return _make_absolute(candidate["url"], u)
+        return None
+    except Exception:
+        return None
 
 
 # متدهای استخراج برای نمایش به کاربر
@@ -1851,6 +1961,17 @@ async def _hls_segment_engine(
         expected = 0  # اندازه‌ی کل سگمنت وقتی از هدر معلومه (0 = نامعلوم)
 
         async def _finish():
+            # 🆕 z36 — سگمنت پوچ = شکست، نه موفقیت!
+            # بعضی CDNها برای سگمنت‌های پاک‌شده/خراب HTTP 200 با بدنه‌ی چندبایتی
+            # می‌دن — اینجا قبول می‌شد و خروجی «۱۳۰مگِ خراب» می‌شد.
+            _sz = os.path.getsize(part_path)
+            _dd = float(segments[idx][1]) if idx < len(segments) else 0.0
+            if _dd >= 1.0 and _sz < 1024:
+                try:
+                    os.unlink(part_path)
+                except Exception:
+                    pass
+                raise _EmptySegmentError(f"seg {idx}: only {_sz}B for {_dd:.1f}s")
             os.replace(part_path, final_path)
             seg_paths[idx] = final_path
             counters["done"] += 1
@@ -1878,14 +1999,19 @@ async def _hls_segment_engine(
                     m416 = re.search(r"\*/(\d+)", _resp_header(w.headers, "Content-Range"))
                     total416 = int(m416.group(1)) if m416 else 0
                     if (not total416 and have > 0) or (total416 and have >= total416):
-                        await _finish()
-                        return
-                    have = 0
-                    expected = 0
-                    try:
-                        os.unlink(part_path)
-                    except Exception:
-                        pass
+                        try:
+                            await _finish()
+                            return
+                        except _EmptySegmentError:
+                            have = 0
+                            expected = 0
+                    else:
+                        have = 0
+                        expected = 0
+                        try:
+                            os.unlink(part_path)
+                        except Exception:
+                            pass
                     await asyncio.sleep(min(2.0, 0.4 * (attempt + 1)))
                     continue
                 if w.status_code not in (200, 206):
@@ -1930,6 +2056,11 @@ async def _hls_segment_engine(
                         await _finish()
                     except FileNotFoundError:
                         pass
+                    except _EmptySegmentError:
+                        have = 0
+                        expected = 0
+                        await asyncio.sleep(min(1.5, 0.3 * (attempt + 1)))
+                        continue
                     return
                 logger.debug("seg %d attempt %d eof-truncated (%d/%d) — will resume",
                              idx, attempt + 1, have, expected)
@@ -1939,6 +2070,11 @@ async def _hls_segment_engine(
                 logger.debug("seg %d attempt %d stalled at %d bytes — resume later",
                              idx, attempt + 1, have)
                 await asyncio.sleep(min(3.0, 0.5 * (attempt + 1)))
+            except _EmptySegmentError:
+                # 🆕 z36 — سگمنت پوچ (بدنه‌ی خالی) — از صفر تلاش دوباره
+                have = 0
+                expected = 0
+                await asyncio.sleep(min(1.5, 0.3 * (attempt + 1)))
             except asyncio.CancelledError:
                 state["abort"] = True
                 raise
@@ -2260,6 +2396,8 @@ async def download_with_quality(
     stats_out: Optional[dict] = None,
     title: Optional[str] = None,
     year=None,
+    _exclude: Optional[set] = None,
+    _depth: int = 0,
 ) -> Optional[str]:
     """
     دانلود فیلم یا قسمت سریال با کیفیت انتخابی.
@@ -2275,12 +2413,17 @@ async def download_with_quality(
             دانلود اشتباه با Auto (باگ 480p→431MB)، خطای واضح میده.
         stats_out: 🆕 z16 دیکشنری اختیاری که موتور سگمنت آمار زنده توش می‌ریزه
             ({"mbps": سرعت لحظه‌ای, "concurrency": تعداد کانکشن فعلی،
-             🆕 z35 "gap_spans": نقشه‌ی پرش‌های سگمنت گم‌شده})
+             🆕 z35 "gap_spans": نقشه‌ی پرش‌های سگمنت گم‌شده،
+             🆕 z36 "declared_duration": جمع EXTINF برای sync ساب})
         title, year: 🆕 z35 — برای fallback جستجوی TMDB وقتی find خالیه
+        _exclude: 🆕 z36 داخلی — سرورهایی که فایل‌شون گیت سلامت رو رد کرد
+        _depth: 🆕 z36 داخلی — عمق retry (حداکثر 2)
 
     Returns:
         مسیر فایل دانلود شده، یا None در صورت خطا.
     """
+    _exclude = set(_exclude or ())
+    _depth = int(_depth or 0)
     if not imdb_id:
         return None
     if not imdb_id.startswith("tt"):
@@ -2315,7 +2458,7 @@ async def download_with_quality(
                     return _p
                 logger.warning("[IMDBPlay] iran server %s failed → falling back to CDN", preferred_server)
             for server in _SERVERS:
-                if server["name"] == preferred_server:
+                if server["name"] == preferred_server and server["name"] not in _exclude:
                     try:
                         logger.info("[IMDBPlay] Auto + preferred server %s...", preferred_server)
                         stream = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
@@ -2330,7 +2473,8 @@ async def download_with_quality(
         if not stream:
             # برای Auto، اولین سرور موفق کافیه
             stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode,
-                                                     expected_s=_expected_s)
+                                                     expected_s=_expected_s,
+                                                     exclude=_exclude)
     else:
         # برای کیفیت خاص، سرورها رو به ترتیب امتحان کن تا سروری پیدا بشه که اون کیفیت رو داشته باشه
         # 🆕 سرور انتخابی کاربر «اول» امتحان میشه؛ اگه این کیفیت رو نداشت،
@@ -2348,6 +2492,8 @@ async def download_with_quality(
         if preferred_server:
             ordered.sort(key=lambda s: 0 if s["name"] == preferred_server else 1)
         for server in ordered:
+            if server["name"] in _exclude:
+                continue
             try:
                 logger.info("[IMDBPlay] Trying server %s for quality %s...", server["name"], quality_label)
                 candidate = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
@@ -2357,14 +2503,15 @@ async def download_with_quality(
                 # بررسی اینکه آیا این سرور کیفیت مورد نظر رو داره
                 # اگه سرور لیست کیفیت‌ها رو داره (مثل Videasy/Vidking)، چک کن
                 if candidate.get("qualities"):
+                    # 🆕 z36 — برچسب None (مثل بعضی جواب‌های 2Embed) کرش نمی‌ده
                     has_q = any(
-                        q.get("label", "").lower() == target_quality
+                        (q.get("label") or "").lower() == target_quality
                         for q in candidate["qualities"]
                     )
                     if has_q:
                         # این سرور کیفیت مورد نظر رو داره — URL اون کیفیت رو برگردون
                         for q in candidate["qualities"]:
-                            if q.get("label", "").lower() == target_quality:
+                            if (q.get("label") or "").lower() == target_quality:
                                 candidate["url"] = q["url"]
                                 break
                         # 🆕 z35 — چک مدت قبل از پذیرش سرور
@@ -2377,11 +2524,43 @@ async def download_with_quality(
                         logger.info("[IMDBPlay] ✓ Server %s has quality %s", server["name"], quality_label)
                         break
                     else:
+                        # 🆕 z36 — لیستِ خودِ سرور برچسب هدف رو نداره؛ شاید master
+                        # playlist‌ش variant متناظر داشته باشه (برچسب‌های API و
+                        # برچسب‌های master گاهی فرق می‌کنن):
+                        _mv = None
+                        if candidate.get("type", "hls") == "hls" and candidate.get("url"):
+                            _mv = await _resolve_variant_from_master(candidate, target_quality)
+                        if _mv:
+                            candidate["url"] = _mv
+                            if not await _stream_duration_ok(
+                                    candidate, _expected_s,
+                                    f"q:{server['name']}:{quality_label} (master)"):
+                                continue
+                            stream = candidate
+                            logger.info("[IMDBPlay] ✓ z36 master-variant %s on %s",
+                                        quality_label, server["name"])
+                            break
                         logger.info("[IMDBPlay] ✗ Server %s doesn't have quality %s (has: %s)",
                                     server["name"], quality_label,
                                     [q.get("label") for q in candidate["qualities"]])
                         continue
                 else:
+                    # 🆕 z36 — سرور لیست کیفیت نداره ولی شاید master playlist‌ش
+                    # variant واقعی داشته باشه (منو از master می‌بینه، دانلودر نمی‌دید).
+                    # همین‌جا variant متناظر با کیفیت هدف رو پیدا کن:
+                    _mv = None
+                    if candidate.get("type", "hls") == "hls" and candidate.get("url"):
+                        _mv = await _resolve_variant_from_master(candidate, target_quality)
+                    if _mv:
+                        candidate["url"] = _mv
+                        if not await _stream_duration_ok(
+                                candidate, _expected_s,
+                                f"q:{server['name']}:{quality_label} (master)"):
+                            continue
+                        stream = candidate
+                        logger.info("[IMDBPlay] ✓ z36 master-variant %s on %s",
+                                    quality_label, server["name"])
+                        break
                     # سرور فقط Auto داره (مثل Vidzee) — اگه کیفیت Auto خواستیم، خوبه
                     # اگه نه، این سرور رو رد کن
                     logger.info("[IMDBPlay] ✗ Server %s only has Auto quality", server["name"])
@@ -2411,12 +2590,39 @@ async def download_with_quality(
                 )
             logger.warning("[IMDBPlay] No server has quality %s, falling back to Auto", quality_label)
             stream = await _get_first_working_stream(tmdb_id, imdb_id, season, episode,
-                                                     expected_s=_expected_s)
+                                                     expected_s=_expected_s,
+                                                     exclude=_exclude)
             # وقتی fallback می‌کنیم، quality_label رو هم به Auto تغییر بده
             quality_label = "Auto"
 
     if not stream:
         raise RuntimeError(f"No working stream found for {imdb_id}")
+
+    # 🆕 z36 — گیت سلامت + retry خودکار با سرور بعدی
+    async def _finish_or_retry(path: str, declared: Optional[float]) -> str:
+        ok, why = await asyncio.to_thread(
+            _validate_video_file, path, declared, _expected_s)
+        if ok:
+            logger.info("[z36] integrity OK: %s (%s)", os.path.basename(path), why)
+            return path
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+        _srv = stream.get("server") or "?"
+        if _depth < 2 and _srv != "?":
+            logger.warning("[z36] integrity FAIL on %s: %s → retry با سرور بعدی", _srv, why)
+            _exclude.add(_srv)
+            return await download_with_quality(
+                imdb_id, quality_label, out_dir, season, episode,
+                progress_cb=progress_cb, preferred_server=preferred_server,
+                strict_quality=strict_quality, stats_out=stats_out,
+                title=title, year=year, _exclude=_exclude, _depth=_depth + 1,
+            )
+        raise RuntimeError(
+            f"ویدیوی دانلودشده نامعتبر بود ({why}) و سرور جایگزین سالمی هم پیدا نشد. "
+            "بعداً دوباره امتحان کن یا کیفیت/سرور دیگه‌ای انتخاب کن."
+        )
 
     m3u8_url = stream["url"]
     headers = {"User-Agent": _USER_AGENT}
@@ -2459,7 +2665,8 @@ async def download_with_quality(
                                     pass
                     logger.info("Download complete: %s (%.1f MB)",
                                 out_path, os.path.getsize(out_path) / 1024 / 1024)
-                    return out_path
+                    # 🆕 z36 — گیت سلامت (MP4: مدت اعلامی نداریم)
+                    return await _finish_or_retry(out_path, None)
         except Exception as e:
             logger.error("MP4 download failed: %s", e)
             mp4_failed = True
@@ -2636,6 +2843,14 @@ async def download_with_quality(
     if not segments:
         raise RuntimeError("No segments in variant m3u8")
 
+    # 🆕 z36 — جمع EXTINF اعلامی (مرجع sync ساب و گیت سلامت)
+    _declared_total = float(sum(float(d or 0.0) for _u, d in segments))
+    if stats_out is not None:
+        try:
+            stats_out["declared_duration"] = _declared_total
+        except Exception:
+            pass
+
     total = len(segments)
     server_name = stream.get("server", "unknown")
     logger.info("Downloading %d segments from %s (init=%s)",
@@ -2737,7 +2952,8 @@ async def download_with_quality(
 
     logger.info("Download complete: %s (%.1f MB)",
                 out_path, os.path.getsize(out_path) / 1024 / 1024)
-    return out_path
+    # 🆕 z36 — گیت سلامت خروجی + retry خودکار با سرور بعدی اگه خراب بود
+    return await _finish_or_retry(out_path, _declared_total)
 
 
 async def _concat_segments_async(seg_paths: List[str], out_path: str,
@@ -3459,6 +3675,7 @@ def embed_subtitle_soft(
     subtitle_path: str,
     out_path: str,
     sync_info: Optional[dict] = None,
+    declared_duration: Optional[float] = None,
 ) -> Optional[str]:
     """
     قرار دادن زیرنویس به‌صورت softsub داخل فایل ویدیو (بدون re-encode).
@@ -3472,12 +3689,14 @@ def embed_subtitle_soft(
     🆕 z34: قبل از جاسازی، زیرنویس به‌طور خودکار با ویدیو همگام می‌شه
     (ویدیوهای PAL-spun/تندتر سرورها vs ساب‌های 23.976-timed → درِیف تجمعی).
     جزئیات تصمیم در sync_info پر می‌شه (applied/factor/reason).
+    🆕 z36: declared_duration (جمع EXTINF پلی‌لیست) — برای شاخه‌ی استرچ واقعی.
 
     Args:
         video_path: مسیر فایل ویدیو
         subtitle_path: مسیر فایل زیرنویس (VTT یا SRT)
         out_path: مسیر فایل خروجی (پسوند نهایی خروجی ممکنه .mkv باشه)
         sync_info: dict اختیاری — بعد از اجرا با نتیجه‌ی sync پر می‌شه
+        declared_duration: 🆕 z36 جمع EXTINF پلی‌لیست منبع (ثانیه) یا None
 
     Returns:
         مسیر فایل خروجی اگه موفق، None در غیر این صورت.
@@ -3490,7 +3709,8 @@ def embed_subtitle_soft(
             except ImportError:
                 from subtitle_sync import auto_sync_subtitle
             subtitle_path, _sync_factor, _sync_reason = auto_sync_subtitle(
-                video_path, subtitle_path, sync_info=sync_info)
+                video_path, subtitle_path, sync_info=sync_info,
+                declared_duration=declared_duration)
         except Exception as _sync_err:
             logger.warning("[z34] subtitle auto-sync skipped: %s", _sync_err)
 

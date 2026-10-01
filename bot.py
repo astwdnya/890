@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z35"  # نشانگر نسخه — تو لاگ استارت باید z35 دیده بشه (🆕 z35: فیکس ریشه‌ای درِیف ساب — بازتایم ساب با نقشه‌ی پرش‌های سگمنت گم‌شده + sync ساب جداگانه در مسیر حافظه ابری + sanity-check مدت استریم + fallback جستجوی TMDB)
+BOT_BUILD = "z36"  # نشانگر نسخه — تو لاگ استارت باید z36 دیده بشه (🆕 z36: ریشه‌یابی نهایی درِیف ساب — سگمنت‌های CDN ~۰.۸٪ بلندتر از EXTINF اعلامی decode می‌شن؛ ساب حالا با نسبت مدت واقعی/اعلامی بازتایم می‌شه + گیت سلامت فایل خروجی (فایل خراب/صوتی/بریده تحویل نمی‌شه) + رد سگمنت پوچ + retry خودکار سرور بعدی + رفع ناسازگاری منو/دانلودر برای کیفیت خاص)
 
 # ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
 # 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
@@ -15328,7 +15328,8 @@ async def _imdb_cloud_deliver(event, status_msg, state, final_path, title,
             try:
                 from searcher.imdb.subtitle_sync import auto_sync_subtitle as _a_sync_c
                 _spc, _sfc, _srcc = await asyncio.to_thread(
-                    _a_sync_c, final_path, separate_sub_path)
+                    _a_sync_c, final_path, separate_sub_path, None,
+                    state.get("declared_duration"))
                 if _spc and os.path.exists(_spc) and abs(_sfc - 1.0) > 1e-6:
                     separate_sub_path = _spc
                     logger.info("[IMDB] z35 cloud separate-sub auto-synced ×%.5f (%s)", _sfc, _srcc)
@@ -15626,6 +15627,14 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
         vid_size = os.path.getsize(video_path) / 1024 / 1024
         await status_msg.edit(f"✅ ویدیو دانلود شد ({vid_size:.1f} MB)")
 
+        # 🆕 z36 — جمع EXTINF پلی‌لیست منبع (برای شاخه‌ی «استرچ واقعی» سینک ساب)
+        _decl_dur = (seg_stats or {}).get("declared_duration")
+        if _decl_dur:
+            try:
+                state["declared_duration"] = float(_decl_dur)
+            except Exception:
+                pass
+
         # 🆕 z35 — فیکس ریشه‌ای درِیف ساب: اگه سگمنت‌هایی گم شده بودن (پرش محتوایی
         # تو ویدیوی خروجی)، تایم‌استمپ‌های ساب با نقشه‌ی دقیق همون پرش‌ها جابه‌جا
         # می‌شن — ساب حتی روی ویدیوی دارای پرش هم برای کل فیلم دقیق می‌مونه.
@@ -15691,8 +15700,10 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                     # event loop رو حین remux فریز می‌کرد — حالا در thread جدا اجرا می‌شه
                     # 🆕 z34: همگام‌سازی خودکار زیرنویس با ویدیو (فیکس درِیف تایمینگ)
                     _sync_info: dict = {}
+                    _decl_embed = (seg_stats or {}).get("declared_duration")
                     embedded = await asyncio.to_thread(
-                        embed_subtitle_soft, video_path, persian_sub_path, softsub_out, _sync_info)
+                        embed_subtitle_soft, video_path, persian_sub_path, softsub_out,
+                        _sync_info, _decl_embed)
                     if embedded and os.path.exists(embedded):
                         final_path = embedded
                         if not sub_name:
@@ -15789,7 +15800,8 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                 try:
                     from searcher.imdb.subtitle_sync import auto_sync_subtitle as _a_sync
                     _sp, _sf2, _sr2 = await asyncio.to_thread(
-                        _a_sync, video_path, persian_sub_path)
+                        _a_sync, video_path, persian_sub_path, None,
+                        (seg_stats or {}).get("declared_duration"))
                     if _sp and os.path.exists(_sp) and abs(_sf2 - 1.0) > 1e-6:
                         persian_sub_path = _sp
                         sub_caption_suffix = f"\n⏱️ زیرنویس با ویدیو همگام شد (×{_sf2:.4f})"
@@ -15834,7 +15846,8 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                         try:
                             from searcher.imdb.subtitle_sync import auto_sync_subtitle as _a_sync2
                             _sp2, _sf3, _sr3 = await asyncio.to_thread(
-                                _a_sync2, video_path, persian_sub_path)
+                                _a_sync2, video_path, persian_sub_path, None,
+                                (seg_stats or {}).get("declared_duration"))
                             if _sp2 and os.path.exists(_sp2) and abs(_sf3 - 1.0) > 1e-6:
                                 persian_sub_path = _sp2
                                 _sync_note2 = f"\n⏱️ زیرنویس با ویدیو همگام شد (×{_sf3:.4f})"

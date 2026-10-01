@@ -68,6 +68,14 @@ _MAX_CREDITS_FRAC = 0.15  # بعد از ضریب، فاصله‌ی آخرین cu
 _MIN_END_SLACK_S = -15.0  # ساب می‌تونه حداکثر 15 ثانیه از پایان ویدیو بیرون بزنه
 _MIN_DRIFT_S = 8.0        # اصلاح کمتر از 8 ثانیه (تجمعی در انتها) معنی نداره
 
+# 🆕 z36 — شاخه‌ی «استرچ واقعی ویدیو»:
+#   سگمنت‌های HLS بعضی CDNها (مثل Vidzee) به‌طور سیستماتیک ~۰.۵-۱٪ بلندتر از
+#   EXTINF اعلامی decode می‌شن (اندازه‌گیری زنده: نسبت ≈ 1.008 برای کل فیلم ≈ +73s).
+#   ساب که برای تایم‌لاین اصلی (همون جمع EXTINF) تایم شده، روی ویدیو درِیف خطی
+#   می‌گیره — کاربر هر ۷-۸ دقیقه باید شیفت می‌کرد. فاکتور درست:
+#       f = مدت_واقعی_ffprobe / جمع_EXTINF_پلی‌لیست
+_STRETCH_MIN_REL = 0.004  # حداقل انحراف نسبی مدت (۰.۴٪) که شاخه فعال شه
+
 _SUPPORTED_EXT = (".srt", ".vtt", ".ass", ".ssa")
 
 
@@ -337,19 +345,41 @@ def _fps_candidates(fps: float) -> List[Tuple[float, str]]:
     return cands
 
 
+def _stretch_candidate(duration: float, declared_duration: float) -> Optional[Tuple[float, str]]:
+    """🆕 z36 — کاندید ضریب از نسبت مدت واقعی ویدیو به مدت اعلامی پلی‌لیست.
+
+    ویدیوی خروجی concat همون سگمنت‌هاست ولی هر سگمنت واقعاً کمی بلندتر از
+    EXTINF اعلامی decode می‌شه (باگ ترنسکود CDN) → زمان‌محور واقعی کشیده‌تره.
+    ساب برای تایم‌لاین اعلامی (اصلی) تایم شده → ضریب = real/declared.
+    این ضریب «اندازه‌گیری‌شده‌ی انتها-به-انتها»ست و هر نوع speedup مرتکب‌شده
+    توسط CDN رو هم پوشش می‌ده (حتی اگه fps ظاهری استاندارد گزارش شده باشه).
+    """
+    if not declared_duration or declared_duration <= 0 or not duration or duration <= 0:
+        return None
+    rel = duration / declared_duration
+    if abs(rel - 1.0) < _STRETCH_MIN_REL:
+        return None
+    return rel, (
+        f"استرچ واقعی ویدیو: مدت ffprobe={duration:.0f}s ≠ پلی‌لیست={declared_duration:.0f}s "
+        f"(×{rel:.5f} ≈ {(rel - 1.0) * 100:+.2f}٪)"
+    )
+
+
 def decide_sync_factor(
     duration: Optional[float],
     fps: Optional[float],
     first: float,
     last: float,
     cue_count: int,
+    declared_duration: Optional[float] = None,
 ) -> Tuple[float, str]:
     """
     ضریب scale زیرنویس رو تصمیم می‌گیره.  1.0 = دست نزن.
     منطق:
       1) گاردهای داده (تعداد cue، طول، پوشش)
       2) اگه ساب خودش می‌خونه (فاصله‌ی آخرین cue تا پایان ≤ 45s) → 1.0
-      3) کاندیدهای fps-محور؛ اعتبارسنجی: فضای کردیت باقیمانده C = D − L×f
+      3) 🆕 z36 کاندید «استرچ» (نسبت مدت واقعی/اعلامی) — اندازه‌گیری انتها-به-انتها
+      4) کاندیدهای fps-محور؛ اعتبارسنجی مشترک: فضای کردیت باقیمانده C = D − L×f
          باید توی بازه‌ی منطقی باشه (−15s تا 15% طول ویدیو) و درِیف ≥ 8s
     """
     if cue_count < _MIN_CUES:
@@ -361,9 +391,35 @@ def decide_sync_factor(
     if last < duration * _MIN_COVERAGE:
         return 1.0, f"زیرنویس فقط {100 * last / duration:.0f}% ویدیو رو پوشش می‌ده (نسخه‌ی متفاوت)"
 
-    gap1 = duration - last
+    # 🆕 z36 — مرجع «انتهای فیلم» برای ساب، تایم‌لاین اعلامیه (ساب برای همون تایم شده).
+    # اگه مدت اعلامی پلی‌لیست موجوده، جفت‌بودن رو با اون می‌سنجیم نه مدت واقعی —
+    # وگرنه استرچ ~۰.۸٪ (۷۲s در فیلم ۱۵۰دقیقه‌ای) تو پنجره‌ی 45s گم می‌شد.
+    _ref_end = duration
+    if declared_duration and declared_duration > 0:
+        _ref_end = float(declared_duration)
+    gap1 = _ref_end - last
+    _st = _stretch_candidate(duration, declared_duration)
     if _MIN_END_SLACK_S <= gap1 <= _FIT_TOLERANCE_S:
-        return 1.0, f"زیرنویس از قبل جفت است (gap={gap1:.0f}s)"
+        if _st is None:
+            return 1.0, f"زیرنویس از قبل جفت است (gap={gap1:.0f}s)"
+        # ظاهراً جفت (با تایم‌لاین اعلامی) ولی استرچ واقعی معنادار هست →
+        # اعمالش ساب رو با مدت واقعی ویدیو تراز می‌کنه؛ گاردها مثل همیشه:
+        f, why = _st
+        drift = last * abs(1.0 - f)
+        credits = duration - last * f
+        if drift >= _MIN_DRIFT_S and \
+                credits >= _MIN_END_SLACK_S and credits <= duration * _MAX_CREDITS_FRAC:
+            return f, (f"{why} | درِیف≈{drift:.0f}s، کردیت≈{credits:.0f}s")
+        return 1.0, f"زیرنویس جفت است (gap={gap1:.0f}s) و استرچ قابل‌اعتماد نیست"
+
+    # ─── 🆕 z36: کاندید استرچ (اندازه‌گیری واقعی)، بعد fps ───
+    if _st is not None:
+        f, why = _st
+        drift = last * abs(1.0 - f)
+        credits = duration - last * f
+        if drift >= _MIN_DRIFT_S and \
+                credits >= _MIN_END_SLACK_S and credits <= duration * _MAX_CREDITS_FRAC:
+            return f, (f"{why} | درِیف≈{drift:.0f}s، کردیت≈{credits:.0f}s")
 
     if not fps or fps <= 0:
         return 1.0, f"fps ویدیو نامشخص (gap={gap1:.0f}s) — بدون تغییر"
@@ -390,9 +446,14 @@ def auto_sync_subtitle(
     video_path: str,
     sub_path: str,
     sync_info: Optional[Dict] = None,
+    declared_duration: Optional[float] = None,
 ) -> Tuple[str, float, str]:
     """
     همگام‌سازی خودکار زیرنویس با ویدیو.
+
+    🆕 z36 — declared_duration: جمع EXTINF پلی‌لیست HLS منبع (ثانیه).
+      اگه داده بشه و مدت واقعی ویدیو (ffprobe) باهاش نخونه (استرچ CDN)،
+      ساب با نسبت همون دو مدت بازتایم می‌شه — ریشه‌ی درِیف «هر چند دقیقه».
 
     Returns:
         (مسیر زیرنویس نهایی, ضریب اعمال‌شده, دلیل/توضیح)
@@ -430,6 +491,7 @@ def auto_sync_subtitle(
 
         factor, reason = decide_sync_factor(
             duration, fps, stats["first"], stats["last"], int(stats["count"]),
+            declared_duration=declared_duration,
         )
         logger.info(
             "[z34] sub-sync decision: video=%s dur=%.1fs fps=%s | sub cues=%d first=%.1fs last=%.1fs "
