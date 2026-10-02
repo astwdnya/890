@@ -803,8 +803,11 @@ async def _2embed_get_stream(tmdb_id: str, imdb_id: str, season: Optional[int], 
     is_tv = bool(season and episode)
     media_type = "tv" if is_tv else "movie"
 
-    # Try multiple providers
-    for provider in ["vidlink", "videasy", "hollymoviehd", "nextgencloudfabric", "klikxxi"]:
+    # 🆕 z38 — Try multiple providers؛ superstream اول: تنها provider با
+    # لیبل‌های کیفیت واقعی (1080p/720p/480p) و همان فایل ~1650MB «720p» استاندارد
+    # (1280x536 اسکوپ) — قبلاً اصلاً تو لیست نبود و کاربر هرگز به آن نمی‌رسید.
+    for provider in ["superstream", "vidlink", "videasy", "hollymoviehd",
+                     "nextgencloudfabric", "klikxxi"]:
         try:
             if is_tv:
                 api_url = f"https://new.vidnest.fun/{provider}/{media_type}/{tmdb_id}/{season}/{episode}"
@@ -831,8 +834,11 @@ async def _2embed_get_stream(tmdb_id: str, imdb_id: str, season: Optional[int], 
                 if "data" in decrypted and "stream" in decrypted.get("data", {}):
                     stream = decrypted["data"]["stream"]
                     for quality, info in stream.get("qualities", {}).items():
+                        _lbl = f"{quality}p" if str(quality).isdigit() else str(quality)
                         streams.append({
-                            "quality": f"{quality}p",
+                            # 🆕 z38 — label همیشه ست شود (دانلودر روی q["label"] چک می‌کند)
+                            "quality": _lbl,
+                            "label": _lbl,
                             "url": info["url"],
                             "type": info.get("type", "mp4"),
                             "headers": decrypted.get("headers", {}),
@@ -863,12 +869,19 @@ async def _2embed_get_stream(tmdb_id: str, imdb_id: str, season: Optional[int], 
                         "headers": decrypted.get("headers", {}),
                     })
                 elif "streams" in decrypted:
+                    # 🆕 z38 — superstream این ساختار را می‌دهد: هر آیتم
+                    # quality=«1080p/720p/480p» دارد؛ قبلاً فقط «language»
+                    # («Original») خوانده می‌شد و هر سه استریم لیبل یکسان می‌گرفتند
+                    # → انتخاب 720p غیرممکن بود.
                     for s_item in decrypted["streams"]:
+                        _lbl = str(s_item.get("quality") or s_item.get("language") or "auto").strip()
                         streams.append({
-                            "quality": s_item.get("language", "auto"),
+                            "quality": _lbl,
+                            "label": _lbl,
                             "url": s_item["url"],
                             "type": s_item.get("type", "hls"),
-                            "headers": s_item.get("headers", {}),
+                            "headers": {**(decrypted.get("headers") or {}),
+                                        **(s_item.get("headers") or {})},
                         })
                 elif "all_urls" in decrypted:
                     for i, url in enumerate(decrypted["all_urls"]):
@@ -1189,16 +1202,29 @@ def _sum_media_playlist_durations(text: str) -> float:
 
 
 def _pick_variant_url(master_text: str, base_url: str, prefer_height: int = 720) -> Optional[str]:
-    """انتخاب نزدیک‌ترین variant به ارتفاع خواسته از master playlist (URL مطلق)."""
+    """انتخاب نزدیک‌ترین variant به کیفیت خواسته از master playlist (URL مطلق).
+
+    🆕 z38 — width-aware: برای محتوای اسکوپ، تطابق بر اساس «عرض مرجع» انجام
+    می‌شود (720p → عرض 1280). master با واریانت‌های 1920x804/1280x536/854x358
+    برای درخواست 720p دیگر 804 را انتخاب نمی‌کند (1080-class اشتباه) —
+    1280x536 را برمی‌دارد."""
     variants = _parse_master_m3u8(master_text)
     if not variants:
         return None
 
-    def _h(resolution: str) -> int:
+    def _wh(resolution: str) -> Tuple[int, int]:
         m = re.search(r"(\d+)x(\d+)", resolution or "")
-        return int(m.group(2)) if m else 0
+        return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
-    best = min(variants, key=lambda v: abs(_h(v[2]) - (prefer_height or 720)))
+    pref_w = _label_width_from_height(prefer_height)
+
+    def _score(v) -> int:
+        w, h = _wh(v[2])
+        if pref_w and w:
+            return abs(w - pref_w)
+        return abs(h - (prefer_height or 720))
+
+    best = min(variants, key=_score)
     return _make_absolute(base_url, best[0])
 
 
@@ -1697,7 +1723,16 @@ def _parse_variant_m3u8(text: str) -> Tuple[List[Tuple[str, float]], Optional[st
 
 
 def _resolution_to_label(resolution: str, bandwidth: int) -> str:
-    """تبدیل resolution (مثل 1920x1080) به label (مثل 1080p)."""
+    """تبدیل resolution (مثل 1920x1080) به label (مثل 1080p).
+
+    🆕 z38 — width-aware: فیلم‌های سینمایی اسکوپ (2.39:1) ارتفاع کم دارند:
+      1920x804 = 1080p کلاس (قبلاً اشتباهی «720p» لیبل می‌خورد!)
+      1280x536 = 720p کلاس (قبلاً اشتباهی «480p» می‌شد!)
+      854x358  = 480p کلاس (قبلاً «358p» می‌شد)
+    استاندارد رلیزها بر اساس «عرض» است: 1080p = 1920 عرض، 720p = 1280 عرض،
+    480p = 854 عرض — همون‌طور که Avengers.Infinity.War.2018.720p.WEB-DL
+    یعنی 1280x536 و 1080p یعنی 1920x804.
+    """
     if not resolution:
         if bandwidth >= 8_000_000:
             return "1080p"
@@ -1706,21 +1741,32 @@ def _resolution_to_label(resolution: str, bandwidth: int) -> str:
         if bandwidth >= 2_000_000:
             return "480p"
         return "Auto"
-    try:
-        h = int(resolution.split("x")[1])
-    except (ValueError, IndexError):
+    m = re.match(r"(\d+)x(\d+)", resolution.strip())
+    if not m:
         return "Auto"
-    if h >= 2160:
+    w, h = int(m.group(1)), int(m.group(2))
+    if w >= 3400 or h >= 1800:
         return "4K"
-    if h >= 1080:
+    if w >= 1800 or h >= 1000:
         return "1080p"
-    if h >= 720:
+    if w >= 1200 or h >= 700:
         return "720p"
-    if h >= 480:
+    if w >= 800 or h >= 480:
         return "480p"
-    if h >= 360:
+    if w >= 600 or h >= 340:
         return "360p"
     return f"{h}p"
+
+
+# 🆕 z38 — عرضِ مرجع هر کلاس کیفیت (برای محتوای اسکوپ 2.39:1)
+_QUALITY_WIDTH_BY_HEIGHT = {
+    2160: 3840, 1080: 1920, 720: 1280, 480: 854, 360: 640, 240: 426,
+}
+
+
+def _label_width_from_height(prefer_height: int) -> int:
+    """720 → 1280 (عرض مرجع کلاس 720p) — برای انتخاب واریانت اسکوپ."""
+    return _QUALITY_WIDTH_BY_HEIGHT.get(int(prefer_height or 0), 0)
 
 
 def _make_absolute(base_url: str, url: str) -> str:
@@ -1913,9 +1959,14 @@ async def get_qualities(imdb_id: str, season: Optional[int] = None, episode: Opt
 
 
 async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, episode: Optional[int] = None,
-                                   iran_hints: Optional[dict] = None) -> List[dict]:
+                                   iran_hints: Optional[dict] = None,
+                                   title: Optional[str] = None, year=None) -> List[dict]:
     """
     🆕 پروب موازی همه‌ی سرورها → لیست کیفیت‌های هر سرور (برای منوی انتخاب سرور).
+
+    🆕 z38 — title/year: fallback جستجوی TMDB وقتی find خالی برمی‌گردد
+    (مثل tt4154795 = Avengers: Infinity War) — بدون این، منوی سرور برای
+    چنین عنوان‌هایی «هیچ سروری این عنوان رو نداره» نشان می‌داد!
 
     برخلاف get_qualities که با اولین سرورِ چندکیفیتی متوقف میشه، این تابع
     همه‌ی سرورها رو امتحان می‌کنه تا کاربر ببینه کدوم سرور چه کیفیتی داره.
@@ -1943,7 +1994,8 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
     if not imdb_id.startswith("tt"):
         imdb_id = f"tt{imdb_id}"
 
-    tmdb_id = await _get_tmdb_id(imdb_id)
+    tmdb_id = await _get_tmdb_id(imdb_id, title=title, year=year,
+                                 is_tv=bool(season and episode))
     if not tmdb_id:
         logger.error("Cannot resolve tmdb_id for %s", imdb_id)
         return []
@@ -2821,8 +2873,10 @@ async def download_with_quality(
                         break
                     # 🆕 z37 — سرور «فقط Auto» (مثل Vidzee) دیگر کورکورانه رد نمی‌شه:
                     # پروب می‌شه؛ اگه زنجیره سالم بود و رزولوشن واقعی سگمنت با
-                    # کیفیت هدف بخوند (Vidzee 1920x804 → 720p ✓)، قبوله — همون
-                    # رفتار قدیمیِ «فایل 1800MB» با تضمین کیفیت (بدون باگ 431MB).
+                    # کیفیت هدف بخونه، قبوله.
+                    # 🆕 z38 — لیبل‌ها width-aware شدن: Vidzee 1920x804 حالا
+                    # «1080p» است (نه 720p) → برای درخواست 720p رد می‌شه و
+                    # سرورِ دارای 720p واقعی (1280x536، مثل superstream) برنده می‌شه.
                     _pok, _pdet = await _probe_stream_health(
                         candidate, want_label=quality_label, require_match=True)
                     if _pok:
@@ -2847,7 +2901,8 @@ async def download_with_quality(
                     q.get("label", "?")
                     for e in (list(_iran_cache_get(_ck).values())
                               + list(_VIDSRCME_CACHE.get(_ck, {}).values())
-                              + (await get_all_server_qualities(imdb_id, season, episode)))
+                              + (await get_all_server_qualities(imdb_id, season, episode,
+                                                                title=title, year=year)))
                     for q in e["qualities"]
                     if q.get("label", "").lower() != "auto"
                 })

@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z37"  # نشانگر نسخه — تو لاگ استارت باید z37 دیده بشه (🆕 z37: فیکس رجریشن 720p — ریشه: زنجیره‌ی 2Embed/videasy پلی‌لیست سالم می‌داد ولی همه‌ی سگمنت‌هایش 403 bad signature؛ حالا هر کاندید قبل از پذیرش «پروب سلامت» می‌شه (fetch واقعی سگمنت) + providerهای vidnest به‌ترتیب پروب می‌شن (hollymoviehd/nextgen سالم → جایگزین videasy) + سرورهای فقط-Auto با اثبات رزولوشن واقعی ffprobe قبول می‌شن (بازگشت فایل ~1800MB برای 720p) + مدارشکن موتور سگمنت (پیشرفت <2% → قطع فوری و سرور بعدی به‌جای گیر ۱۵ دقیقه‌ای))
+BOT_BUILD = "z38"  # نشانگر نسخه — تو لاگ استارت باید z38 دیده بشه (🆕 z38: پیدا شدن فایل ~1650MB «720p» اونجرز 2018 — ریشه: (۱) لیبل کیفیت فقط از ارتفاع: 1280x536 (720p استاندارد اسکوپ) «480p» لیبل می‌خورد و 1920x804 (1080-class، ~3.9GB) «720p»! حالا width-aware: 1080p=عرض 1920، 720p=عرض 1280، 480p=عرض 854؛ (۲) provider «superstream» به resolver 2Embed اضافه شد — تنها provider با لیبل‌های واقعی 1080p/720p/480p و همان فایل 1658MB؛ (۳) منوی سرور برای ttهایی که TMDB find خالی می‌دهد (مثل tt4154795) حالا با جستجوی عنوانی TMDB کار می‌کند — دیگر «هیچ سروری این عنوان رو نداره» نمی‌بینی؛ (۴) انتخاب واریانت master هم width-aware شد)
 
 # ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
 # 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
@@ -14532,7 +14532,9 @@ async def imdb_cb_title(event):
         # 🆕 z25 — منابع 🇮🇷 فقط وقتی IRAN_MENU_SOURCES_ENABLED=True (پیش‌فرض: خاموش برای سرعت)
         sq = await get_all_server_qualities(
             imdb_id,
-            iran_hints=_imdb_iran_hints(info) if IRAN_MENU_SOURCES_ENABLED else None)
+            iran_hints=_imdb_iran_hints(info) if IRAN_MENU_SOURCES_ENABLED else None,
+            # 🆕 z38 — fallback جستجوی TMDB وقتی find خالیه (مثل tt4154795)
+            title=info.get("title"), year=info.get("year"))
         qualities = _imdb_agg_qualities(sq)
         if not sq:
             await event.edit(f"{caption}\n\n❌ هیچ سروری این عنوان رو نداره.", parse_mode="md")
@@ -14851,7 +14853,9 @@ async def imdb_cb_episode(event):
     # 🆕 z25 — منابع 🇮🇷 فقط وقتی IRAN_MENU_SOURCES_ENABLED=True (پیش‌فرض: خاموش برای سرعت)
     sq = await get_all_server_qualities(
         imdb_id, season, episode,
-        iran_hints=_imdb_iran_hints(state.get("info")) if IRAN_MENU_SOURCES_ENABLED else None)
+        iran_hints=_imdb_iran_hints(state.get("info")) if IRAN_MENU_SOURCES_ENABLED else None,
+        # 🆕 z38 — fallback جستجوی TMDB وقتی find خالیه
+        title=state.get("info", {}).get("title"), year=state.get("info", {}).get("year"))
     qualities = _imdb_agg_qualities(sq)
     if not sq:
         await event.edit("❌ هیچ سروری این قسمت رو نداره.")
