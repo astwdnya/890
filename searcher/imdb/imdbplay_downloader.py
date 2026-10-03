@@ -79,7 +79,7 @@ SESSION_MAX_CLIENTS = int(os.environ.get("IMDB_MAX_CLIENTS", "96"))       # حد
 SEG_CONCURRENCY_MIN = int(os.environ.get("IMDB_SEG_MIN", "4"))            # کف concurrency
 SEG_CONCURRENCY_MAX = int(os.environ.get("IMDB_SEG_MAX", "64"))           # سقف concurrency
 SEG_ADAPT_ENABLED   = os.environ.get("IMDB_SEG_ADAPT", "1") != "0"        # خاموش/روشن کردن تطبیق
-SEG_ADAPT_WINDOW    = float(os.environ.get("IMDB_SEG_WINDOW", "4"))       # ثانیه بین اندازه‌گیری‌ها
+SEG_ADAPT_WINDOW    = float(os.environ.get("IMDB_SEG_WINDOW", "3"))       # ثانیه بین اندازه‌گیری‌ها (z41: 4→3 → قفل سریع‌تر)
 SEG_TIMEOUT         = int(os.environ.get("IMDB_SEG_TIMEOUT", "45"))       # تایم‌اوت هر سگمنت
 SEG_RETRIES         = int(os.environ.get("IMDB_SEG_RETRIES", "5"))        # تلاش مجدد هر سگمنت
 # 🛡 z17 — ضد فریز: توقف در ۹۹٪ (مثل 1710/1714) سه علت داشت:
@@ -953,9 +953,12 @@ async def _2embed_get_stream_multi(tmdb_id: str, imdb_id: str, season: Optional[
     fetched = await asyncio.gather(*[_safe_fetch(p) for p in providers])
     by_provider = {p: res for p, res in fetched if res}
 
-    # 🆕 z40 — فاز ۲: پروب «موازی» همه‌ی providerها (هرکدام با ددلاین ۳۰s)؛
-    # قبلاً پروب‌ها ترتیبی بودند و providerهای مرده (پروب تا ۳۰s) مجموعاً
-    # >۶۰s تاخیر می‌ساختند.
+    # 🆕 z40 — فاز ۲: پروب «موازی» همه‌ی providerها؛
+    # قبلاً پروب‌ها ترتیبی بودند و providerهای مرده مجموعاً >۶۰s تاخیر می‌ساختند.
+    # 🆕 z41 — ددلاین ۳۰s → ۱۲s: پروب سالم (پلی‌لیست + ۵۱۲KB سگمنت) روی CDNهای
+    # واقعی ۲-۵s تمام می‌شود (اندازه‌گیری زنده)؛ provider مرده فقط ۱۲s اشغال
+    # می‌کند نه ۳۰s — چون منو منتظر کندترین provider است، این یعنی منو
+    # ~۲× سریع‌تر باز می‌شود.
     async def _probe_provider(provider: str):
         res = by_provider.get(provider)
         if not res:
@@ -982,11 +985,13 @@ async def _2embed_get_stream_multi(tmdb_id: str, imdb_id: str, season: Optional[
                 }
             # 🆕 z37 — پروب سلامت؛ زنجیره‌ی «پلی‌لیست سالم ولی سگمنت 403»
             # (مثل videasy/streamvaultsrc) اینجا رد می‌شود.
+            # 🆕 z41 — ددلاین ۱۴s (بود ۳۰s) — پروب سالم ≤۵s است؛ حتی CDNهای کند
+            # (۵۱۲KB در ~۱۰۰KB/s) تا ~۱۳s جواب می‌دهند؛ مرده‌ها منتظر نمی‌مانیم.
             try:
                 _pok, _pdet = await asyncio.wait_for(
-                    _probe_stream_health(result), timeout=30.0)
+                    _probe_stream_health(result), timeout=14.0)
             except asyncio.TimeoutError:
-                _pok, _pdet = False, "probe deadline 30s"
+                _pok, _pdet = False, "probe deadline 14s"
             return provider, (result if _pok else None), _pdet
         except Exception as e:
             return provider, None, f"{type(e).__name__}: {str(e)[:60]}"
@@ -2089,6 +2094,28 @@ async def get_qualities(imdb_id: str, season: Optional[int] = None, episode: Opt
 # ═══════════════════════════════════════════════════════════
 
 
+async def _gather_deadline(coros, deadline: float) -> list:
+    """🆕 z41 — gather با ددلاین کلی.
+
+    منوی کیفیت منتظر «کندترین» زنجیره نمی‌ماند: هر کوروتینی که تا deadline
+    تمام نشده باشد cancel می‌شود و جایگاهش None می‌گیرد (سرور از منو حذف می‌شود
+    به‌جای اینکه کل منو ۳۰-۶۰s معطلش بماند)."""
+    tasks = {asyncio.create_task(c): i for i, c in enumerate(coros)}
+    done, pending = await asyncio.wait(
+        tasks.keys(), timeout=deadline, return_when=asyncio.ALL_COMPLETED)
+    for t in pending:
+        t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    out = [None] * len(coros)
+    for t in done:
+        try:
+            out[tasks[t]] = t.result()
+        except Exception:
+            out[tasks[t]] = None
+    return out
+
+
 async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, episode: Optional[int] = None,
                                    iran_hints: Optional[dict] = None,
                                    title: Optional[str] = None, year=None) -> List[dict]:
@@ -2209,7 +2236,7 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
                             for _u in _urls[:3]:
                                 async with AsyncSession() as s:
                                     r = await s.get(_u, impersonate=_BROWSER_IMPERSONATE,
-                                                    timeout=12, headers=headers)
+                                                    timeout=9, headers=headers)
                                 if r.status_code != 200:
                                     continue
                                 if "#EXT-X-STREAM-INF:" in r.text:
@@ -2267,7 +2294,7 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
                 for _u in _urls[:3]:
                     async with AsyncSession() as s:
                         r = await s.get(_u, impersonate=_BROWSER_IMPERSONATE,
-                                        timeout=15, headers=headers)
+                                        timeout=10, headers=headers)
                     if r.status_code != 200:
                         logger.warning("[IMDBPlay] probe %s: m3u8 HTTP %d (r%d)",
                                        entry["server"], r.status_code, round_no)
@@ -2315,15 +2342,27 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
             logger.warning("[IMDBPlay] probe %s failed (r%d): %s", server["name"], round_no, e)
             return None
 
-    # 🆕 پروب موازی ۲ رانده + هاست‌های vidsrcme (Castletv و...) همزمان
+    # 🆕 پروب موازی + 🆕 z41 — ددلاین کلی: منو منتظر «کندترین» زنجیره نمی‌ماند!
+    # اندازه‌گیری زنده (tt4154795): منوی سرد ۳۴s بود چون چند سرور مرده تا
+    # تایم‌اوت کامل پروب می‌شدند و بعد راند ۲ هم برای‌شان اجرا می‌شد.
+    # حالا: راند ۱ حداکثر _MENU_R1_DEADLINE ثانیه (هر سروری تمام نشده، حذف می‌شود)؛
+    # راند ۲ فقط وقتی کمتر از ۲ سرور سالم داریم (لیست خالی/فقر‌زدگی) و با ددلاین کوتاه‌تر.
+    _MENU_R1_DEADLINE = float(os.environ.get("IMDB_MENU_R1_DEADLINE", "18"))
+    _MENU_R2_DEADLINE = float(os.environ.get("IMDB_MENU_R2_DEADLINE", "10"))
+
     async def _servers_probe() -> list:
-        results = list(await asyncio.gather(*[_probe(s, 1) for s in _SERVERS]))
+        results = await _gather_deadline([_probe(s, 1) for s in _SERVERS],
+                                         _MENU_R1_DEADLINE)
+        healthy_n = sum(1 for r in results if r)
         failed = [s for s, r in zip(_SERVERS, results) if not r]
-        if failed:
+        # 🆕 z41 — راند ۲ فقط وقتی منو تقریباً خالی است؛ با لیست سالمِ کافی
+        # منتظر سرورهای مرده نمی‌مانیم (۳۴s → ~۱۴s در اندازه‌گیری زنده).
+        if failed and healthy_n < 2:
             logger.info("[IMDBPlay] probe round 2 for %d failed server(s): %s",
                         len(failed), [s["name"] for s in failed])
-            await asyncio.sleep(1.5)
-            retry_iter = iter(await asyncio.gather(*[_probe(s, 2) for s in failed]))
+            await asyncio.sleep(0.5)
+            retry_iter = iter(await _gather_deadline(
+                [_probe(s, 2) for s in failed], _MENU_R2_DEADLINE))
             for i, r in enumerate(results):
                 if not r:
                     results[i] = next(retry_iter)
@@ -2617,94 +2656,129 @@ async def _hls_segment_engine(
             _spawn(state["desired"] - state["alive"])
 
     async def _controller():
-        """hill-climbing روی concurrency: چند کاندیدا رو زنده می‌سنجه و بهترین رو قفل می‌کنه."""
+        """🆕 z41 — کنترلر v2: کاوش دوطرفه‌ی سریع + قفل + واچ‌داگ افت sustained.
+
+        چرا hill-climb صعودیِ z40 اشتباه بود؟ بنچمارک زنده‌ی z41 (دو CDN سالم 2Embed):
+            goodstream:       8→22 | 16→33 | 24→7.7 | 32→13 | 48→13 | 64→8   (MB/s)
+            brandpositioning: 8→15 | 16→62 | 24→31 | 32→19 | 48→7  | 64→4   (MB/s)
+        منحنی «غیرخطی» است و بعد از قله (concurrency~۱۶) سقوط شدید دارد؛
+        نردبان صعودی ۸تایی هر ۸ثانیه دقیقاً وارد ناحیه‌ی سقوط می‌شد
+        (لاگ کاربر: 2.3MB/s روی 🔀۲۴) و برای دانلودهای کوتاه هرگز به قفل
+        نمی‌رسید. الگوریتم جدید:
+          ۱) warmup یک baseline در نقطه‌ی شروع (۱۶)
+          ۲) دو کاندید (best×2 و best÷2) هرکدام ۲ پنجره سنجیده می‌شوند → بهترین
+          ۳) قفل + حلقه‌ی نظارت: ۳ پنجره‌ی متوالی زیر ۵۵٪ بهترین → یک کاوش
+             مجدد (حداکثر ۲ بار در دانلود) — برای CDNهایی که وسط دانلود
+             شروع به throttle می‌کنند.
+        """
         WIN = max(0.2, SEG_ADAPT_WINDOW)
         try:
-            # فاز warmup: دو پنجره با نقطه‌ی شروع
             prev = counters["bytes"]
-            base_mbps = 0.0
-            for _ in range(2):
-                await asyncio.sleep(WIN)
-                if state["abort"] or counters["done"] >= total:
-                    return
-                now = counters["bytes"]
-                base_mbps = (now - prev) / WIN / 1048576
-                prev = now
-                stats_out["mbps"] = base_mbps
-                stats_out["concurrency"] = state["desired"]
 
-            # اگه خیلی نزدیک پایانیم، دست نزن
-            if total - counters["done"] - counters["failed"] < 30:
-                return
-
-            # نردبان کاندیداها (فقط صعودی؛ سقف با env قابل بالابردنه)
-            # 🆕 z40 — گام ۸ و تا ۸ پله: CDNهای سریع تا conc~30-64 همچنان
-            # صعودی‌اند (بنچمارک زنده: brandpositioning 22MB/s@16 → 53MB/s@30)
-            ladder = [state["desired"]]
-            c = ladder[0]
-            while c + 8 <= SEG_CONCURRENCY_MAX and len(ladder) < 8:
-                c += 8
-                ladder.append(c)
-
-            best_c, best_m = ladder[0], base_mbps
-            for cand in ladder[1:]:
-                if state["abort"] or counters["done"] >= total:
-                    break
-                if total - counters["done"] - counters["failed"] < 30:
-                    break
-                state["desired"] = cand
-                _reconcile()
+            async def _measure(n_win: int) -> Optional[float]:
+                """میانگین throughput n پنجره‌ی آخر؛ None = ابطال/پایان."""
+                nonlocal prev
                 m = 0.0
-                for _ in range(2):
+                for _ in range(max(1, n_win)):
                     await asyncio.sleep(WIN)
-                    if state["abort"]:
-                        return
+                    if state["abort"] or counters["done"] >= total:
+                        return None
                     now = counters["bytes"]
                     m = (now - prev) / WIN / 1048576
                     prev = now
                     stats_out["mbps"] = m
-                    stats_out["concurrency"] = cand
-                if m > best_m * 1.05:  # حداقل ۵٪ بهبود واقعی
-                    best_c, best_m = cand, m
+                    stats_out["concurrency"] = state["desired"]
+                return m
 
-            # 🆕 اگه هیچ کاندیدای بالاتر بهتر نشد، پایین‌ترها رو هم امتحان کن
-            # (برای CDNهایی که سقف پایینی به‌ازای هر IP دارن)
-            if best_c == ladder[0]:
-                c = ladder[0]
-                while c - 8 >= SEG_CONCURRENCY_MIN:
-                    c -= 8
-                    if state["abort"] or counters["done"] >= total:
-                        break
-                    if total - counters["done"] - counters["failed"] < 30:
-                        break
-                    state["desired"] = c
+            def _remaining() -> int:
+                return total - counters["done"] - counters["failed"]
+
+            async def _explore(best_c: int, best_m: float,
+                               known: Optional[dict] = None):
+                """کاوش دوطرفه: اول یک نقطه‌ی پایین‌تر، بعد تا ۲ پله بالاتر.
+
+                هر پله فقط با ≥۱۰٪ بهبود واقعی (۲ پنجره) پذیرفته می‌شود؛
+                پله‌ی بالاترِ بازنده = توقف (ناحیه‌ی سقوط CDN را ورود نمی‌کنیم)
+                و پله‌ی برنده = ادامه به ×۲ بعدی (برای CDNهایی که واقعاً
+                با concurrency مقیاس می‌شوند).
+                known = نقاطی که قبلاً اندازه‌گیری شده‌اند (c → MB/s) تا
+                هیچ نقطه‌ای دو بار سنجیده نشود."""
+                known = known if isinstance(known, dict) else {}
+
+                async def _probe_cand(cand: int) -> Optional[float]:
+                    if cand in known:
+                        return known[cand]
+                    state["desired"] = cand
                     _reconcile()
-                    m = 0.0
-                    for _ in range(2):
-                        await asyncio.sleep(WIN)
-                        if state["abort"]:
-                            return
-                        now = counters["bytes"]
-                        m = (now - prev) / WIN / 1048576
-                        prev = now
-                        stats_out["mbps"] = m
-                        stats_out["concurrency"] = c
-                    if m > best_m * 1.05:
-                        best_c, best_m = c, m
+                    m = await _measure(2)
+                    if m is not None:
+                        known[cand] = m
+                    return m
+
+                dn = max(best_c // 2, SEG_CONCURRENCY_MIN)
+                if dn != best_c and not state["abort"] and _remaining() >= 30:
+                    m = await _probe_cand(dn)
+                    if m is None:
+                        state["desired"] = best_c
+                        _reconcile()
+                        stats_out["concurrency"] = best_c
+                        return best_c, best_m
+                    if m > best_m * 1.10:
+                        best_c, best_m = dn, m
+                c = best_c
+                for _ in range(2):
+                    if state["abort"] or _remaining() < 30:
+                        break
+                    up = min(c * 2, SEG_CONCURRENCY_MAX)
+                    if up == c:
+                        break
+                    m = await _probe_cand(up)
+                    if m is None:
+                        break
+                    if m > best_m * 1.10:
+                        best_c, best_m, c = up, m, up
                     else:
-                        break  # پایین‌تر هم بهتر نشد → کافیه
+                        break  # بازنده → ناحیه‌ی سقوط است؛ بالاتر نمی‌رویم
+                state["desired"] = best_c
+                _reconcile()
+                stats_out["concurrency"] = best_c
+                return best_c, best_m
 
-            state["desired"] = best_c
-            _reconcile()
-            stats_out["concurrency"] = best_c
-            logger.info("[SEG] adaptive concurrency settled at %d (%.1f MB/s)", best_c, best_m)
+            # فاز warmup: baseline دو پنجره با نقطه‌ی شروع
+            _start_c = max(1, min(SEGMENT_CONCURRENCY, SEG_CONCURRENCY_MAX))
+            _known = {_start_c: None}  # بعد از baseline پر می‌شود
+            base_mbps = await _measure(2)
+            _known[_start_c] = base_mbps
+            if base_mbps is None or _remaining() < 30:
+                return
+            best_c, best_m = await _explore(_start_c, base_mbps, _known)
+            logger.info("[SEG] adaptive concurrency settled at %d (%.1f MB/s)",
+                        best_c, best_m)
 
-            # تا پایان: فقط آمار به‌روز کن
+            # حلقه‌ی نظارت + واچ‌داگ افت sustained (حداکثر ۲ کاوش مجدد)
+            re_probes = 0
             while not state["abort"] and counters["done"] < total:
-                await asyncio.sleep(WIN)
-                now = counters["bytes"]
-                stats_out["mbps"] = (now - prev) / WIN / 1048576
-                prev = now
+                m = await _measure(1)
+                if m is None:
+                    break
+                if (m >= best_m * 0.55 or _remaining() < 30
+                        or re_probes >= 2 or best_m <= 0.05):
+                    continue
+                # مشکوک به افت (CDN شروع به throttle کرده)؛ با ۲ پنجره تأیید کن
+                deg = 0
+                for _ in range(2):
+                    m2 = await _measure(1)
+                    if m2 is None:
+                        return
+                    if m2 < best_m * 0.55:
+                        deg += 1
+                if deg == 2:
+                    re_probes += 1
+                    logger.info("[SEG] ⚠ throughput dropped to %.1f MB/s "
+                                "(best %.1f) — re-probing concurrency", m, best_m)
+                    best_c, best_m = await _explore(best_c, best_m)
+                    logger.info("[SEG] adaptive concurrency re-settled at %d "
+                                "(%.1f MB/s)", best_c, best_m)
         except asyncio.CancelledError:
             raise
 
