@@ -85,7 +85,7 @@ from searcher.imdb.vidsrc_extras import get_qualities, search_subtitles, downloa
 from searcher.imdb.imdbplay_downloader import get_all_server_qualities, SERVER_NAMES, download_with_quality  # 🆕 پروب موازی همه‌ی سرورها + دانلودر جدید (preferred_server/strict_quality)
 from searcher.imdb.subf2m_subtitle import list_persian_subtitles, download_persian_subtitle  # 🆕 آرشیو subf2m — لیست مچ دقیق قسمت + دانلود انتخابی کاربر
 from searcher.imdb.subtitlecat_subtitle import list_menu_subtitles, download_persian_subtitle as download_scat_persian  # 🆕 z19: آرشیو subtitlecat — ترجمه‌ی ماشینی on-demand
-BOT_BUILD = "z38"  # نشانگر نسخه — تو لاگ استارت باید z38 دیده بشه (🆕 z38: پیدا شدن فایل ~1650MB «720p» اونجرز 2018 — ریشه: (۱) لیبل کیفیت فقط از ارتفاع: 1280x536 (720p استاندارد اسکوپ) «480p» لیبل می‌خورد و 1920x804 (1080-class، ~3.9GB) «720p»! حالا width-aware: 1080p=عرض 1920، 720p=عرض 1280، 480p=عرض 854؛ (۲) provider «superstream» به resolver 2Embed اضافه شد — تنها provider با لیبل‌های واقعی 1080p/720p/480p و همان فایل 1658MB؛ (۳) منوی سرور برای ttهایی که TMDB find خالی می‌دهد (مثل tt4154795) حالا با جستجوی عنوانی TMDB کار می‌کند — دیگر «هیچ سروری این عنوان رو نداره» نمی‌بینی؛ (۴) انتخاب واریانت master هم width-aware شد)
+BOT_BUILD = "z40"  # نشانگر نسخه — تو لاگ استارت باید z40 دیده بشه (🆕 z40: سرعت — انتخاب سریع‌ترین CDN برای هر کیفیت با بنچمارک زنده (720p اونجرز: 1MB/s → تا ~50MB/s)، ارزیابی موازی سرورها به‌جای حلقه‌ی ترتیبی، کش منو/پروب/رزولوشن (TTL ۱۰ دقیقه)، providerهای 2Embed موازی، پروب سبک‌تر 512KB، سقف ۶۴ کانکشن موازی) (🆕 z38: پیدا شدن فایل ~1650MB «720p» اونجرز 2018 — ریشه: (۱) لیبل کیفیت فقط از ارتفاع: 1280x536 (720p استاندارد اسکوپ) «480p» لیبل می‌خورد و 1920x804 (1080-class، ~3.9GB) «720p»! حالا width-aware: 1080p=عرض 1920، 720p=عرض 1280، 480p=عرض 854؛ (۲) provider «superstream» به resolver 2Embed اضافه شد — تنها provider با لیبل‌های واقعی 1080p/720p/480p و همان فایل 1658MB؛ (۳) منوی سرور برای ttهایی که TMDB find خالی می‌دهد (مثل tt4154795) حالا با جستجوی عنوانی TMDB کار می‌کند — دیگر «هیچ سروری این عنوان رو نداره» نمی‌بینی؛ (۴) انتخاب واریانت master هم width-aware شد)
 
 # ═══ 🇮🇷 سوییچ فارسی‌سرچر (منابع ایرانی: FJ/tdmmo + Film2Movie + دوستی‌ها + فارسی‌لند) ═══
 # 🆕 z25 — چون پروب منابع ایرانی جواب سرچ رو کند می‌کرد، «کلاً» غیرفعال شدن.
@@ -15561,7 +15561,10 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
                 if last_progress[0]:
                     d, t = last_progress[0]
                     pct = d * 100 // t if t else 0
-                    srv_short = server_info.get("server", "") if server_info else ""
+                    # 🆕 z40 — سرور «واقعی» تحویل‌دهنده (نه صرفاً انتخاب کاربر):
+                    # download_with_quality ممکنه برای همان کیفیت از CDN سریع‌تری بگیرد
+                    srv_short = (seg_stats.get("served_by")
+                                 or (server_info.get("server", "") if server_info else ""))
                     srv_text = f" [{srv_short}]" if srv_short else ""
                     # 🆕 z17: فاز موتور سگمنت (تلاش مجدد سگمنت‌های باقی‌مانده)
                     _phase = seg_stats.get("phase") or ""

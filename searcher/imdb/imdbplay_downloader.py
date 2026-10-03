@@ -38,6 +38,7 @@ imdbplay_downloader.py
 
 import asyncio
 import base64
+import copy as _copy
 import json
 import logging
 import os
@@ -70,10 +71,13 @@ _BROWSER_IMPERSONATE = "chrome"
 #   sem=3 → 58MB/s | sem=16 → 105MB/s | sem=24+ → افت شدید (CDN به‌ازای هر IP محدود می‌کنه)
 # پس: worker-pool داینامیک + hill-climbing روی throughput واقعی.
 # نقطه‌ی بهینه برای هر CDN متفاوته و خودِ موتور پیداش می‌کنه.
-SEGMENT_CONCURRENCY = int(os.environ.get("IMDB_SEG_CONCURRENCY", "12"))   # نقطه‌ی شروع
-SESSION_MAX_CLIENTS = int(os.environ.get("IMDB_MAX_CLIENTS", "48"))       # حداکثر curl handle همزمان
+# 🆕 z40 — بنچمارک زنده‌ی دوباره: CDNهای سریع (brandpositioning/sprintspeedlight) تا
+# ~53MB/s در conc=30 بالا می‌رن و سقف 40 کانکشن قدیمی گلوگاه بود؛
+# CDNهای کند (tinyloud) رو کنترلر تطبیقی خودش پایین میاره. سقف‌ها بالاتر، تصمیم با کنترلر.
+SEGMENT_CONCURRENCY = int(os.environ.get("IMDB_SEG_CONCURRENCY", "16"))   # نقطه‌ی شروع
+SESSION_MAX_CLIENTS = int(os.environ.get("IMDB_MAX_CLIENTS", "96"))       # حداکثر curl handle همزمان
 SEG_CONCURRENCY_MIN = int(os.environ.get("IMDB_SEG_MIN", "4"))            # کف concurrency
-SEG_CONCURRENCY_MAX = int(os.environ.get("IMDB_SEG_MAX", "40"))           # سقف concurrency
+SEG_CONCURRENCY_MAX = int(os.environ.get("IMDB_SEG_MAX", "64"))           # سقف concurrency
 SEG_ADAPT_ENABLED   = os.environ.get("IMDB_SEG_ADAPT", "1") != "0"        # خاموش/روشن کردن تطبیق
 SEG_ADAPT_WINDOW    = float(os.environ.get("IMDB_SEG_WINDOW", "4"))       # ثانیه بین اندازه‌گیری‌ها
 SEG_TIMEOUT         = int(os.environ.get("IMDB_SEG_TIMEOUT", "45"))       # تایم‌اوت هر سگمنت
@@ -137,6 +141,41 @@ _VIDSRCME_CACHE = {}
 # بعد از انتخاب کاربر مستقیم از کش برداره (همون الگوی _VIDSRCME_CACHE)
 _IRAN_CACHE = {}
 _IRAN_CACHE_MAX = 48
+
+
+# ═══════════════════════════════════════════════════════════
+#   🆕 z40 — کش‌های سرعت: منوی کیفیت و شروع دانلود نباید همان زنجیره‌ی
+#   سنگین (API + decrypt + پروب) را چندبار از نو اجرا کنند.
+#   - _PROBE_CACHE:   نتیجه‌ی _probe_stream_health per (url,type,label,require_match)
+#   - _RESOLVE_CACHE: خروجی _get_stream_for_server per (server_id, vm_key)
+#   - _MENU_CACHE:    خروجی کامل get_all_server_qualities per (imdb,s,e,title,year,ir)
+#   همه با TTL و deepcopy — چون کالرها روی streamها mutation انجام می‌دهند.
+# ═══════════════════════════════════════════════════════════
+
+_CACHE_TTL_OK = 600.0      # نتیجه‌ی سالم: ۱۰ دقیقه
+_CACHE_TTL_FAIL = 90.0     # نتیجه‌ی ناموفق: ۹۰ ثانیه (تا زنجیره‌ی مرده مدام چک نشه)
+
+_PROBE_CACHE: Dict[tuple, tuple] = {}    # key → (ts, (ok, det))
+_RESOLVE_CACHE: Dict[tuple, tuple] = {}  # key → (ts, stream-or-None)
+_MENU_CACHE: Dict[tuple, tuple] = {}     # key → (ts, entries-list)
+
+
+def _cache_get(store: dict, key, ok: bool = True,
+               ttl_ok: float = _CACHE_TTL_OK, ttl_fail: float = _CACHE_TTL_FAIL):
+    """هیتر کش؛ ok تعیین می‌کند نتیجه‌ی ناموفق چقدر بماند."""
+    hit = store.get(key)
+    if not hit:
+        return None
+    ts, val = hit
+    ttl = ttl_ok if ok else ttl_fail
+    if (time.monotonic() - ts) > ttl:
+        store.pop(key, None)
+        return None
+    return val
+
+
+def _cache_put(store: dict, key, val) -> None:
+    store[key] = (time.monotonic(), _copy.deepcopy(val) if val is not None else None)
 
 
 def _iran_cache_put(key: str, entries: list) -> None:
@@ -798,131 +837,181 @@ def _vidnest_decrypt(data_str: str) -> str:
     return base64.b64decode(s).decode("utf-8", errors="replace")
 
 
-async def _2embed_get_stream(tmdb_id: str, imdb_id: str, season: Optional[int], episode: Optional[int]) -> Optional[dict]:
-    """استخراج stream از 2embed.cc (sub-source: vnest/vidlink)."""
-    is_tv = bool(season and episode)
+async def _2embed_fetch_provider(provider: str, tmdb_id: str, is_tv: bool,
+                                 season: Optional[int], episode: Optional[int]):
+    """🆕 z40 — فاز ۱: API + decrypt + ساخت لیست استریم‌ها برای یک provider.
+
+    Returns:
+        (streams, captions) یا None — streams آماده‌ی probe؛ captions ویژه‌ی vidlink.
+    """
     media_type = "tv" if is_tv else "movie"
+    if is_tv:
+        api_url = f"https://new.vidnest.fun/{provider}/{media_type}/{tmdb_id}/{season}/{episode}"
+    else:
+        api_url = f"https://new.vidnest.fun/{provider}/{media_type}/{tmdb_id}"
+
+    async with AsyncSession() as s:
+        # Use impersonate="chrome" to bypass Cloudflare and rate limits
+        r = await s.get(api_url, impersonate=_BROWSER_IMPERSONATE, timeout=15,
+                        headers={"User-Agent": _USER_AGENT,
+                                 "Referer": "https://cineby.hair/",
+                                 "Origin": "https://cineby.hair",
+                                 "Accept": "application/json"})
+    if r.status_code != 200:
+        return None
+    obj = r.json()
+    if not obj.get("encrypted"):
+        return None
+
+    decrypted = json.loads(_vidnest_decrypt(obj["data"]))
+
+    # Parse based on response structure
+    streams = []
+    captions = None
+    if "data" in decrypted and "stream" in decrypted.get("data", {}):
+        stream = decrypted["data"]["stream"]
+        for quality, info in stream.get("qualities", {}).items():
+            _lbl = f"{quality}p" if str(quality).isdigit() else str(quality)
+            streams.append({
+                # 🆕 z38 — label همیشه ست شود (دانلودر روی q["label"] چک می‌کند)
+                "quality": _lbl,
+                "label": _lbl,
+                "url": info["url"],
+                "type": info.get("type", "mp4"),
+                "headers": decrypted.get("headers", {}),
+            })
+        # vidlink provider has built-in captions
+        if stream.get("captions"):
+            captions = stream.get("captions")
+    elif "url" in decrypted:
+        streams.append({
+            "quality": "auto",
+            "url": decrypted["url"],
+            "type": "hls",
+            "headers": decrypted.get("headers", {}),
+        })
+    elif "streams" in decrypted:
+        # 🆕 z38 — superstream این ساختار را می‌دهد: هر آیتم
+        # quality=«1080p/720p/480p» دارد؛ قبلاً فقط «language»
+        # («Original») خوانده می‌شد و هر سه استریم لیبل یکسان می‌گرفتند
+        # → انتخاب 720p غیرممکن بود.
+        for s_item in decrypted["streams"]:
+            _lbl = str(s_item.get("quality") or s_item.get("language") or "auto").strip()
+            streams.append({
+                "quality": _lbl,
+                "label": _lbl,
+                "url": s_item["url"],
+                "type": s_item.get("type", "hls"),
+                "headers": {**(decrypted.get("headers") or {}),
+                            **(s_item.get("headers") or {})},
+            })
+    elif "all_urls" in decrypted:
+        for i, url in enumerate(decrypted["all_urls"]):
+            streams.append({
+                "quality": f"mirror_{i+1}",
+                "url": url,
+                "type": "hls",
+                "headers": {},
+            })
+    elif "sources" in decrypted:
+        for s_item in decrypted["sources"]:
+            streams.append({
+                "quality": s_item.get("quality", "auto"),
+                "url": s_item["url"],
+                "type": "hls" if "hls" in s_item.get("type", "") else s_item.get("type", "hls"),
+                "headers": {},
+            })
+    if not streams:
+        return None
+    return streams, captions
+
+
+async def _2embed_get_stream_multi(tmdb_id: str, imdb_id: str, season: Optional[int],
+                                   episode: Optional[int]) -> List[dict]:
+    """🆕 z40 — همه‌ی providerهای سالم 2Embed (به ترتیب اولویت).
+
+    چرا لیست؟ providerها روی CDNهای متفاوت با سرعت‌های ۱ تا ۵۰ برابری‌اند
+    (tinyloud ~1MB/s در برابر brandpositioning ~53MB/s برای همان 720p).
+    دانلودرِ کیفیت‌محور بین همه‌شان بنچمارک می‌زند و سریع‌ترین را برمی‌دارد.
+    """
+    is_tv = bool(season and episode)
 
     # 🆕 z38 — Try multiple providers؛ superstream اول: تنها provider با
     # لیبل‌های کیفیت واقعی (1080p/720p/480p) و همان فایل ~1650MB «720p» استاندارد
     # (1280x536 اسکوپ) — قبلاً اصلاً تو لیست نبود و کاربر هرگز به آن نمی‌رسید.
-    for provider in ["superstream", "vidlink", "videasy", "hollymoviehd",
-                     "nextgencloudfabric", "klikxxi"]:
+    providers = ["superstream", "vidlink", "videasy", "hollymoviehd",
+                 "nextgencloudfabric", "klikxxi"]
+
+    async def _safe_fetch(p: str):
         try:
-            if is_tv:
-                api_url = f"https://new.vidnest.fun/{provider}/{media_type}/{tmdb_id}/{season}/{episode}"
-            else:
-                api_url = f"https://new.vidnest.fun/{provider}/{media_type}/{tmdb_id}"
-
-            async with AsyncSession() as s:
-                # Use impersonate="chrome" to bypass Cloudflare and rate limits
-                r = await s.get(api_url, impersonate=_BROWSER_IMPERSONATE, timeout=15,
-                                headers={"User-Agent": _USER_AGENT,
-                                         "Referer": "https://cineby.hair/",
-                                         "Origin": "https://cineby.hair",
-                                         "Accept": "application/json"})
-                if r.status_code != 200:
-                    continue
-                obj = r.json()
-                if not obj.get("encrypted"):
-                    continue
-
-                decrypted = json.loads(_vidnest_decrypt(obj["data"]))
-
-                # Parse based on response structure
-                streams = []
-                if "data" in decrypted and "stream" in decrypted.get("data", {}):
-                    stream = decrypted["data"]["stream"]
-                    for quality, info in stream.get("qualities", {}).items():
-                        _lbl = f"{quality}p" if str(quality).isdigit() else str(quality)
-                        streams.append({
-                            # 🆕 z38 — label همیشه ست شود (دانلودر روی q["label"] چک می‌کند)
-                            "quality": _lbl,
-                            "label": _lbl,
-                            "url": info["url"],
-                            "type": info.get("type", "mp4"),
-                            "headers": decrypted.get("headers", {}),
-                        })
-                    # vidlink provider has built-in captions
-                    if stream.get("captions"):
-                        result = {
-                            "url": streams[0]["url"] if streams else None,
-                            "headers": streams[0].get("headers", {}) if streams else {},
-                            "server": "2Embed",
-                            "type": streams[0].get("type", "mp4") if streams else "mp4",
-                            "qualities": streams,
-                            "subtitles": stream.get("captions", []),
-                        }
-                        # 🆕 z37 — provider سالم: پروب قبل از بازگشت
-                        _pok, _pdet = await _probe_stream_health(result)
-                        if _pok:
-                            logger.info("2Embed/%s %s -> HEALTHY (%s)", provider, tmdb_id, _pdet)
-                            return result
-                        logger.info("2Embed/%s %s -> probe FAIL (%s) — provider بعدی",
-                                    provider, tmdb_id, _pdet)
-                        continue
-                elif "url" in decrypted:
-                    streams.append({
-                        "quality": "auto",
-                        "url": decrypted["url"],
-                        "type": "hls",
-                        "headers": decrypted.get("headers", {}),
-                    })
-                elif "streams" in decrypted:
-                    # 🆕 z38 — superstream این ساختار را می‌دهد: هر آیتم
-                    # quality=«1080p/720p/480p» دارد؛ قبلاً فقط «language»
-                    # («Original») خوانده می‌شد و هر سه استریم لیبل یکسان می‌گرفتند
-                    # → انتخاب 720p غیرممکن بود.
-                    for s_item in decrypted["streams"]:
-                        _lbl = str(s_item.get("quality") or s_item.get("language") or "auto").strip()
-                        streams.append({
-                            "quality": _lbl,
-                            "label": _lbl,
-                            "url": s_item["url"],
-                            "type": s_item.get("type", "hls"),
-                            "headers": {**(decrypted.get("headers") or {}),
-                                        **(s_item.get("headers") or {})},
-                        })
-                elif "all_urls" in decrypted:
-                    for i, url in enumerate(decrypted["all_urls"]):
-                        streams.append({
-                            "quality": f"mirror_{i+1}",
-                            "url": url,
-                            "type": "hls",
-                            "headers": {},
-                        })
-                elif "sources" in decrypted:
-                    for s_item in decrypted["sources"]:
-                        streams.append({
-                            "quality": s_item.get("quality", "auto"),
-                            "url": s_item["url"],
-                            "type": "hls" if "hls" in s_item.get("type", "") else s_item.get("type", "hls"),
-                            "headers": {},
-                        })
-
-                if streams:
-                    logger.info("2Embed/%s %s -> %s", provider, tmdb_id, streams[0]["url"][:80])
-                    result = {
-                        "url": streams[0]["url"],
-                        "headers": streams[0].get("headers", {}),
-                        "server": "2Embed",
-                        "type": streams[0].get("type", "mp4"),
-                        "qualities": streams,
-                    }
-                    # 🆕 z37 — پروب سلامت هر provider؛ زنجیره‌ی «پلی‌لیست سالم ولی
-                    # سگمنت 403» (مثل videasy/streamvaultsrc) اینجا رد می‌شه و
-                    # provider بعدی (hollymoviehd/nextgencloudfabric) امتحان می‌شه.
-                    _pok, _pdet = await _probe_stream_health(result)
-                    if _pok:
-                        logger.info("2Embed/%s %s -> HEALTHY (%s)", provider, tmdb_id, _pdet)
-                        return result
-                    logger.info("2Embed/%s %s -> probe FAIL (%s) — provider بعدی",
-                                provider, tmdb_id, _pdet)
-                    continue
+            return p, await _2embed_fetch_provider(p, tmdb_id, is_tv, season, episode)
         except Exception as e:
-            logger.debug("2Embed provider %s failed: %s", provider, e)
-            continue
-    return None
+            logger.debug("2Embed provider %s failed: %s", p, e)
+            return p, None
+
+    # فاز ۱ — موازی (APIهای vidnest فشاری تحمل می‌کنند؛ ۶ درخواست سبک است)
+    fetched = await asyncio.gather(*[_safe_fetch(p) for p in providers])
+    by_provider = {p: res for p, res in fetched if res}
+
+    # 🆕 z40 — فاز ۲: پروب «موازی» همه‌ی providerها (هرکدام با ددلاین ۳۰s)؛
+    # قبلاً پروب‌ها ترتیبی بودند و providerهای مرده (پروب تا ۳۰s) مجموعاً
+    # >۶۰s تاخیر می‌ساختند.
+    async def _probe_provider(provider: str):
+        res = by_provider.get(provider)
+        if not res:
+            return provider, None, "no streams"
+        streams, captions = res
+        try:
+            if captions is not None:
+                result = {
+                    "url": streams[0]["url"] if streams else None,
+                    "headers": streams[0].get("headers", {}) if streams else {},
+                    "server": "2Embed",
+                    "type": streams[0].get("type", "mp4") if streams else "mp4",
+                    "qualities": streams,
+                    "subtitles": captions,
+                }
+            else:
+                logger.info("2Embed/%s %s -> %s", provider, tmdb_id, streams[0]["url"][:80])
+                result = {
+                    "url": streams[0]["url"],
+                    "headers": streams[0].get("headers", {}),
+                    "server": "2Embed",
+                    "type": streams[0].get("type", "mp4"),
+                    "qualities": streams,
+                }
+            # 🆕 z37 — پروب سلامت؛ زنجیره‌ی «پلی‌لیست سالم ولی سگمنت 403»
+            # (مثل videasy/streamvaultsrc) اینجا رد می‌شود.
+            try:
+                _pok, _pdet = await asyncio.wait_for(
+                    _probe_stream_health(result), timeout=30.0)
+            except asyncio.TimeoutError:
+                _pok, _pdet = False, "probe deadline 30s"
+            return provider, (result if _pok else None), _pdet
+        except Exception as e:
+            return provider, None, f"{type(e).__name__}: {str(e)[:60]}"
+
+    probed = await asyncio.gather(*[_probe_provider(p) for p in providers])
+    probe_by_provider = {p: (r, det) for p, r, det in probed}
+    healthy = []
+    for provider in providers:  # اولویت: superstream اول و…
+        result, det = probe_by_provider.get(provider, (None, "missing"))
+        if result is not None:
+            logger.info("2Embed/%s %s -> HEALTHY (%s)", provider, tmdb_id, det)
+            healthy.append(result)
+        elif det and det != "no streams":
+            logger.info("2Embed/%s %s -> probe FAIL (%s)", provider, tmdb_id, det)
+    return healthy
+
+
+async def _2embed_get_stream(tmdb_id: str, imdb_id: str, season: Optional[int], episode: Optional[int]) -> Optional[dict]:
+    """استخراج stream از 2embed.cc — اولین provider سالم (برای منو/Auto).
+
+    🆕 z40 — فاز ۱ (API/decrypt) و فاز ۲ (پروب) هر دو موازی؛ برای کیفیت‌محور
+    نسخه‌ی لیستی _2embed_get_stream_multi استفاده شود.
+    """
+    healthy = await _2embed_get_stream_multi(tmdb_id, imdb_id, season, episode)
+    return healthy[0] if healthy else None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1072,6 +1161,22 @@ async def _garageband_get_stream(imdb_id: str, season: Optional[int], episode: O
 
 
 async def _get_stream_for_server(server: dict, tmdb_id: str, imdb_id: str, season: Optional[int], episode: Optional[int]) -> Optional[dict]:
+    """🆕 z40 — wrapper کش‌دار (TTL ۱۰ دقیقه؛ deepcopy در ورود/خروج تا mutation کالرها
+    کش رو مسموم نکنه). منو همه‌ی سرورها رو رزولو می‌کنه؛ شروع دانلود بعدش فوریه."""
+    sid = (server or {}).get("id", "?")
+    key = (sid, imdb_id, int(season or 0), int(episode or 0), str(tmdb_id))
+    hit = _RESOLVE_CACHE.get(key)
+    if hit:
+        ts, val = hit
+        if (time.monotonic() - ts) <= _CACHE_TTL_OK:
+            return _copy.deepcopy(val) if val else val
+        _RESOLVE_CACHE.pop(key, None)
+    stream = await _get_stream_for_server_nocache(server, tmdb_id, imdb_id, season, episode)
+    _RESOLVE_CACHE[key] = (time.monotonic(), _copy.deepcopy(stream) if stream else None)
+    return stream
+
+
+async def _get_stream_for_server_nocache(server: dict, tmdb_id: str, imdb_id: str, season: Optional[int], episode: Optional[int]) -> Optional[dict]:
     """گرفتن stream info از یک سرور خاص."""
     sid = server["id"]
     if sid == "ir":  # 🆕 z22 منابع ایرانی (FJ 🇮🇷 / Film2Movie / ...) — از کشِ پروب
@@ -1317,7 +1422,9 @@ class _SourceBrokenError(Exception):
 #   پروب = fetch واقعی یک سگمنت؛ اگه سالم نبود، استریم قبل از هر تعهدی رد می‌شه.
 # ═══════════════════════════════════════════════════════════
 
-_PROBE_MAX_BYTES = 1_572_864  # حداکثر ~1.5MB برای سگمنت پروب
+# 🆕 z40 — 512KB کافیه: ffprobe رزولوشن رو از بسته‌های اولیه‌ی TS (SPS/PPS) می‌خونه؛
+# پروب 1.5MB روی CDN کند (~120KB/s) نزدیک ۱۳ ثانیه طول می‌کشید و منوی کیفیت/شروع دانلود رو کند می‌کرد.
+_PROBE_MAX_BYTES = 524_288    # حداکثر ~512KB برای سگمنت پروب
 _PROBE_MIN_BYTES = 65_536     # کمتر از این = سگمنت «عملاً خالی»
 
 
@@ -1331,6 +1438,30 @@ def _label_height(label: str) -> int:
 
 async def _probe_stream_health(stream: dict, want_label: str = "",
                                require_match: bool = False) -> Tuple[bool, str]:
+    """🆕 z40 — wrapper کش‌دار پروب سلامت.
+
+    منو و دانلودر هر دو برای یک URL/کیفیت یکسان پروب می‌زنند — کش یعنی:
+    منو پروب می‌زند، شروع دانلود فوری است (TTL سالم ۱۰ دقیقه، شکست ۹۰ ثانیه).
+    """
+    url = (stream or {}).get("url") or ""
+    stype = (stream or {}).get("type", "hls")
+    key = (url, stype, (want_label or "").lower(), bool(require_match))
+    hit = _PROBE_CACHE.get(key)
+    if hit:
+        ts, val = hit
+        ttl = _CACHE_TTL_OK if val[0] else _CACHE_TTL_FAIL
+        if (time.monotonic() - ts) <= ttl:
+            ok, det = val
+            logger.debug("[z40] probe cache HIT (%s): %s", ok, det[:60])
+            return ok, det
+        _PROBE_CACHE.pop(key, None)
+    ok, det = await _probe_stream_health_uncached(stream, want_label, require_match)
+    _cache_put(_PROBE_CACHE, key, (ok, det))
+    return ok, det
+
+
+async def _probe_stream_health_uncached(stream: dict, want_label: str = "",
+                                        require_match: bool = False) -> Tuple[bool, str]:
     """پروب سلامت استریم: پلی‌لیست → (واریانت) → دانلود واقعی یک سگمنت.
 
     Args:
@@ -1994,6 +2125,14 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
     if not imdb_id.startswith("tt"):
         imdb_id = f"tt{imdb_id}"
 
+    # 🆕 z40 — کش کامل منو: باز کردن دوباره‌ی منوی کیفیت در ۱۰ دقیقه = آنی
+    _mkey = (imdb_id, int(season or 0), int(episode or 0),
+             str(title or ""), str(year or ""), bool(iran_hints))
+    _mhit = _MENU_CACHE.get(_mkey)
+    if _mhit and (time.monotonic() - _mhit[0]) <= _CACHE_TTL_OK:
+        logger.info("[z40] menu cache HIT for %s (%d entries)", imdb_id, len(_mhit[1]))
+        return _copy.deepcopy(_mhit[1])
+
     tmdb_id = await _get_tmdb_id(imdb_id, title=title, year=year,
                                  is_tv=bool(season and episode))
     if not tmdb_id:
@@ -2050,6 +2189,52 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
                         "resolution": q.get("resolution", ""),
                     })
                 if entry["qualities"]:
+                    # 🆕 z40 — لیبل‌های API اصلاً کیفیت نیستند (مثل LS-25/GS-25
+                    # که اسم mirror هستند) → master playlist را مستقیم امتحان
+                    # کن تا منو لیبل واقعی 360p/720p/1080p ببیند.
+                    _std = re.compile(r"^(360p|480p|540p|720p|1080p|1440p|2160p|4k|auto)$",
+                                      re.IGNORECASE)
+                    _has_std = any(_std.match((q.get("label") or "").strip())
+                                   for q in entry["qualities"])
+                    if not _has_std and entry["type"] == "hls":
+                        try:
+                            headers = {"User-Agent": _USER_AGENT}
+                            headers.update(entry["headers"])
+                            _urls = [entry["url"]]
+                            for _q in entry["qualities"][:4]:
+                                _qu = _q.get("url") or ""
+                                if _qu and _qu not in _urls:
+                                    _urls.append(_qu)
+                            _media_url = None
+                            for _u in _urls[:3]:
+                                async with AsyncSession() as s:
+                                    r = await s.get(_u, impersonate=_BROWSER_IMPERSONATE,
+                                                    timeout=12, headers=headers)
+                                if r.status_code != 200:
+                                    continue
+                                if "#EXT-X-STREAM-INF:" in r.text:
+                                    variants = _parse_master_m3u8(r.text)
+                                    variants.sort(key=lambda v: -v[1])
+                                    if variants:
+                                        entry["qualities"] = [{
+                                            "label": _resolution_to_label(res, bw),
+                                            "url": _make_absolute(_u, vu),
+                                            "bandwidth": bw,
+                                            "resolution": res,
+                                        } for vu, bw, res in variants]
+                                        entry["url"] = _u
+                                        logger.info("[z40] probe %s: لیبل‌های API غیرکیفیتی "
+                                                    "بودند → از master: %s",
+                                                    entry["server"],
+                                                    [q["label"] for q in entry["qualities"]])
+                                        return entry
+                                elif _media_url is None:
+                                    _media_url = _u
+                            if _media_url:
+                                entry["url"] = _media_url
+                        except Exception as _pe:
+                            logger.debug("[z40] probe master-fallback %s: %s",
+                                         entry["server"], _pe)
                     return entry
                 # لیست خالی بود → Auto (لینک stream معتبره)
                 entry["qualities"].append({"label": "Auto", "url": entry["url"],
@@ -2067,38 +2252,55 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
                                            "bandwidth": 0, "resolution": ""})
                 return entry
             # ۳) m3u8 رو بگیر و پارس کن
+            # 🆕 z40 — اگه استریم اول master نبود (مثل LS-25)، استریم‌های دیگر
+            # همان سرور (تا ۳ URL) هم برای master بررسی می‌شوند تا منو لیبل
+            # واقعی 360p/720p/1080p ببیند، نه «Auto» بی‌کیفیت.
             try:
                 headers = {"User-Agent": _USER_AGENT}
                 headers.update(entry["headers"])
-                async with AsyncSession() as s:
-                    r = await s.get(entry["url"], impersonate=_BROWSER_IMPERSONATE,
-                                    timeout=15, headers=headers)
-                if r.status_code == 200:
+                _urls = [entry["url"]]
+                for _q in (stream.get("qualities") or [])[:4]:
+                    _qu = _q.get("url") or ""
+                    if _qu and _qu not in _urls:
+                        _urls.append(_qu)
+                _media_url = None  # اولین media playlist سالم (برای Auto)
+                for _u in _urls[:3]:
+                    async with AsyncSession() as s:
+                        r = await s.get(_u, impersonate=_BROWSER_IMPERSONATE,
+                                        timeout=15, headers=headers)
+                    if r.status_code != 200:
+                        logger.warning("[IMDBPlay] probe %s: m3u8 HTTP %d (r%d)",
+                                       entry["server"], r.status_code, round_no)
+                        continue
                     text = r.text
                     if "#EXT-X-STREAM-INF:" in text:
                         variants = _parse_master_m3u8(text)
                         variants.sort(key=lambda v: -v[1])
-                        for u, bw, res in variants:
+                        for vu, bw, res in variants:
                             entry["qualities"].append({
                                 "label": _resolution_to_label(res, bw),
-                                "url": _make_absolute(entry["url"], u),
+                                "url": _make_absolute(_u, vu),
                                 "bandwidth": bw,
                                 "resolution": res,
                             })
-                    else:
-                        label = "Auto"
-                        m = re.search(r'/(1080p|720p|480p|360p|4k|2160p)/', entry["url"], re.IGNORECASE)
-                        if m:
-                            label = m.group(1).lower()
-                            if label in ("4k", "2160p"):
-                                label = "4K"
-                        entry["qualities"].append({
-                            "label": label, "url": entry["url"],
-                            "bandwidth": 0, "resolution": "",
-                        })
-                else:
-                    logger.warning("[IMDBPlay] probe %s: m3u8 HTTP %d (r%d)",
-                                   entry["server"], r.status_code, round_no)
+                        entry["url"] = _u  # master واقعی — دانلودر هم از همین بگوید
+                        break
+                    if _media_url is None:
+                        _media_url = _u
+                if not entry["qualities"]:
+                    # هیچ masterای پیدا نشد → Auto روی اولین media playlist سالم
+                    _u = _media_url or entry["url"]
+                    label = "Auto"
+                    m = re.search(r'/(1080p|720p|480p|360p|4k|2160p)/', _u, re.IGNORECASE)
+                    if m:
+                        label = m.group(1).lower()
+                        if label in ("4k", "2160p"):
+                            label = "4K"
+                    entry["qualities"].append({
+                        "label": label, "url": _u,
+                        "bandwidth": 0, "resolution": "",
+                    })
+                    entry["url"] = _u
             except Exception as pf:
                 logger.warning("[IMDBPlay] probe %s: m3u8 fetch failed (r%d): %s",
                                entry["server"], round_no, pf)
@@ -2138,6 +2340,9 @@ async def get_all_server_qualities(imdb_id: str, season: Optional[int] = None, e
     logger.info("[IMDBPlay] get_all_server_qualities %s → %d server(s): %s",
                 imdb_id, len(entries),
                 [(e["server"], [q["label"] for q in e["qualities"]]) for e in entries])
+    # 🆕 z40 — ذخیره‌ی کامل منو در کش (فقط وقتی چیزی پیدا شده)
+    if entries:
+        _MENU_CACHE[_mkey] = (time.monotonic(), _copy.deepcopy(entries))
     return entries
 
 
@@ -2433,10 +2638,12 @@ async def _hls_segment_engine(
                 return
 
             # نردبان کاندیداها (فقط صعودی؛ سقف با env قابل بالابردنه)
+            # 🆕 z40 — گام ۸ و تا ۸ پله: CDNهای سریع تا conc~30-64 همچنان
+            # صعودی‌اند (بنچمارک زنده: brandpositioning 22MB/s@16 → 53MB/s@30)
             ladder = [state["desired"]]
             c = ladder[0]
-            while c + 6 <= SEG_CONCURRENCY_MAX and len(ladder) < 5:
-                c += 6
+            while c + 8 <= SEG_CONCURRENCY_MAX and len(ladder) < 8:
+                c += 8
                 ladder.append(c)
 
             best_c, best_m = ladder[0], base_mbps
@@ -2464,8 +2671,8 @@ async def _hls_segment_engine(
             # (برای CDNهایی که سقف پایینی به‌ازای هر IP دارن)
             if best_c == ladder[0]:
                 c = ladder[0]
-                while c - 6 >= SEG_CONCURRENCY_MIN:
-                    c -= 6
+                while c - 8 >= SEG_CONCURRENCY_MIN:
+                    c -= 8
                     if state["abort"] or counters["done"] >= total:
                         break
                     if total - counters["done"] - counters["failed"] < 30:
@@ -2673,6 +2880,244 @@ async def _download_direct_entry(entry: dict, out_dir: str,
         return None
 
 
+async def _quick_speed_bench(stream: dict, cap_s: float = 4.5, nseg: int = 3) -> float:
+    """🆕 z40 — بنچمارک کوتاه سرعت واقعی CDN برای یک کاندید (≤ cap_s ثانیه).
+
+    چرا؟ بنچمارک زنده‌ی اونجرز 2018/720p: همان کلاس فایل روی tinyloud ~1MB/s و روی
+    brandpositioning ~53MB/s! انتخاب «اولین سرورِ هم‌کیفیت» یعنی قفل شدن روی CDN کند.
+    HLS: پلی‌لیست variant → دانلود موازی nseg سگمنت. MP4: دو تکه‌ی Range.
+    Returns: MB/s (0.0 = شکست اندازه‌گیری).
+    """
+    url = (stream or {}).get("url") or ""
+    if not url:
+        return 0.0
+    headers = {"User-Agent": _USER_AGENT}
+    headers.update((stream or {}).get("headers") or {})
+    t0 = time.monotonic()
+    total = 0
+
+    async def _pull(u: str, extra_headers: Optional[dict] = None):
+        nonlocal total
+        try:
+            async with AsyncSession() as s:
+                w = await s.get(u, impersonate=_BROWSER_IMPERSONATE,
+                                timeout=cap_s + 3, headers=extra_headers or headers,
+                                stream=True)
+                if w.status_code not in (200, 206):
+                    return
+                async for ch in w.aiter_content(65536):
+                    total += len(ch)
+                try:
+                    await w.aclose()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    async def _capped(u: str, extra_headers: Optional[dict] = None):
+        try:
+            await asyncio.wait_for(_pull(u, extra_headers), timeout=cap_s)
+        except Exception:
+            pass
+
+    try:
+        if (stream or {}).get("type", "hls") == "hls":
+            async with AsyncSession() as s:
+                r = await s.get(url, impersonate=_BROWSER_IMPERSONATE, timeout=10,
+                                headers=headers)
+            if r.status_code != 200:
+                return 0.0
+            txt, base = r.text, url
+            if "#EXT-X-STREAM-INF" in txt:
+                vurl = _pick_variant_url(txt, url, 720)
+                if not vurl:
+                    return 0.0
+                async with AsyncSession() as s:
+                    r2 = await s.get(vurl, impersonate=_BROWSER_IMPERSONATE, timeout=10,
+                                     headers=headers)
+                if r2.status_code != 200:
+                    return 0.0
+                txt, base = r2.text, vurl
+            segs, _init = _parse_variant_m3u8(txt)
+            if not segs:
+                return 0.0
+            picks = [_make_absolute(base, segs[min(4 + i, len(segs) - 1)][0])
+                     for i in range(max(1, nseg))]
+            await asyncio.gather(*[_capped(u) for u in picks])
+        else:
+            # MP4/MKV مستقیم — دو تکه‌ی دور از هم (تا کش/لبه فریب ندهد)
+            await asyncio.gather(*[
+                _capped(url, {**headers, "Range": f"bytes={off}-{off + 1_048_575}"})
+                for off in (0, 4_194_304)])
+    except Exception:
+        pass
+    dt = time.monotonic() - t0
+    if dt <= 0.2:
+        return 0.0
+    return total / dt / 1048576
+
+
+async def _resolve_candidate_for_quality(candidate: dict, server_name: str,
+                                         target_quality: str, quality_label: str,
+                                         expected_s: Optional[float]) -> Optional[dict]:
+    """🆕 z40 — یک کاندید استریم را برای کیفیت هدف ارزیابی کن (سه شاخه‌ی z36-z38).
+
+    Returns: همان کاندید با url بازنویسی‌شده به واریانت کیفیت هدف، یا None."""
+    try:
+        if candidate.get("qualities"):
+            # 🆕 z36 — برچسب None (مثل بعضی جواب‌های 2Embed) کرش نمی‌ده
+            has_q = any(
+                (q.get("label") or "").lower() == target_quality
+                for q in candidate["qualities"]
+            )
+            if has_q:
+                # این سرور کیفیت مورد نظر رو داره — URL اون کیفیت
+                for q in candidate["qualities"]:
+                    if (q.get("label") or "").lower() == target_quality:
+                        candidate["url"] = q["url"]
+                        break
+                # 🆕 z35 — چک مدت قبل از پذیرش سرور
+                if not await _stream_duration_ok(
+                        candidate, expected_s,
+                        f"q:{server_name}:{quality_label}"):
+                    return None
+                # 🆕 z37 — پروب سلامت: برچسب API داریم، فقط سلامت زنجیره
+                _pok, _pdet = await _probe_stream_health(
+                    candidate, want_label=quality_label)
+                if not _pok:
+                    logger.info("[IMDBPlay] ✗ Server %s quality-%s probe FAIL: %s",
+                                server_name, quality_label, _pdet)
+                    return None
+                logger.info("[IMDBPlay] ✓ Server %s has quality %s (%s)",
+                            server_name, quality_label, _pdet)
+                return candidate
+            # 🆕 z36 — لیستِ سرور برچسب هدف رو نداره؛ شاید master playlist‌ش
+            # variant متناظر داشته باشه (برچسب‌های API و master فرق می‌کنن):
+            # 🆕 z40 — فقط streams[0] نه! بعضی providerها (مثل hollymoviehd
+            # با LS-25/GS-25) استریم اولشان master نیست ولی استریم‌های دیگر
+            # (مسیر /pl/) master با واریانت‌های واقعی‌اند → تا ۳ URL بررسی می‌شود.
+            _urls_to_try = []
+            if candidate.get("type", "hls") and candidate.get("url"):
+                _urls_to_try.append(candidate["url"])
+            for q in (candidate.get("qualities") or [])[:4]:
+                _qu = q.get("url") or ""
+                if _qu and _qu not in _urls_to_try:
+                    _urls_to_try.append(_qu)
+            for _try_url in _urls_to_try[:3]:
+                _mv = None
+                if candidate.get("type", "hls") == "hls":
+                    candidate["url"] = _try_url
+                    _mv = await _resolve_variant_from_master(candidate, target_quality)
+                if not _mv:
+                    continue
+                candidate["url"] = _mv
+                if not await _stream_duration_ok(
+                        candidate, expected_s,
+                        f"q:{server_name}:{quality_label} (master)"):
+                    return None
+                # 🆕 z37 — پروب سلامت (ریشه‌ی رجریشن)
+                _pok, _pdet = await _probe_stream_health(
+                    candidate, want_label=quality_label)
+                if not _pok:
+                    logger.info("[IMDBPlay] ✗ Server %s master-variant probe FAIL: %s",
+                                server_name, _pdet)
+                    return None
+                logger.info("[IMDBPlay] ✓ z37 master-variant %s on %s (%s)",
+                            quality_label, server_name, _pdet)
+                return candidate
+            logger.info("[IMDBPlay] ✗ Server %s doesn't have quality %s (has: %s)",
+                        server_name, quality_label,
+                        [q.get("label") for q in candidate["qualities"]])
+            return None
+        else:
+            # 🆕 z36 — سرور لیست کیفیت نداره ولی شاید master playlist‌ش
+            # variant واقعی داشته باشه (🆕 z40: تا ۳ URL از لیست هم امتحان می‌شود):
+            _urls_to_try = []
+            if candidate.get("type", "hls") and candidate.get("url"):
+                _urls_to_try.append(candidate["url"])
+            for q in (candidate.get("qualities") or [])[:4]:
+                _qu = q.get("url") or ""
+                if _qu and _qu not in _urls_to_try:
+                    _urls_to_try.append(_qu)
+            for _try_url in _urls_to_try[:3]:
+                _mv = None
+                if candidate.get("type", "hls") == "hls":
+                    candidate["url"] = _try_url
+                    _mv = await _resolve_variant_from_master(candidate, target_quality)
+                if not _mv:
+                    continue
+                candidate["url"] = _mv
+                if not await _stream_duration_ok(
+                        candidate, expected_s,
+                        f"q:{server_name}:{quality_label} (master)"):
+                    return None
+                _pok, _pdet = await _probe_stream_health(
+                    candidate, want_label=quality_label)
+                if not _pok:
+                    logger.info("[IMDBPlay] ✗ Server %s master-variant probe FAIL: %s",
+                                server_name, _pdet)
+                    return None
+                logger.info("[IMDBPlay] ✓ z37 master-variant %s on %s (%s)",
+                            quality_label, server_name, _pdet)
+                return candidate
+            # 🆕 z37/z38 — سرور «فقط Auto» با اثبات رزولوشن واقعی (width-aware)
+            _pok, _pdet = await _probe_stream_health(
+                candidate, want_label=quality_label, require_match=True)
+            if _pok:
+                logger.info("[IMDBPlay] ✓ z37 probe-verified %s on %s (%s)",
+                            quality_label, server_name, _pdet)
+                return candidate
+            logger.info("[IMDBPlay] ✗ Server %s auto-only/probe fail: %s",
+                        server_name, _pdet)
+            return None
+    except Exception as e:
+        logger.warning("[IMDBPlay] ✗ Server %s exception: %s", server_name, e)
+        return None
+
+
+async def _pick_fastest_candidate(_eval_server, ordered, preferred_server):
+    """🆕 z40 — ارزیابی موازی همه‌ی سرورها → بنچمارک سرعت → سریع‌ترین کاندید.
+
+    قبلاً حلقه‌ی ترتیبی بود و مجموعِ تاخیر زنجیره‌های مرده پرداخت می‌شد؛
+    حالا هزینه = کندترین سرور. و به‌جای «اولین هم‌کیفیت» (که می‌توانست روی
+    CDN ~1MB/s قفل شود)، سریع‌ترین CDN سالم انتخاب می‌شود (تا ~50× سریع‌تر).
+    """
+    _evals = await asyncio.gather(*[_eval_server(s) for s in ordered])
+    # 🆕 z40 — هر سرور می‌تواند «لیست» کاندید برگرداند (2Embed چند provider دارد)
+    healthy = []
+    for _res in _evals:
+        if not _res:
+            continue
+        if isinstance(_res, list):
+            healthy.extend(_res)
+        else:
+            healthy.append(_res)
+
+    if not healthy:
+        return None
+    if len(healthy) == 1:
+        return healthy[0]
+
+    async def _bench_one(c):
+        try:
+            c["_mbps"] = await asyncio.wait_for(_quick_speed_bench(c), timeout=8.0)
+        except Exception:
+            c["_mbps"] = 0.0
+        return c
+
+    benched = await asyncio.gather(*[_bench_one(c) for c in healthy])
+
+    def _rank(c):
+        pref = 0 if (preferred_server and c.get("server") == preferred_server) else 1
+        return (-c.get("_mbps", 0.0), pref)
+
+    benched.sort(key=_rank)
+    logger.info("[z40] speed-bench: %s → انتخاب %s (%.1f MB/s)",
+                [(c.get("server"), round(c.get("_mbps", 0.0), 1)) for c in benched],
+                benched[0].get("server"), benched[0].get("_mbps", 0.0))
+    return benched[0]
+
+
 async def download_with_quality(
     imdb_id: str,
     quality_label: str,
@@ -2780,115 +3225,43 @@ async def download_with_quality(
             ordered += [{"id": "vm", "name": n, "vm_name": n} for n in vm_names]
         if preferred_server:
             ordered.sort(key=lambda s: 0 if s["name"] == preferred_server else 1)
-        for server in ordered:
-            if server["name"] in _exclude:
-                continue
-            try:
-                logger.info("[IMDBPlay] Trying server %s for quality %s...", server["name"], quality_label)
-                candidate = await _get_stream_for_server(server, tmdb_id, imdb_id, season, episode)
-                if not candidate or not candidate.get("url"):
-                    continue
 
-                # بررسی اینکه آیا این سرور کیفیت مورد نظر رو داره
-                # اگه سرور لیست کیفیت‌ها رو داره (مثل Videasy/Vidking)، چک کن
-                if candidate.get("qualities"):
-                    # 🆕 z36 — برچسب None (مثل بعضی جواب‌های 2Embed) کرش نمی‌ده
-                    has_q = any(
-                        (q.get("label") or "").lower() == target_quality
-                        for q in candidate["qualities"]
-                    )
-                    if has_q:
-                        # این سرور کیفیت مورد نظر رو داره — URL اون کیفیت رو برگردون
-                        for q in candidate["qualities"]:
-                            if (q.get("label") or "").lower() == target_quality:
-                                candidate["url"] = q["url"]
-                                break
-                        # 🆕 z35 — چک مدت قبل از پذیرش سرور
-                        if not await _stream_duration_ok(
-                                candidate, _expected_s,
-                                f"q:{server['name']}:{quality_label}"):
-                            stream = None
-                            continue
-                        # 🆕 z37 — پروب سلامت: برچسب API داریم، فقط سلامت زنجیره
-                        _pok, _pdet = await _probe_stream_health(candidate, want_label=quality_label)
-                        if not _pok:
-                            logger.info("[IMDBPlay] ✗ Server %s quality-%s probe FAIL: %s",
-                                        server["name"], quality_label, _pdet)
-                            stream = None
-                            continue
-                        stream = candidate
-                        logger.info("[IMDBPlay] ✓ Server %s has quality %s (%s)",
-                                    server["name"], quality_label, _pdet)
-                        break
-                    else:
-                        # 🆕 z36 — لیستِ خودِ سرور برچسب هدف رو نداره؛ شاید master
-                        # playlist‌ش variant متناظر داشته باشه (برچسب‌های API و
-                        # برچسب‌های master گاهی فرق می‌کنن):
-                        _mv = None
-                        if candidate.get("type", "hls") == "hls" and candidate.get("url"):
-                            _mv = await _resolve_variant_from_master(candidate, target_quality)
-                        if _mv:
-                            candidate["url"] = _mv
-                            if not await _stream_duration_ok(
-                                    candidate, _expected_s,
-                                    f"q:{server['name']}:{quality_label} (master)"):
-                                continue
-                            # 🆕 z37 — پروب سلامت (ریشه‌ی رجریشن: همین شاخه
-                            # زنجیره‌ی خراب videasy را بدون آزمون سگمنت می‌پذیرفت)
-                            _pok, _pdet = await _probe_stream_health(candidate, want_label=quality_label)
-                            if not _pok:
-                                logger.info("[IMDBPlay] ✗ Server %s master-variant probe FAIL: %s",
-                                            server["name"], _pdet)
-                                continue
-                            stream = candidate
-                            logger.info("[IMDBPlay] ✓ z37 master-variant %s on %s (%s)",
-                                        quality_label, server["name"], _pdet)
-                            break
-                        logger.info("[IMDBPlay] ✗ Server %s doesn't have quality %s (has: %s)",
-                                    server["name"], quality_label,
-                                    [q.get("label") for q in candidate["qualities"]])
-                        continue
+        async def _eval_server(server):
+            """🆕 z40 — ارزیابی یک سرور برای کیفیت هدف → «لیست» کاندیدهای سالم.
+
+            چرا لیست؟ یک سرور (مثل 2Embed) چند provider با CDNهای متفاوت دارد
+            که همه می‌توانند کیفیت هدف را بدهند ولی سرعتشان تا ۵۰ برابر فرق دارد؛
+            همه باید به بنچمارک برسند. (منطق سه‌شاخه‌ای z36-z38 در
+            _resolve_candidate_for_quality است.)"""
+            if server["name"] in _exclude:
+                return []
+            try:
+                logger.info("[IMDBPlay] Trying server %s for quality %s...",
+                            server["name"], quality_label)
+                # 🆕 z40 — برای 2Embed همه‌ی providerهای سالم؛ برای بقیه تک‌استریم
+                if server.get("id") == "s9":
+                    multi = await _2embed_get_stream_multi(
+                        tmdb_id, imdb_id, season, episode)
                 else:
-                    # 🆕 z36 — سرور لیست کیفیت نداره ولی شاید master playlist‌ش
-                    # variant واقعی داشته باشه (منو از master می‌بینه، دانلودر نمی‌دید).
-                    # همین‌جا variant متناظر با کیفیت هدف رو پیدا کن:
-                    _mv = None
-                    if candidate.get("type", "hls") == "hls" and candidate.get("url"):
-                        _mv = await _resolve_variant_from_master(candidate, target_quality)
-                    if _mv:
-                        candidate["url"] = _mv
-                        if not await _stream_duration_ok(
-                                candidate, _expected_s,
-                                f"q:{server['name']}:{quality_label} (master)"):
-                            continue
-                        # 🆕 z37 — پروب سلامت master-variant
-                        _pok, _pdet = await _probe_stream_health(candidate, want_label=quality_label)
-                        if not _pok:
-                            logger.info("[IMDBPlay] ✗ Server %s master-variant probe FAIL: %s",
-                                        server["name"], _pdet)
-                            continue
-                        stream = candidate
-                        logger.info("[IMDBPlay] ✓ z37 master-variant %s on %s (%s)",
-                                    quality_label, server["name"], _pdet)
-                        break
-                    # 🆕 z37 — سرور «فقط Auto» (مثل Vidzee) دیگر کورکورانه رد نمی‌شه:
-                    # پروب می‌شه؛ اگه زنجیره سالم بود و رزولوشن واقعی سگمنت با
-                    # کیفیت هدف بخونه، قبوله.
-                    # 🆕 z38 — لیبل‌ها width-aware شدن: Vidzee 1920x804 حالا
-                    # «1080p» است (نه 720p) → برای درخواست 720p رد می‌شه و
-                    # سرورِ دارای 720p واقعی (1280x536، مثل superstream) برنده می‌شه.
-                    _pok, _pdet = await _probe_stream_health(
-                        candidate, want_label=quality_label, require_match=True)
-                    if _pok:
-                        stream = candidate
-                        logger.info("[IMDBPlay] ✓ z37 probe-verified %s on %s (%s)",
-                                    quality_label, server["name"], _pdet)
-                        break
-                    logger.info("[IMDBPlay] ✗ Server %s auto-only/probe fail: %s", server["name"], _pdet)
-                    continue
+                    _one = await _get_stream_for_server(
+                        server, tmdb_id, imdb_id, season, episode)
+                    multi = [_one] if _one and _one.get("url") else []
+                _out = []
+                for candidate in multi:
+                    _got = await _resolve_candidate_for_quality(
+                        candidate, server["name"], target_quality,
+                        quality_label, _expected_s)
+                    if _got:
+                        _out.append(_got)
+                return _out
+
             except Exception as e:
-                logger.warning("[IMDBPlay] ✗ Server %s exception: %s", server["name"], e)
-                continue
+                logger.warning("[IMDBPlay] ✗ Server %s exception: %s",
+                               server["name"], e)
+                return []
+
+
+        stream = await _pick_fastest_candidate(_eval_server, ordered, preferred_server)
 
         # اگه هیچ سرور کیفیت مورد نظر رو نداشت:
         # 🆕 strict_quality=True → به‌جای دانلود اشتباه با Auto، خطای واضح
@@ -2919,6 +3292,14 @@ async def download_with_quality(
 
     if not stream:
         raise RuntimeError(f"No working stream found for {imdb_id}")
+
+    # 🆕 z40 — نام «سرور واقعی» تحویل‌دهنده به بات (برای لیبل درست پیشرفت؛
+    # قبلاً بات نام سرورِ «انتخابیِ» کاربر را نشان می‌داد — گمراه‌کننده)
+    if stats_out is not None:
+        try:
+            stats_out["served_by"] = stream.get("server") or ""
+        except Exception:
+            pass
 
     # 🆕 z36 — گیت سلامت + retry خودکار با سرور بعدی
     async def _finish_or_retry(path: str, declared: Optional[float]) -> str:
