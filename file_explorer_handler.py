@@ -9,6 +9,9 @@
 #  ۲) ✏️ تغییر نام:
 #     ربات اسم جدید رو می‌پرسه (مثلاً mamad.apk) و همون فایل رو با
 #     اسم جدید برمی‌گردونه (بدون هیچ تغییری توی محتوا).
+#     🆕 بعد از اسم، میشه یه عکس هم فرستاد تا به‌عنوان تامبنیل فایل ست
+#     بشه — عکس خودکار به سایز استاندارد تلگرام (۳۲۰×۳۲۰ JPEG) تبدیل
+#     میشه و روی فایل ارسالی می‌شینه (یا /skip برای رد شدن).
 #  ۳) ☁️ آپلود به Filebin (https://filebin.net):
 #     فایل رو استریمی و با نوار پیشرفت روی filebin.net آپلود می‌کنه.
 #     هوشمند: پسوندهای بلاک‌شده (exe/apk/msi/dll/scr) مستقیم با پسوند
@@ -83,6 +86,13 @@ try:
     import rarfile  # type: ignore
 except Exception:
     rarfile = None
+
+# 🆕 Pillow — تبدیل عکس تامبنیل تغییر نام (تو requirements.txt هست)
+try:
+    from PIL import Image, ImageOps  # type: ignore
+except Exception:
+    Image = None
+    ImageOps = None
 
 logger = logging.getLogger("file_explorer")
 
@@ -2485,7 +2495,8 @@ async def fe_rename_cb(event):
             event,
             f"✏️ فایل: <b>{_esc(fname)}</b>\n\n"
             "چه اسمی میخوای براش بزاری؟ اسم کامل همراه پسوند رو بفرست.\n"
-            "مثلاً: <code>mamad.apk</code>",
+            "مثلاً: <code>mamad.apk</code>\n\n"
+            "🆕 بعد از اسم، میتونی یه <b>عکس</b> هم بفرستی تا به‌عنوان تامبنیل فایل ست بشه (اختیاری).",
             [[Button.inline("❌ لغو", f"frenc_{event.sender_id}")]],
         )
         await event.answer()
@@ -2566,7 +2577,7 @@ async def fe_abort_cb(event):
 
 
 async def fe_rename_text_handler(event):
-    """دریافت اسم جدید از کاربر و ارسال فایل با اسم جدید."""
+    """دریافت اسم جدید → مرحله‌ی ۲ (عکس تامبنیل اختیاری) → ارسال."""
     st = frename_pending.get(event.sender_id)
     if not st:
         return
@@ -2582,11 +2593,42 @@ async def fe_rename_text_handler(event):
             frename_pending.pop(event.sender_id, None)
             await event.reply("❌ تغییر نام لغو شد")
             raise events.StopPropagation
+        if raw == "/skip" and st.get("stage") == "thumb":
+            # 🆕 بدون تامبنیل — مستقیم بفرست
+            frename_pending.pop(event.sender_id, None)
+            new_name = st.get("new_name") or ""
+            if not new_name:
+                await event.reply("⚠️ اسم جدید گم شد — دوباره فایل رو بفرست و شروع کن")
+                raise events.StopPropagation
+            await _run_rename_send(event, st, new_name, thumb_src=None)
+            return
         return
 
-    frename_pending.pop(event.sender_id, None)
+    # ─── 🆕 مرحله‌ی ۲: اسم گرفته شده — منتظر عکس تامبنیل هستیم ───
+    if st.get("stage") == "thumb":
+        # کاربر می‌تونه وسط انتظار، اسم رو هم عوض کنه
+        updated = _sanitize_filename(raw)
+        if not updated:
+            await event.reply(
+                "❌ اسم نامعتبره — دوباره بفرست یا <code>/skip</code> / <code>/cancel</code>",
+                parse_mode="html",
+            )
+            raise events.StopPropagation
+        st["new_name"] = updated
+        st["created"] = time.time()
+        await event.reply(
+            f"✏️ اسم آپدیت شد: <b>{_esc(updated)}</b>\n"
+            "🖼 حالا عکس تامبنیل رو بفرست — عکس نمیخوای؟ دکمه‌ی پایین رو بزن.",
+            parse_mode="html",
+            buttons=[
+                [Button.inline("⏭️ بدون تامبنیل — همینطوری بفرست", f"frskip_{event.sender_id}")],
+                [Button.inline("❌ لغو", f"frenc_{event.sender_id}")],
+            ],
+        )
+        raise events.StopPropagation
 
     if time.time() - st["created"] > RENAME_TTL:
+        frename_pending.pop(event.sender_id, None)
         await event.reply("⌛️ مهلت تغییر نام تمام شد — دوباره فایل رو بفرست")
         raise events.StopPropagation
 
@@ -2595,6 +2637,35 @@ async def fe_rename_text_handler(event):
         await event.reply("❌ اسم نامعتبره — یه اسم دیگه بفرست (مثلاً: <code>mamad.apk</code>)", parse_mode="html")
         raise events.StopPropagation
 
+    # ─── 🆕 رفتن به مرحله‌ی ۲: پرسیدن عکس تامبنیل (اختیاری) ───
+    frename_pending[event.sender_id] = {
+        "stage": "thumb",
+        "chat_id": st["chat_id"],
+        "msg_id": st["msg_id"],
+        "file_name": st["file_name"],
+        "new_name": new_name,
+        "created": time.time(),
+    }
+    await event.reply(
+        f"✏️ اسم جدید: <b>{_esc(new_name)}</b>\n\n"
+        "🖼 اگه میخوای فایل تامبنیل داشته باشه، <b>عکسش رو بفرست</b> —\n"
+        "خودم به سایز استاندارد تامبنیل تلگرام (حداکثر ۳۲۰×۳۲۰ JPEG) تبدیلش می‌کنم و روی فایل می‌ذارم.\n\n"
+        "• عکس نمیخوای؟ <code>/skip</code> یا دکمه‌ی پایین\n"
+        "• لغو؟ <code>/cancel</code>",
+        parse_mode="html",
+        buttons=[
+            [Button.inline("⏭️ بدون تامبنیل — همینطوری بفرست", f"frskip_{event.sender_id}")],
+            [Button.inline("❌ لغو", f"frenc_{event.sender_id}")],
+        ],
+    )
+    raise events.StopPropagation
+
+
+async def _run_rename_send(event, st, new_name, thumb_src=None):
+    """🆕 هسته‌ی تغییر نام — دانلود فایل اصلی، rename و ارسال با اسم جدید.
+
+    thumb_src: مسیر عکسِ پردازش‌شده (JPEG ≤ 320px)؛ اگه ست باشه به‌عنوان
+    تامبنیل داکیومنت به send_file پاس داده میشه."""
     work_dir = os.path.join(_output_folder, f"fren_{event.sender_id}_{secrets.token_hex(4)}")
     status = None
     # 🆕 توکن لغو — دکمه «❌ لغو» روی پیام وضعیت می‌شینه و وسط دانلود/ارسال
@@ -2631,21 +2702,35 @@ async def fe_rename_text_handler(event):
         if os.path.abspath(final_path) != os.path.abspath(got):
             os.replace(got, final_path)
 
+        # 🆕 تامبنیل اختیاری — عکس پردازش‌شده رو داخل work_dir کپی می‌کنیم
+        # (work_dir آخر عملیات کامل پاک میشه، پس تامبنیل هم تمیز میشه)
+        thumb_path = None
+        if thumb_src and os.path.exists(thumb_src):
+            thumb_path = os.path.join(work_dir, "tg_thumb.jpg")
+            try:
+                shutil.copyfile(thumb_src, thumb_path)
+            except Exception:
+                thumb_path = None
+
         try:
-            await status.edit("📤 در حال ارسال با اسم جدید...", parse_mode="html")
+            await status.edit(
+                "📤 در حال ارسال با اسم جدید" + (" و تامبنیل..." if thumb_path else "..."),
+                parse_mode="html",
+            )
         except MessageNotModifiedError:
             pass
 
         # 🆕 progress_callback برای ارسال — هم درصد پیشرفت میده هم نقطه‌ی لغو
         prog_up = _ProgEdit(status, "ارسال", abort_token=abort_token)
-        await client.send_file(
-            st["chat_id"],
-            final_path,
+        send_kwargs = dict(
             force_document=True,
             caption=f"✏️ <b>{_esc(old_name)}</b> ← <b>{_esc(new_name)}</b>",
             parse_mode="html",
             progress_callback=prog_up.cb,
         )
+        if thumb_path:
+            send_kwargs["thumb"] = thumb_path
+        await client.send_file(st["chat_id"], final_path, **send_kwargs)
         try:
             await status.edit(
                 f"✅ فایل با اسم جدید ارسال شد: <code>{_esc(new_name)}</code>",
@@ -2684,6 +2769,142 @@ async def fe_rename_text_handler(event):
         except Exception:
             pass
     raise events.StopPropagation
+
+
+# ───────────── 🆕 تامبنیل اختیاری برای تغییر نام ─────────────
+THUMB_MAX_SIDE = 320          # تلگرام: عرض و ارتفاع تامبنیل داکیومنت حداکثر ۳۲۰
+THUMB_MAX_BYTES = 190 * 1024  # حجم تامبنیل هم بهتره زیر ~۲۰۰ کیلوبایت بمونه
+
+
+def _make_telegram_thumb(src_path: str, out_path: str) -> Optional[str]:
+    """🆕 هر عکسی رو به تامبنیل استاندارد تلگرام تبدیل می‌کنه (JPEG ≤ 320px).
+
+    • چرخش EXIF عکس‌های موبایل اصلاح میشه
+    • RGB + کوچیک‌سازی به داخل ۳۲۰×۳۲۰ با حفظ نسبت تصویر
+    • JPEG با کيفیت پله‌پله کاهش می‌خوره تا حجم زیر سقف بمونه
+    (sync هست — از طریق asyncio.to_thread صدا زده میشه تا event-loop بلاک نشه)"""
+    if Image is None:
+        raise RuntimeError("Pillow نصب نیست")
+    img = Image.open(src_path)
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    img = img.convert("RGB")
+    img.thumbnail((THUMB_MAX_SIDE, THUMB_MAX_SIDE), Image.LANCZOS)
+    q = 90
+    while True:
+        img.save(out_path, "JPEG", quality=q, optimize=True)
+        if os.path.getsize(out_path) <= THUMB_MAX_BYTES or q <= 40:
+            break
+        q -= 15
+    return out_path
+
+
+async def fe_rename_photo_handler(event):
+    """🆕 مرحله‌ی ۲ تغییر نام: کاربر عکس تامبنیل رو می‌فرسته.
+
+    عکس → تبدیل خودکار به JPEG ≤ ۳۲۰×۳۲۰ → دانلود فایل اصلی → rename →
+    ارسال فایل با اسم جدید + تامبنیل روی همون فایل.
+    فقط وقتی وارد عمل میشه که کاربر واقعاً توی مرحله‌ی «منتظر عکس» باشه."""
+    st = frename_pending.get(event.sender_id)
+    if not st or st.get("stage") != "thumb":
+        return
+    if not _is_authorized(event.sender_id):
+        return
+
+    ph_dir = os.path.join(
+        _output_folder, f"frenph_{event.sender_id}_{secrets.token_hex(4)}"
+    )
+    try:
+        if time.time() - st.get("created", time.time()) > RENAME_TTL:
+            frename_pending.pop(event.sender_id, None)
+            await event.reply("⌛️ مهلت تغییر نام تمام شد — دوباره فایل رو بفرست")
+            raise events.StopPropagation
+
+        new_name = st.get("new_name") or ""
+        if not new_name:
+            frename_pending.pop(event.sender_id, None)
+            await event.reply("⚠️ اسم جدید گم شد — دوباره فایل رو بفرست و شروع کن")
+            raise events.StopPropagation
+
+        frename_pending.pop(event.sender_id, None)
+
+        os.makedirs(ph_dir, exist_ok=True)
+        raw_photo = await event.client.download_media(
+            event.message, file=os.path.join(ph_dir, "raw")
+        )
+        if not raw_photo or not os.path.exists(raw_photo):
+            await event.reply(
+                "❌ دریافت عکس ناموفق بود — دوباره بفرست یا <code>/skip</code>",
+                parse_mode="html",
+            )
+            raise events.StopPropagation
+
+        thumb_src = None
+        try:
+            thumb_src = os.path.join(ph_dir, "thumb.jpg")
+            await asyncio.to_thread(_make_telegram_thumb, raw_photo, thumb_src)
+        except Exception as e:
+            logger.warning(f"[FileExplorer] thumb convert failed: {e}")
+            thumb_src = None
+            try:
+                await event.reply(
+                    "⚠️ تبدیل عکس ناموفق بود — بدون تامبنیل می‌فرستم.",
+                    parse_mode="html",
+                )
+            except Exception:
+                pass
+
+        await _run_rename_send(event, st, new_name, thumb_src=thumb_src)
+    except events.StopPropagation:
+        raise
+    except Exception as e:
+        logger.error(f"[FileExplorer] rename photo error: {e}", exc_info=True)
+        try:
+            await event.reply(
+                "❌ خطا در پردازش تامبنیل — دوباره امتحان کن یا <code>/skip</code>",
+                parse_mode="html",
+            )
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(ph_dir, ignore_errors=True)
+    raise events.StopPropagation
+
+
+async def fe_rename_skip_cb(event):
+    """🆕 دکمه «⏭️ بدون تامبنیل — همینطوری بفرست»: frskip_<uid>"""
+    try:
+        if not _is_authorized(event.sender_id):
+            await event.answer("⛔️ اجازه نداری", alert=True)
+            return
+        uid = int(event.data.decode("utf-8", "ignore").split("_", 1)[1])
+        if event.sender_id != uid:
+            await event.answer("⛔️ این عملیات مال تو نیست", alert=True)
+            return
+        st = frename_pending.get(uid)
+        if not st or st.get("stage") != "thumb":
+            await event.answer("⏰ این درخواست منقضی شده — دوباره شروع کن", alert=True)
+            return
+        frename_pending.pop(uid, None)
+        new_name = st.get("new_name") or ""
+        if not new_name:
+            await event.answer("⚠️ اسم نامعتبر — دوباره شروع کن", alert=True)
+            return
+        try:
+            await event.answer("📤 در حال ارسال...")
+        except Exception:
+            pass
+        await _run_rename_send(event, st, new_name, thumb_src=None)
+    except events.StopPropagation:
+        raise
+    except Exception as e:
+        logger.error(f"[FileExplorer] rename skip error: {e}", exc_info=True)
+        try:
+            await event.answer("❌ خطا", alert=True)
+        except Exception:
+            pass
 
 
 # ═══════════════════════ ۶) آپلود به Filebin ═══════════════════════
@@ -3181,6 +3402,14 @@ def register_file_explorer_handlers(
     client.add_event_handler(fe_rename_cb, events.CallbackQuery(pattern=r"^fren_-?\d+_\d+$"))
     client.add_event_handler(fe_rename_cancel_cb, events.CallbackQuery(pattern=r"^frenc_\d+$"))
     client.add_event_handler(fe_rename_text_handler, events.NewMessage(incoming=True))
+    # 🆕 مرحله‌ی تامبنیل تغییر نام: عکس کاربر → تبدیل به سایز تلگرام → اعمال روی فایل
+    client.add_event_handler(
+        fe_rename_photo_handler,
+        events.NewMessage(incoming=True, func=lambda e: bool(e.photo)),
+    )
+    client.add_event_handler(
+        fe_rename_skip_cb, events.CallbackQuery(pattern=r"^frskip_\d+$")
+    )
     # 🆕 بستن منوی اصلی + لغو عملیات‌ها
     client.add_event_handler(fe_dismiss_cb, events.CallbackQuery(pattern=r"^fexdism_-?\d+_\d+$"))
     client.add_event_handler(fe_abort_cb, events.CallbackQuery(pattern=r"^fexab_[0-9a-f]+$"))

@@ -35,6 +35,7 @@ from telethon.tl.types import (
     Message,
     DocumentAttributeVideo,
     DocumentAttributeAudio,
+    DocumentAttributeFilename,
     InputMediaUploadedDocument,
     InputWebDocument,
     DocumentAttributeImageSize,
@@ -563,6 +564,11 @@ from otherwebsiteshandler.txxx_network_handler import (
 from otherwebsiteshandler.drtuber_handler import (
     is_drtuber_url, extract_drtuber_qualities,
     download_drtuber_direct, download_drtuber_m3u8, drtuber_sessions,
+)
+# 🆕 9Vids (وردپرس + پلاگین clean-tube-player — RE شده: iframe base64 → mp4 مستقیم)
+from otherwebsiteshandler.ninevids_handler import (
+    is_ninevids_url, extract_ninevids_qualities,
+    download_ninevids_direct, download_ninevids_m3u8, ninevids_sessions,
 )
 from otherwebsiteshandler.porntop_handler import (
     is_porntop_url, extract_porntop_qualities,
@@ -2793,9 +2799,14 @@ async def send_file_with_progress(
 
         if is_video and not force_document:
             duration_int = int(duration) if duration else 0
+            # 🆕 FIX: اسم فایل ارسالی — filepath ممکنه فایل temp فست‌استارت باشه
+            # (filepath + "_faststart.mp4") و تلگرام اسم رو از basename می‌سازه،
+            # پس «movie.mp4_faststart.mp4» می‌شد. با DocumentAttributeFilename صریح،
+            # اسم اصلی فایل حفظ می‌شه (get_attributes فقط اگه filename ندی از مسیر می‌سازه).
             attributes, mime_type = utils.get_attributes(
                 filepath,
                 attributes=[
+                    DocumentAttributeFilename(os.path.basename(orig_filepath)),
                     DocumentAttributeVideo(
                         duration=duration_int,
                         w=width if width else 0,
@@ -19103,6 +19114,12 @@ process_drtuber_request, drtuber_quality_callback, drtuber_cancel_callback = _ma
     drtuber_sessions, "DrTuber",
 )
 
+# 🆕 9Vids (وردپرس + clean-tube-player — iframe base64 → MP4 مستقیم)
+process_ninevids_request, ninevids_quality_callback, ninevids_cancel_callback = _make_site_handler(
+    "nvd", extract_ninevids_qualities, download_ninevids_direct, download_ninevids_m3u8,
+    ninevids_sessions, "9Vids",
+)
+
 # PornTop (KVS + yt-dlp fallback)
 process_porntop_request, porntop_quality_callback, porntop_cancel_callback = _make_site_handler(
     "ptp2", extract_porntop_qualities, download_porntop_direct, download_porntop_m3u8,
@@ -19498,6 +19515,7 @@ NEW_SITE_HANDLERS = [
     (is_vjav_url, process_vjav_request, "VJAV"),
     (is_hdzog_url, process_hdzog_request, "HDzog"),
     (is_drtuber_url, process_drtuber_request, "DrTuber"),
+    (is_ninevids_url, process_ninevids_request, "9Vids"),
     (is_porntop_url, process_porntop_request, "PornTop"),
     (is_xhaccess_url, process_xhaccess_request, "xHAccess"),
     (is_pornone_url, process_pornone_request, "PornOne"),
@@ -23602,6 +23620,9 @@ async def main():
     client.add_event_handler(hdzog_cancel_callback, events.CallbackQuery(pattern=r"hdz2_cancel_.+"))
     client.add_event_handler(drtuber_quality_callback, events.CallbackQuery(pattern=r"drt_q_.+"))
     client.add_event_handler(drtuber_cancel_callback, events.CallbackQuery(pattern=r"drt_cancel_.+"))
+    # 🆕 9Vids
+    client.add_event_handler(ninevids_quality_callback, events.CallbackQuery(pattern=r"nvd_q_.+"))
+    client.add_event_handler(ninevids_cancel_callback, events.CallbackQuery(pattern=r"nvd_cancel_.+"))
     client.add_event_handler(porntop_quality_callback, events.CallbackQuery(pattern=r"ptp2_q_.+"))
     client.add_event_handler(porntop_cancel_callback, events.CallbackQuery(pattern=r"ptp2_cancel_.+"))
     client.add_event_handler(xhaccess_quality_callback, events.CallbackQuery(pattern=r"xha_q_.+"))
