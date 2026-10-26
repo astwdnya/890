@@ -602,7 +602,7 @@ from otherwebsiteshandler.generic_handler import (
     javhihi_sessions, tokyoporn_sessions, javwhores_sessions,
     goodporn_sessions, porn365_sessions, fapcake_sessions, fux_sessions,
 )
-# ─── Comic sites handler (17 sites) ───────────────────────
+# ─── Comic sites handler (18 sites) ───────────────────────
 from otherwebsiteshandler.comics_handler import (
     SITES as COMIC_SITES,
     extract_comic_info,
@@ -614,7 +614,7 @@ from otherwebsiteshandler.comics_handler import (
     is_erofus_url, is_nhentai_url, is_ilikecomix_url,
     is_hentai18_url, is_sexcomix_me_url, is_xlecx_url,
     is_comics_moon_url, is_comicsporn_url, is_zzcartoon_url,
-    is_comicsflix_url, is_eggporncomics_url,
+    is_comicsflix_url, is_eggporncomics_url, is_eahentai_url,
     _get_site_key_from_url as _get_comic_site_key,
     _is_comic_url as _is_comic_page_url,
     _is_search_url as _is_comic_search_url,
@@ -5934,7 +5934,7 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
-    # ─── Comic sites (17 sites) ─────────────────────────────────
+    # ─── Comic sites (18 sites) ─────────────────────────────────
     # تشخیص URL کمیک
     _comic_url_fns = [
         is_hdporncomics_url, is_sexkomix2_url, is_hentai_name_url,
@@ -5942,7 +5942,7 @@ async def generic_url_handler(event):
         is_erofus_url, is_nhentai_url, is_ilikecomix_url,
         is_hentai18_url, is_sexcomix_me_url, is_xlecx_url,
         is_comics_moon_url, is_comicsporn_url, is_zzcartoon_url,
-        is_comicsflix_url, is_eggporncomics_url,
+        is_comicsflix_url, is_eggporncomics_url, is_eahentai_url,
     ]
     for _is_comic_fn in _comic_url_fns:
         if _is_comic_fn(target_url):

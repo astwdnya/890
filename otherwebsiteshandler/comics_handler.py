@@ -3,7 +3,7 @@ comics_handler.py
 ─────────────────
 هندلر عمومی برای سایت‌های کمیک.
 
-این هندلر از 17 سایت پشتیبانی می‌کنه:
+این هندلر از 18 سایت پشتیبانی می‌کنه:
   - hdporncomics.com
   - sexkomix2.com
   - hentai.name
@@ -21,6 +21,7 @@ comics_handler.py
   - zzcartoon.com (ویدیو)
   - comicsflix.com
   - eggporncomics.com
+  - eahentai.com (Next.js — استخراج اختصاصی از flight data)
 
 نکته مهم: این هندلرها از نوع "کمیک" هستن - نه ویدیو.
 ر-bot یه لینک کمیک می‌بینه و:
@@ -429,6 +430,31 @@ SITES = {
             r'href="((?:https?://(?:www\.)?eggporncomics\.com)?/comics/\d+/[\w\-]+)/?"',
         ],
     },
+    "eahentai": {
+        "display_name": "EAHentai",
+        "domain": "eahentai.com",
+        "allowed_hosts": frozenset({"eahentai.com", "www.eahentai.com", "i.eahentai.com"}),
+        "allowed_suffixes": (".eahentai.com",),
+        "homepage": "https://eahentai.com/",
+        # NOTE: eahentai یه اپ Next.js (App Router) هست — لیست کامل تصاویر
+        # آلبوم داخل flight data (رشته JSON داخل self.__next_f.push) قرار داره
+        # و تگ‌های <img> فقط پنجره‌ی صفحه‌ی فعلی رو نشون میدن.
+        # پس استخراج اختصاصی با custom_extract انجام میشه.
+        "custom_extract": "eahentai",
+        "comic_url_patterns": [
+            # /a/{albumID} و /a/{albumID}/{pageNumber}
+            r"^https?://(?:www\.)?eahentai\.com/a/\d+(?:/\d+)?/?$",
+        ],
+        "search_url_patterns": [
+            r"^https?://(?:www\.)?eahentai\.com/search(?:\?.*)?$",
+            r"^https?://(?:www\.)?eahentai\.com/\?page=\d+.*$",
+        ],
+        # فقط fallback اگه استخراج اختصاصی چیزی پیدا نکرد (تگ‌های img صفحه viewer)
+        "image_patterns": [
+            r'https://i\.eahentai\.com/file/ea-gallery/[^"\\ ]+\.(?:jpg|jpeg|png|webp|gif)',
+        ],
+        "comic_link_patterns": [],
+    },
 }
 
 
@@ -607,6 +633,17 @@ def _post_process_images(images: List[str], site_key: str) -> List[str]:
                 processed.append(url)
         return processed
     
+    if post_process == "eahentai":
+        # eahentai: لینک‌های نسبی CDN → مطلق (اگه یه روزی URI کامل اومد)
+        processed = []
+        for url in images:
+            if url.startswith("/"):
+                full_url = "https://i.eahentai.com/file/ea-gallery" + url
+            else:
+                full_url = url
+            processed.append(full_url)
+        return processed
+
     if post_process == "sexcomix_me":
         # sexcomix.me: data-img="/photos/galleries/43/201/0_780" + data-ext=".jpg"
         # → full URL: https://www.sexcomix.me/photos/galleries/43/201/0_780.jpg
@@ -665,6 +702,68 @@ def _extract_title_for_link(html: str, link_url: str) -> str:
     return ""
 
 
+# ─── eahentai custom extraction ─────────────────────────
+
+
+def _extract_eahentai_album(html: str, album_id: int) -> List[str]:
+    """
+    استخراج تصاویر آلبوم eahentai از Next.js flight data.
+
+    لیست کامل تصاویر هر آلبوم داخل رشته‌های self.__next_f.push([...]) به‌صورت
+    JSON escape‌شده هست (تگ‌های <img> فقط پنجره‌ی صفحه‌ی فعلی رو نشون میدن).
+    هر آبجکت عکس این شکل رو داره:
+      {"imageID":N,"imageUri":"galleries/HASH/NNNN.jpg",...,"albumID":ID,"sort":N}
+    تصاویر آلبوم‌های مرتبط هم تو payload هستن؛ پس فقط آبجکت‌هایی که
+    albumID آنها با آلبوم مقصد برابر است برمی‌داریم و بر اساس sort مرتب می‌کنیم.
+
+    URL کامل عکس: https://i.eahentai.com/file/ea-gallery/ + imageUri
+    """
+    pieces = re.split(r'\{\\"imageID\\":', html)
+    found: List[Tuple[int, str]] = []
+    for piece in pieces[1:]:
+        # فیلدهای آبجکت تا آبجکت بعدی؛ albumID و sort تو ۱۲۰۰ کاراکتر اول هستن
+        m_aid = re.search(r'\\"albumID\\":(\d+)', piece[:1200])
+        if not m_aid or int(m_aid.group(1)) != album_id:
+            continue
+        m_uri = re.search(r'\\"imageUri\\":\\"([^"\\]+)\\"', piece[:600])
+        if not m_uri:
+            continue
+        m_sort = re.search(r'\\"sort\\":(-?\d+)', piece[:1200])
+        found.append((int(m_sort.group(1)) if m_sort else 0, m_uri.group(1)))
+
+    found.sort(key=lambda t: t[0])
+
+    seen, images = set(), []
+    for _, uri in found:
+        if uri in seen:
+            continue
+        seen.add(uri)
+        if uri.startswith("http"):
+            images.append(uri)
+        else:
+            images.append(f"https://i.eahentai.com/file/ea-gallery/{uri}")
+    return images
+
+
+def _extract_eahentai_search(html: str) -> List[Tuple[str, str]]:
+    """
+    استخراج (url, title) آلبوم‌ها از flight data صفحه‌ی سرچ/لیست eahentai.
+    آبجکت آلبوم تو نتایج: {"albumID":N,"addDt":...,"thumbnailUri":...,"title":"..."}
+    """
+    results: List[Tuple[str, str]] = []
+    seen = set()
+    for m in re.finditer(r'\{\\"albumID\\":(\d+),\\"addDt\\":', html):
+        album_id = m.group(1)
+        if album_id in seen:
+            continue
+        seg = html[m.start():m.start() + 3000]
+        mt = re.search(r'\\"title\\":\\"(.*?)\\"', seg)
+        title = html_lib.unescape(mt.group(1)) if mt else ""
+        results.append((f"https://eahentai.com/a/{album_id}", title or f"album {album_id}"))
+        seen.add(album_id)
+    return results
+
+
 async def extract_comic_info(url: str, site_key: Optional[str] = None) -> Optional[dict]:
     """
     استخراج اطلاعات کمیک از صفحه.
@@ -693,8 +792,19 @@ async def extract_comic_info(url: str, site_key: Optional[str] = None) -> Option
         return None
     
     title = extract_title_from_html(html, cfg["display_name"])
-    images = _extract_images_from_html(html, site_key, url)
-    videos = _extract_videos_from_html(html, site_key, url)
+
+    if cfg.get("custom_extract") == "eahentai":
+        # استخراج اختصاصی eahentai — تصاویر داخل Next.js flight data هستن
+        m_aid = re.search(r"/a/(\d+)", url)
+        images = _extract_eahentai_album(html, int(m_aid.group(1))) if m_aid else []
+        if not images:
+            # fallback به الگوهای عمومی (تگ‌های img پنجره‌ی viewer)
+            logger.warning("[%s] custom extract empty, falling back to img patterns", cfg["display_name"])
+            images = _extract_images_from_html(html, site_key, url)
+        videos = []
+    else:
+        images = _extract_images_from_html(html, site_key, url)
+        videos = _extract_videos_from_html(html, site_key, url)
     
     # Post-process images (e.g. nhentai: thumbnail → full image)
     images = _post_process_images(images, site_key)
@@ -742,7 +852,11 @@ async def extract_comic_search_results(url: str, site_key: Optional[str] = None)
         logger.warning("[%s] Failed to fetch search page (HTTP %s)", cfg["display_name"], status)
         return None
     
-    comics = _extract_comic_links_from_search_html(html, site_key, url)
+    if cfg.get("custom_extract") == "eahentai":
+        # استخراج اختصاصی eahentai — لینک آلبوم‌ها تو flight data هستن نه href
+        comics = _extract_eahentai_search(html)
+    else:
+        comics = _extract_comic_links_from_search_html(html, site_key, url)
     
     if not comics:
         logger.warning("[%s] No comic links found on search page", cfg["display_name"])
