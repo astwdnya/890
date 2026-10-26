@@ -15431,7 +15431,15 @@ async def _imdb_cloud_deliver(event, status_msg, state, final_path, title,
                 logger.warning(f"[IMDB] sub cloud upload failed: {sub_up_err}")
 
         active_downloads.pop(dl_id, None)
-        await status_msg.edit("\n".join(lines), buttons=rows, parse_mode="html")
+        # 🆕 z45: اگه ادیت با دکمه‌ها شکست خورد (URL دکمه رد بشه)، بدون دکمه نشون بده
+        try:
+            await status_msg.edit("\n".join(lines), buttons=rows, parse_mode="html")
+        except Exception as _btn_err:
+            logger.warning(f"[IMDB] cloud result edit with buttons failed: {_btn_err}")
+            try:
+                await status_msg.edit("\n".join(lines), buttons=None, parse_mode="html")
+            except Exception:
+                pass
         return True
     except Exception as e:
         logger.error(f"[IMDB] cloud deliver failed: {e}", exc_info=True)

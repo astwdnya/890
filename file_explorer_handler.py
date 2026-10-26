@@ -649,11 +649,22 @@ async def _litterbox_upload(remote_name: str, local_path: str, prog) -> dict:
 
 # ───────── 🆕 سرور خودم (PUBLIC_BASE_URL) — لینک پابلیک بدون آپلود شبکه‌ای ─────────
 def _self_server_base() -> str:
-    """دامنه‌ی عمومی سرور خودم — از PUBLIC_BASE_URL؛ خالی/نامعتبر → "".
+    r"""دامنه‌ی عمومی سرور خودم — از PUBLIC_BASE_URL؛ خالی/نامعتبر → "".
 
-    تو Railway Variables بذار: PUBLIC_BASE_URL=https://<دامنه‌ی Generate Domain>"""
+    تو Railway Variables بذار: PUBLIC_BASE_URL=https://<دامنه‌ی Generate Domain>
+
+    🆕 z45 فیکس «گیر در ۱۰۰٪»: تو Railway بعضی وقتا مقدار با کتیشن/بک‌اسلش
+    کپی میشه (مثل  app-name.up.railway.app\"  یا  "app-name") — قبلاً فقط
+    کتیشنِ اول/آخر حذف می‌شد و  \"  وسط می‌موند → لینک می‌شد
+    https://app-name.up.railway.app\/f/xxx → تلگرام دکمه‌ی URL نامعتبر رو رد
+    می‌کرد → ادیت موفقیت شکست می‌خورد → پیام همیشه تو «در حال آپلود...» گیر
+    می‌کرد. حالا همه‌ی  \ " '  و فاصله‌های مزاحم از کل مقدار حذف می‌شن."""
     base = (os.environ.get("PUBLIC_BASE_URL") or "").strip()
-    # کتیشن دوتایی/تکی که تو Railway Variables جا می‌مونه
+    # 🆕 z45: پاکسازی تهاجمی — بک‌اسلش/کتیشن/فاصله از هر جای مقدار
+    for _ch in ('\\', '"', "'"):
+        base = base.replace(_ch, "")
+    base = base.strip()
+    # کتیشن دوتایی/تکی که تو Railway Variables جا می‌مونه (بخاطر بقیه‌ی حالت‌ها)
     while base[:1] in ('"', "'") and base[-1:] == base[:1]:
         base = base[1:-1].strip()
     base = base.rstrip("/")
@@ -2103,13 +2114,19 @@ class _ProgEdit:
 
     🆕 اگه abort_token داده بشه، با زدن دکمه «لغو» (ثبت توکن تو
     _ABORT_FLAGS) از همون فراخوانی بعدیِ cb عملیات با _UploadAborted قطع
-    میشه — بدون تأخیرِ محدودیت ۳.۵ ثانیه‌ای ادیت."""
+    میشه — بدون تأخیرِ محدودیت ۳.۵ ثانیه‌ای ادیت.
+
+    🆕 z45 فیکس «گیر در ۱۰۰٪ / دوحالته»: تسکِ ادیتِ آخرِ فاز (مثلاً «دانلود:
+    100%») ممکنه «بعد» از ادیتِ پیام نهایی موفقیت اجرا بشه و پیامِ لینک رو
+    overwrite کنه — کاربر همیشه «⏳ دانلود: 100.0%» می‌دید. حالا تسک‌ها
+    رهگیری می‌شن و با stop() قبل از رفتن به فاز بعد لغو می‌شن."""
 
     def __init__(self, msg, label: str, abort_token: Optional[str] = None):
         self.msg = msg
         self.label = label
         self.last_t = 0.0
         self.abort_token = abort_token
+        self._tasks: list = []          # 🆕 z45 تسک‌های ادیتِ در جریان
 
     def cb(self, current: int, total: int):
         # 🆕 چک لغو — قبل از هر چیز و بدون تrottle تا فوری قطع بشه
@@ -2127,7 +2144,11 @@ class _ProgEdit:
                 f"⏳ {self.label}: {pct:.1f}%\n"
                 f"({_fmt_size(current)} / {_fmt_size(total)})"
             )
-            asyncio.get_running_loop().create_task(self._edit(text))
+            # 🆕 z45: رهگیری تسک برای امکان لغو بعدی
+            t = asyncio.get_running_loop().create_task(self._edit(text))
+            self._tasks.append(t)
+            if len(self._tasks) > 4:      # فقط چندتای آخر مهمن
+                self._tasks = self._tasks[-4:]
         except Exception:
             pass
 
@@ -2138,6 +2159,16 @@ class _ProgEdit:
             await self.msg.edit(text, parse_mode="html")
         except Exception:
             pass
+
+    def stop(self):
+        """🆕 z45: فاز تموم شد — همه‌ی ادیت‌های در صف این فاز رو لغو کن تا
+        پیام نهایی (لینک/خطا) رو overwrite نکنن. بعد از این، cb هم کاری
+        نمی‌کنه (msg=None)."""
+        self.msg = None
+        for t in list(self._tasks):
+            if not t.done():
+                t.cancel()
+        self._tasks.clear()
 
 
 # ═══════════════════════ مدیریت سشن ═══════════════════════
@@ -2301,6 +2332,8 @@ async def fe_open_cb(event):
                     retry_buttons,
                 )
                 return
+
+            prog.stop()  # 🆕 z45: جلوی overwrite پیام‌های بعدی با «دانلود: 100%»
 
             if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
                 shutil.rmtree(sess_dir, ignore_errors=True)
@@ -2856,6 +2889,7 @@ async def _run_rename_send(event, st, new_name, thumb_src=None):
 
         prog = _ProgEdit(status, "دانلود", abort_token=abort_token)
         got = await client.download_media(msg, file=tmp_path, progress_callback=prog.cb)
+        prog.stop()  # 🆕 z45: جلوی overwrite پیام‌های بعدی با «دانلود: 100%»
         if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
             await status.edit("❌ دانلود فایل ناموفق بود — دوباره امتحان کن", parse_mode="html")
             raise events.StopPropagation
@@ -3136,6 +3170,7 @@ async def fe_filebin_cb(event):
             btn_msg = None
         prog = _ProgEdit(btn_msg, "دانلود", abort_token=abort_token)
         got = await event.client.download_media(msg, file=local_path, progress_callback=prog.cb)
+        prog.stop()  # 🆕 z45: تسک‌های ادیتِ «دانلود: 100%» نباید پیام‌های بعدی رو overwrite کنن
         if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
             await _safe_edit(
                 event,
@@ -3193,6 +3228,7 @@ async def fe_filebin_cb(event):
                 break
             # بقیه‌ی خطاهای HTTP (مثل 403 پسوند بلاک) → تلاش بعدی با .zip
 
+        prog_up.stop()  # 🆕 z45: ادیت‌های در صف آپلود، پیام نهایی رو overwrite نکنن
         if uploaded:
             fsize = os.path.getsize(got)
             bin_url = f"{FILEBIN_BASE}/{bin_name}"
@@ -3333,6 +3369,7 @@ async def fe_filepizza_cb(event):
             btn_msg = None
         prog = _ProgEdit(btn_msg, "دانلود", abort_token=abort_token)
         got = await event.client.download_media(msg, file=local_path, progress_callback=prog.cb)
+        prog.stop()  # 🆕 z45: تسک‌های ادیتِ «دانلود: 100%» نباید پیام‌های بعدی رو overwrite کنن
         if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
             await _safe_edit(
                 event,
@@ -3515,6 +3552,7 @@ async def fe_vlc_cb(event):
             btn_msg = None
         prog = _ProgEdit(btn_msg, "دانلود", abort_token=abort_token)
         got = await event.client.download_media(msg, file=local_path, progress_callback=prog.cb)
+        prog.stop()  # 🆕 z45: تسک‌های ادیتِ «دانلود: 100%» نباید پیام‌های بعدی رو overwrite کنن
         if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
             await _safe_edit(
                 event,
@@ -3536,6 +3574,9 @@ async def fe_vlc_cb(event):
         res = None
         used_prov = None
         err_lines: list = []
+        # 🆕 z45: prog_up یکبار ساخته میشه (نه تو هر تلاش) — ادیت‌های رهاشده‌ی
+        # تلاش‌های قبلی نمی‌تونن پیام نهایی رو overwrite کنن
+        prog_up = _ProgEdit(btn_msg, "آپلود")
         for prov in chain:
             fa = prov_fa[prov]
             attempts = 1 if prov == "self" else 2
@@ -3547,7 +3588,7 @@ async def fe_vlc_cb(event):
                     _abort_rows(abort_token),
                 )
                 # ⚠️ آپلود بدون توکن‌ریز در cb — لغو با کنسلِ تسک (بخش Filebin)
-                prog_up = _ProgEdit(btn_msg, "آپلود")
+                # 🆕 z45: prog_up بالای حلقه یکبار ساخته شده
                 try:
                     if prov == "self":
                         try:
@@ -3585,6 +3626,7 @@ async def fe_vlc_cb(event):
                         await asyncio.sleep(2)
             if res:
                 break
+        prog_up.stop()  # 🆕 z45: فاز آپلود تموم — ادیت‌های معوقه لغو شن
         if not res:
             hint = (
                 "\n\n💡 برای پایداری بیشتر، کلید رایگان پیکسل‌درین (تا ۲۰ گیگ) رو تو "
@@ -3654,7 +3696,13 @@ async def fe_vlc_cb(event):
             rows = [
                 [Button.url("⬇️ صفحه‌ی دانلود", res["dl_url"])],
             ]
-        await _safe_edit(event, text, rows)
+        # 🆕 z45: اگه ادیت با دکمه‌ها شکست خورد (مثلاً تلگرام URL دکمه رو رد کنه)،
+        # یه بار هم «بدون دکمه» نشون بده تا لینک حتماً به دست کاربر برسه
+        if not await _safe_edit(event, text, rows):
+            try:
+                await event.respond(text, buttons=None, parse_mode="html")
+            except Exception:
+                pass
     except _UploadAborted:
         # 🆕 کاربر دکمه لغو رو زده — پیام لغو + برگشت منو
         logger.info("[FileExplorer] vlc upload cancelled by user")
@@ -3673,6 +3721,16 @@ async def fe_vlc_cb(event):
             pass
     except Exception as e:
         logger.error(f"[FileExplorer] vlc cb error: {e}", exc_info=True)
+        # 🆕 z45: خطا رو «توی پیام» هم نشون بده — event.answer معمولاً از قبل
+        # مصرف شده، توستِ دیرهنگام کاربر رو خبردار نمی‌کنه و پیام گیر می‌کرد
+        try:
+            await _safe_edit(
+                event,
+                f"❌ خطای غیرمنتظره در آپلود: <code>{_esc(str(e)[:200])}</code>",
+                None,
+            )
+        except Exception:
+            pass
         try:
             await event.answer("❌ خطا در آپلود برای پخش", alert=True)
         except Exception:

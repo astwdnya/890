@@ -294,7 +294,13 @@ def serve_file(
 
     base = public_base_url or os.environ.get("PUBLIC_BASE_URL", "")
     # 🆕 نرمال‌سازی: کتیشن/فاصله حذف + اسکییم https:// خودکار
+    # 🆕 z45 فیکس «گیر در ۱۰۰٪»: مقدار Railway مثل  app.up.railway.app\"  —
+    # بک‌اسلش/کتیشن از «کل» مقدار حذف میشه وگرنه لینک نامعتبر می‌سازه که
+    # تلگرام دکمه‌اش رو رد می‌کنه و پیام موفقیت هیچوقت نشون داده نمیشه.
     base = (base or "").strip()
+    for _ch in ('\\', '"', "'"):
+        base = base.replace(_ch, "")
+    base = base.strip()
     while base[:1] in ('"', "'") and base[-1:] == base[:1]:
         base = base[1:-1].strip()
     if base and not base.startswith(("http://", "https://")):
