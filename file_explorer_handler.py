@@ -20,6 +20,11 @@
 #     نتیجه سه تا لینک میده: ⚡️ لینک دانلود مستقیم واقعی (URL امضاشده
 #     S3 — ربات قدم تأیید کوکی رو خودکار انجام میده؛ حدود ۱۵ دقیقه
 #     اعتبار داره) + 📄 لینک صفحه فایل + 🗃 لینک صفحه باکس.
+#  ۳.۵ 🍕 آپلود به FilePizza (https://file.pizza):
+#     آپلود P2P با WebRTC — ربات فایل رو با مرورگر هدلس (playwright) روی
+#     file.pizza سید می‌کنه و لینک دانلود مستقیم میده. نکته‌ی مهم: FilePizza
+#     فایل رو جایی ذخیره نمی‌کنه؛ تا وقتی سیدرِ هدلس روی سرور باز باشه
+#     (FILEPIZZA_SEED_MINUTES دقیقه یا دکمه‌ی ⏹ بستن سیدر) لینک کار می‌کنه.
 # ۴) 🎬 آپلود برای پخش در VLC:
 #     فایل رو روی هاستِ «لینک مستقیم» می‌ذاره که لینکش بایت خام میده و
 #     مستقیم تو VLC و بقیه پلیرها پلی میشه (برخلاف Filebin که صفحه
@@ -75,6 +80,12 @@ try:
     import aiohttp  # type: ignore
 except Exception:
     aiohttp = None
+
+# playwright — برای آپلود به FilePizza (مرورگر هدلسِ سیدر؛ تو requirements هست)
+try:
+    from playwright.async_api import async_playwright  # type: ignore
+except Exception:
+    async_playwright = None
 
 # کتابخانه‌های اختیاری — اگه نصب نباشن فقط فرمت مربوطه غیرفعال میشه
 try:
@@ -133,6 +144,18 @@ FILEBIN_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+# ───────────────── 🍕 FilePizza (آپلود P2P — سیدر باید باز بمونه) ─────────────────
+# FilePizza v2 فایل ذخیره نمی‌کنه؛ مرورگرِ آپلودکننده سیدر می‌مونه و دانلود
+# WebRTC انجام میشه. جریان (تست زنده): goto → input[type=file] → کلیک Start
+# → لینک توی input readonly ظاهر میشه: https://file.pizza/download/<۴ کلمه>
+FILEPIZZA_BASE = os.environ.get("FILEPIZZA_BASE", "https://file.pizza").rstrip("/")
+# P2P — سقف سمت سایت نداره؛ عملاً سقف دانلود تلگرام (۲ گیگ بات‌ها) گلوگاهه
+FILEPIZZA_MAX_BYTES = int(os.environ.get("FILEPIZZA_MAX_MB", "2000")) * 1024 * 1024
+# عمر سیدر هدلس بعد از ساخت لینک (دقیقه) — تا وقتی بازه دانلود P2P ممکنه
+FILEPIZZA_SEED_MINUTES = float(os.environ.get("FILEPIZZA_SEED_MINUTES", "120"))
+# حداکثر انتظار برای ظاهر شدن لینک (ثانیه) — فایل بزرگ = هش torrent طولانی‌تر
+FILEPIZZA_LINK_TIMEOUT = int(os.environ.get("FILEPIZZA_LINK_TIMEOUT", "180"))
 
 # ───────── VLC: Pixeldrain / Litterbox (لینک مستقیم قابل پخش) ─────────
 # برخلاف filebin (که برای دانلود صفحه تأیید HTML میده)، لینک این‌ها بایت
@@ -249,6 +272,7 @@ def _menu_rows(chat_id: int, msg_id: int):
         [Button.inline("✏️ تغییر نام", f"fren_{chat_id}_{msg_id}")],
         [Button.inline("☁️ آپلود ابری (لینک مستقیم)", f"fvlc_{chat_id}_{msg_id}")],
         [Button.inline("📤 آپلود به Filebin", f"fbin_{chat_id}_{msg_id}")],
+        [Button.inline("🍕 آپلود به FilePizza (P2P)", f"fpz_{chat_id}_{msg_id}")],
         [Button.inline("❌ بستن", f"fexdism_{chat_id}_{msg_id}")],
     ]
 
@@ -399,6 +423,144 @@ async def _filebin_direct_url(bin_name: str, remote_name: str) -> Optional[str]:
     except Exception as e:
         logger.warning(f"[FileExplorer] filebin direct-url probe failed: {e}")
     return None
+
+
+# ═══════════════════ 🍕 FilePizza — آپلودر P2P با playwright هدلس ═══════════════════
+# ربات = سیدر: مرورگر هدلس فایل رو باز نگه می‌داره تا دانلودکننده‌ها P2P بگیرن.
+# ⚠️ پوشه‌ی کاریِ فایل سیدرشده تا بسته‌شدن سیدر پاک نمیشه (مالکیت → رجیستری).
+_FP_SEEDERS: dict = {}      # token -> dict(ctx, browser, pw, task, url, name, work_dir)
+_FP_SEED_SEQ = 0
+
+
+async def _fp_close_seeder(token: str) -> bool:
+    """بستن سیدر FilePizza (مرورگر + playwright + پوشه‌ی کاری).
+
+    True یعنی سیدر بود و بسته/پاک شد."""
+    info = _FP_SEEDERS.pop(token, None)
+    if not info:
+        return False
+    task = info.get("task")
+    if task:
+        task.cancel()
+    for key in ("ctx", "browser"):
+        try:
+            obj = info.get(key)
+            if obj:
+                await obj.close()
+        except Exception:
+            pass
+    try:
+        pw = info.get("pw")
+        if pw:
+            await pw.stop()
+    except Exception:
+        pass
+    work_dir = info.get("work_dir")
+    if work_dir:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    logger.info(f"[FileExplorer] filepizza seeder closed: {info.get('url')}")
+    return True
+
+
+async def _fp_seed_keeper(token: str, minutes: float):
+    """پس از پایان مهلت سید، مرورگر رو می‌بنده و پوشه رو پاک می‌کنه."""
+    try:
+        await asyncio.sleep(max(minutes, 0.5) * 60)
+    except asyncio.CancelledError:
+        return
+    if token in _FP_SEEDERS:
+        try:
+            await _fp_close_seeder(token)
+        except Exception:
+            pass
+
+
+async def _filepizza_upload(local_path: str, work_dir: str) -> tuple:
+    """آپلود (سید) به FilePizza با playwright هدلس — خروجی: (link, token).
+
+    مرورگر عمداً باز می‌مونه و تو _FP_SEEDERS ثبت میشه (سیدر)؛ مالکیت
+    work_dir هم به رجیستری منتقل میشه و با بسته‌شدن سیدر پاک میشه.
+    هر خطا → _FeError (و مرورگر کامل بسته میشه)."""
+    if async_playwright is None:
+        raise _FeError("کتابخانه playwright نصب نیست — تو requirements.txt هست")
+    pw = await async_playwright().start()
+    browser = None
+    ctx = None
+    ok = False
+    try:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        ctx = await browser.new_context(user_agent=FILEBIN_UA)
+        page = await ctx.new_page()
+        await page.goto(f"{FILEPIZZA_BASE}/", wait_until="domcontentloaded", timeout=60000)
+        inputs = await page.query_selector_all("input[type=file]")
+        if not inputs:
+            raise _FeError("ورودی فایل توی صفحه‌ی FilePizza پیدا نشد — شاید UI سایت عوض شده")
+        await inputs[0].set_input_files(local_path)
+        # دکمه‌ی Start (exact تا ✕/Cancel اشتباهی کلیک نشن)
+        await page.get_by_role("button", name="Start", exact=True).first.click(timeout=30000)
+        # انتظار برای لینک — فایل بزرگ (هش torrent) طول می‌کشه
+        link = None
+        deadline = time.time() + max(FILEPIZZA_LINK_TIMEOUT, 30)
+        while time.time() < deadline:
+            await page.wait_for_timeout(1000)
+            vals = await page.eval_on_selector_all(
+                "input",
+                "els => els.map(e => e.value).filter(v => v && v.indexOf('http') === 0)",
+            )
+            if vals:
+                link = vals[0]
+                break
+            hrefs = await page.eval_on_selector_all(
+                "a[href]",
+                "els => els.map(e => e.href).filter(h => h.indexOf('/download/') > -1)",
+            )
+            if hrefs:
+                link = hrefs[0]
+                break
+        if not link:
+            raise _FeError(
+                f"لینک FilePizza ظاهر نشد ({FILEPIZZA_LINK_TIMEOUT} ثانیه صبر شد) — "
+                "فایل خیلی بزرگه یا سایت کند بود؛ دوباره امتحان کن"
+            )
+        # ✅ موفق — ثبت سیدر (مرورگر و پوشه باز می‌مونن)
+        global _FP_SEED_SEQ
+        _FP_SEED_SEQ += 1
+        token = f"{secrets.token_hex(4)}{_FP_SEED_SEQ:x}"
+        _FP_SEEDERS[token] = {
+            "ctx": ctx,
+            "browser": browser,
+            "pw": pw,
+            "url": link,
+            "name": os.path.basename(local_path),
+            "work_dir": work_dir,
+            "task": asyncio.ensure_future(
+                _fp_seed_keeper(token, FILEPIZZA_SEED_MINUTES)
+            ),
+        }
+        ok = True
+        return link, token
+    except _FeError:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        raise _FeError(f"خطای FilePizza:\n<code>{_esc(str(e)[:150])}</code>")
+    finally:
+        if not ok:
+            # شکست/لغو — همه‌چیز کامل بسته بشه (مسیر موفق باز می‌مونه)
+            for closer in (ctx, browser):
+                try:
+                    if closer:
+                        await closer.close()
+                except Exception:
+                    pass
+            try:
+                await pw.stop()
+            except Exception:
+                pass
 
 
 async def _pixeldrain_upload(remote_name: str, local_path: str, prog, api_key: str) -> dict:
@@ -3105,6 +3267,169 @@ async def fe_filebin_cb(event):
             shutil.rmtree(work_dir, ignore_errors=True)
 
 
+# ═══════════════════════ ۶.۵) آپلود به FilePizza (P2P) ═══════════════════════
+async def fe_filepizza_cb(event):
+    """دکمه 🍕 آپلود به FilePizza: fpz_<chat_id>_<msg_id>
+
+    فایل دانلود و با مرورگر هدلس (playwright) روی file.pizza سید میشه؛
+    لینک P2P تا باز بودن سیدر (FILEPIZZA_SEED_MINUTES) کار می‌کنه.
+    """
+    chat_id = msg_id = None
+    work_dir = None
+    abort_token = None
+    try:
+        if not _is_authorized(event.sender_id):
+            await event.answer("⛔️ اجازه نداری", alert=True)
+            return
+        if async_playwright is None:
+            await event.answer("⚠️ playwright روی سرور نصب نیست", alert=True)
+            return
+        _, chat_s, msg_s = event.data.decode("utf-8", "ignore").split("_", 2)
+        chat_id, msg_id = int(chat_s), int(msg_s)
+
+        # گارد دابل‌کلیک
+        inflight_key = ("fpz", chat_id, msg_id)
+        if inflight_key in _send_inflight:
+            await event.answer("⏳ همین الان داره آپلود میشه...", alert=True)
+            return
+
+        msg = await event.client.get_messages(chat_id, ids=msg_id)
+        doc = msg.document if msg else None
+        if doc is None:
+            await event.answer("⚠️ فایل اصلی پیدا نشد — احتمالاً پاک شده", alert=True)
+            return
+
+        fname = _doc_filename(doc) or f"file_{msg_id}"
+        size = getattr(doc, "size", 0) or 0
+        if size > FILEPIZZA_MAX_BYTES:
+            await event.answer(
+                f"⚠️ فایل {_fmt_size(size)} هست — از حد مجاز FilePizza ربات بزرگ‌تره",
+                alert=True,
+            )
+            return
+
+        _send_inflight.add(inflight_key)
+        try:
+            await event.answer("🍕 شروع آپلود به FilePizza...")
+        except Exception:
+            pass
+
+        # توکن یکتا برای دکمه لغو این عملیات
+        abort_token = secrets.token_hex(6)
+
+        await _safe_edit(
+            event,
+            f"🍕 در حال دانلود <b>{_esc(fname)}</b> برای FilePizza...",
+            _abort_rows(abort_token),
+        )
+
+        work_dir = os.path.join(_output_folder, f"fpz_{event.sender_id}_{secrets.token_hex(4)}")
+        os.makedirs(work_dir, exist_ok=True)
+        local_path = os.path.join(work_dir, _safe_disk_name(fname) or "file.bin")
+
+        try:
+            btn_msg = await event.get_message()
+        except Exception:
+            btn_msg = None
+        prog = _ProgEdit(btn_msg, "دانلود", abort_token=abort_token)
+        got = await event.client.download_media(msg, file=local_path, progress_callback=prog.cb)
+        if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
+            await _safe_edit(
+                event,
+                "❌ دانلود فایل ناموفق بود — دوباره امتحان کن",
+                _menu_rows(chat_id, msg_id),
+            )
+            return
+
+        await _safe_edit(
+            event,
+            "🍕 فایل دانلود شد — سید روی FilePizza شروع میشه (مرورگر هدلس)...\n"
+            "برای فایل‌های بزرگ، ساخت لینک چند دقیقه طول می‌کشه.",
+            _abort_rows(abort_token),
+        )
+
+        # سید با playwright — لغو با کنسل تسک انجام میشه
+        link, seed_token = await _run_upload_with_abort(
+            abort_token, _filepizza_upload(got, work_dir)
+        )
+        # مالکیت work_dir به سیدر منتقل شد — اینجا دیگه پاکش نمی‌کنیم
+        work_dir = None
+
+        hours = FILEPIZZA_SEED_MINUTES / 60.0
+        parts = [
+            "✅ <b>آپلود به FilePizza انجام شد!</b>\n\n",
+            f"📄 فایل: <code>{_esc(fname)}</code>\n",
+            f"📏 حجم: {_fmt_size(os.path.getsize(got))}\n\n",
+            "⚡️ لینک P2P (دانلود مستقیم — فایل جایی ذخیره نمیشه):\n",
+            f"{_esc(link)}\n\n",
+            f"⚠️ سیدر تا <b>{hours:g} ساعت</b> روی سرور ربات باز می‌مونه — "
+            "تا اون زمان (یا تا ری‌استارت ربات) لینک کار می‌کنه؛ انتقال P2P/WebRTC هست.\n",
+            f"🆔 سیدر: <code>{_esc(seed_token)}</code>",
+        ]
+        rows = [
+            [Button.url("⬇️ دانلود از FilePizza", link)],
+            [Button.inline("⏹ بستن سیدر (قطع لینک)", f"fpzstop_{seed_token}")],
+        ]
+        await _safe_edit(event, "".join(parts), rows)
+    except _UploadAborted:
+        # کاربر دکمه لغو رو زده — پیام لغو + برگشت منو
+        logger.info("[FileExplorer] filepizza upload cancelled by user")
+        try:
+            rows = _menu_rows(chat_id, msg_id) if chat_id is not None and msg_id is not None else None
+            await _safe_edit(event, "❌ آپلود به FilePizza لغو شد.", rows)
+        except Exception:
+            pass
+    except _FeError as e:
+        logger.error(f"[FileExplorer] filepizza cb error: {e}")
+        try:
+            rows = _menu_rows(chat_id, msg_id) if chat_id is not None and msg_id is not None else None
+            await _safe_edit(event, f"❌ آپلود به FilePizza ناموفق بود.\n{e}", rows)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[FileExplorer] filepizza cb error: {e}", exc_info=True)
+        try:
+            await event.answer("❌ خطا در آپلود به FilePizza", alert=True)
+        except Exception:
+            pass
+    finally:
+        try:
+            _send_inflight.discard(("fpz", chat_id, msg_id))
+        except Exception:
+            pass
+        try:
+            if abort_token:
+                _ABORT_FLAGS.discard(abort_token)
+        except Exception:
+            pass
+        # ⚠️ اگه سید موفق بود work_dir=None شده (مالکیت با سیدر) — پاک نمی‌کنیم
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+async def fe_filepizza_stop_cb(event):
+    """دکمه ⏹ بستن سیدر FilePizza: fpzstop_<token>"""
+    try:
+        if not _is_authorized(event.sender_id):
+            await event.answer("⛔️ اجازه نداری", alert=True)
+            return
+        token = event.data.decode("utf-8", "ignore").split("_", 1)[1]
+        closed = await _fp_close_seeder(token)
+        if closed:
+            try:
+                await event.edit("🛑 سیدر FilePizza بسته شد — لینک قطع شد و فایل موقت پاک شد.")
+            except Exception:
+                pass
+            try:
+                await event.answer("🛑 سیدر بسته شد")
+            except Exception:
+                pass
+        else:
+            await event.answer("⚠️ سیدر پیدا نشد — شاید قبلاً بسته یا منقضی شده", alert=True)
+    except Exception as e:
+        logger.error(f"[FileExplorer] filepizza stop cb error: {e}", exc_info=True)
+
+
 # ═══════════════════════ ۴) آپلود برای پخش در VLC ═══════════════════════
 async def fe_vlc_cb(event):
     """دکمه 🎬 آپلود برای پخش در VLC: fvlc_<chat_id>_<msg_id>
@@ -3396,6 +3721,9 @@ def register_file_explorer_handlers(
     client.add_event_handler(fe_noop_cb, events.CallbackQuery(pattern=r"^fexnoop$"))
     # آپلود به Filebin
     client.add_event_handler(fe_filebin_cb, events.CallbackQuery(pattern=r"^fbin_-?\d+_\d+$"))
+    # 🍕 آپلود به FilePizza (P2P — سیدر هدلس playwright)
+    client.add_event_handler(fe_filepizza_cb, events.CallbackQuery(pattern=r"^fpz_-?\d+_\d+$"))
+    client.add_event_handler(fe_filepizza_stop_cb, events.CallbackQuery(pattern=r"^fpzstop_[0-9a-f]+$"))
     # آپلود برای پخش در VLC (Litterbox / Pixeldrain)
     client.add_event_handler(fe_vlc_cb, events.CallbackQuery(pattern=r"^fvlc_-?\d+_\d+$"))
     # تغییر نام
