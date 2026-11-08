@@ -76,6 +76,11 @@ from searcher.whoreshub_search import (
     search_whoreshub_multi_page,
     parse_inline_query as parse_wh_inline_query,
 )
+from searcher.xhamster_search import (
+    search_xhamster,
+    search_xhamster_multi_page,
+    parse_inline_query as parse_xh_inline_query,
+)
 import sys as _sys
 import os as _os
 _searcher_imdb_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "searcher", "imdb")
@@ -5140,7 +5145,7 @@ async def start_cmd(event):
         "• `/stopgithub` → Disable GitHub upload\n"
         "• `/setsearch` → Change default inline search engine\n\n"
         "**Inline search:** `@telformatbot hardcore` — searches your default engine\n"
-        "**Override:** `ph:xxx` `xv:xxx` `ep:xxx` `xn:xxx`\n\n"
+        "**Override:** `ph:xxx` `xv:xxx` `ep:xxx` `xn:xxx` `wh:xxx` `xh:xxx` `imd:xxx` `iran:xxx`\n\n"
         "**During download:** ⏸ Pause  •  ❌ Cancel\n"
         "**After download:** 🗜 Compress  •  ✅ Delete",
         parse_mode="markdown",
@@ -14260,7 +14265,7 @@ async def setsearch_cmd(event):
     if event.sender_id not in AUTHORIZED_USERS:
         return await event.reply("⛔ Unauthorized")
     current = get_user_default_search(event.sender_id)
-    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX", "imd": "IMDB", "wh": "WhoresHub"}
+    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX", "imd": "IMDB", "wh": "WhoresHub", "xh": "XHamster"}
     buttons = [
         [Button.inline(f"{'✅ ' if current == k else ''}{v}", f"setsearch_{k}") for k, v in labels.items()]
     ]
@@ -14279,10 +14284,10 @@ async def setsearch_callback(event):
     if not data.startswith("setsearch_"):
         return
     src = data.replace("setsearch_", "")
-    if src not in ("ph", "xv", "ep", "xn", "imd", "wh"):
+    if src not in ("ph", "xv", "ep", "xn", "imd", "wh", "xh"):
         return
     set_user_default_search(user_id, src)
-    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX", "imd": "IMDB", "wh": "WhoresHub"}
+    labels = {"ph": "PornHub", "xv": "XVideos", "ep": "Eporner", "xn": "XNXX", "imd": "IMDB", "wh": "WhoresHub", "xh": "XHamster"}
     buttons = [
         [Button.inline(f"{'✅ ' if src == k else ''}{v}", f"setsearch_{k}") for k, v in labels.items()]
     ]
@@ -18079,7 +18084,7 @@ async def xnxx_inline_handler(event):
             await event.answer([], cache_time=5)
             return
 
-        # تشخیص منبع: ph:xxx → PornHub, xv:xxx → XVideos, ep:xxx → Eporner, xn:xxx → XNXX, imd:xxx → IMDB, wh:xxx → WhoresHub
+        # تشخیص منبع: ph:xxx → PornHub, xv:xxx → XVideos, ep:xxx → Eporner, xn:xxx → XNXX, imd:xxx → IMDB, wh:xxx → WhoresHub, xh:xxx → XHamster
         is_ph = raw.lower().startswith("ph:")
         is_xv = raw.lower().startswith("xv:")
         is_ep = raw.lower().startswith("ep:")
@@ -18087,6 +18092,7 @@ async def xnxx_inline_handler(event):
         is_imd = raw.lower().startswith("imd:")
         is_iran = raw.lower().startswith("iran:")
         is_wh = raw.lower().startswith("wh:")
+        is_xh = raw.lower().startswith("xh:")
         if is_ph:
             inner = raw[3:].strip()
             parsed = parse_inline_query(inner)
@@ -18103,6 +18109,9 @@ async def xnxx_inline_handler(event):
         elif is_wh:
             inner = raw[3:].strip()
             parsed = parse_wh_inline_query(inner)
+        elif is_xh:
+            inner = raw[3:].strip()
+            parsed = parse_xh_inline_query(inner)
         elif is_imd:
             inner = raw[4:].strip()
         elif is_iran:
@@ -18132,6 +18141,9 @@ async def xnxx_inline_handler(event):
                 elif default_src == "wh":
                     is_wh = True
                     parsed = parse_wh_inline_query(inner)
+                elif default_src == "xh":
+                    is_xh = True
+                    parsed = parse_xh_inline_query(inner)
             elif iran_srv and iran_srv in ("doostihaa", "farsiland"):
                 # کاربر /server رو روی سرور ایرانی گذاشته
                 is_iran = True
@@ -18155,7 +18167,7 @@ async def xnxx_inline_handler(event):
             page = parsed["page"]
             sort = parsed["sort"]
 
-        source = "IMDB" if is_imd else ("IRAN" if is_iran else ("EP" if is_ep else ("WH" if is_wh else ("XV" if is_xv else ("PH" if is_ph else "XNXX")))))
+        source = "IMDB" if is_imd else ("IRAN" if is_iran else ("EP" if is_ep else ("WH" if is_wh else ("XH" if is_xh else ("XV" if is_xv else ("PH" if is_ph else "XNXX"))))))
         logger.info(f"[INLINE] {source}: q='{query}' page={page} sort={sort}")
 
         iran_inline_entries: list = []  # 🆕 z23 — فقط برای سرچر IMDB پر می‌شه
@@ -18211,6 +18223,15 @@ async def xnxx_inline_handler(event):
                 )
             else:
                 results = await search_whoreshub(
+                    query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
+                )
+        elif is_xh:
+            if page == 0:
+                results = await search_xhamster_multi_page(
+                    query, pages=3, limit=INLINE_RESULTS_LIMIT, sort=sort
+                )
+            else:
+                results = await search_xhamster(
                     query, page=page, limit=INLINE_RESULTS_LIMIT, sort=sort
                 )
         else:  # XNXX
@@ -18463,6 +18484,10 @@ async def xnxx_inline_handler(event):
                 quality = video.get("quality", "")
                 hd_tag = ""
                 source_tag = "WH"
+            elif is_xh:
+                quality = video.get("quality", "")
+                hd_tag = ""
+                source_tag = "XH"
             else:
                 quality = video.get("quality", "")
                 hd_tag = ""
