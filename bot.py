@@ -18651,7 +18651,8 @@ async def ytdlp_quality_callback(event):
 
     try:
         success, error, size = await download_with_ytdlp(
-            entry["url"], chosen["format_id"], filepath, progress_cb
+            entry["url"], chosen["format_id"], filepath, progress_cb,
+            height=chosen.get("height") or 0,
         )
         if active_downloads.get(dl_id, {}).get("cancelled"):
             raise asyncio.CancelledError("Download cancelled by user")

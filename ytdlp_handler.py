@@ -230,11 +230,30 @@ async def download_with_ytdlp(
     format_id: str,
     filepath: str,
     progress_cb,
+    height: int = 0,
 ) -> Tuple[bool, str, int]:
-    """Download video using yt-dlp with the selected format."""
+    """Download video using yt-dlp with the selected format.
+
+    height: اگه مشخص باشه، انتخاب فرمت height-محور انجام می‌شه. format_idهای
+    بعضی سایت‌ها (مثل XHamster) از tbr ساخته می‌شن و در هر درخواست عوض می‌شن،
+    پس مچ‌کردن id قابل اعتماد نیست. ضمناً bestaudio وقتی هیچ فرمت audio-only
+    وجود نداره مچ نمی‌شه و عبارت کامل به /best (بالاترین کیفیت) برمی‌گرده —
+    همون باگی که باعث می‌شد فارغ از انتخاب کاربر، بالاترین کیفیت دانلود بشه.
+    """
     await progress_cb("📥 **در حال دانلود با yt-dlp (32x Multi-Segment)...**")
     try:
-        format_spec = f"{format_id}+bestaudio/best"
+        if height:
+            # انتخاب height-محور: پایدارترین معیار بین درخواست‌ها؛
+            # bestvideo اگه فرمت video-only + صدا موجود باشه merge می‌شه،
+            # وگرنه best (ترجیحاً muxed با صدا) در همون height انتخاب می‌شه.
+            format_spec = (
+                f"bestvideo[height<={height}]+bestaudio/"
+                f"best[height<={height}]/"
+                f"bestvideo+bestaudio/best"
+            )
+        else:
+            # مسیر قدیمی + exact-id قبل از best (به‌جای پرش مستقیم به بالاترین)
+            format_spec = f"{format_id}+bestaudio/{format_id}/best"
         cmd = [
             "yt-dlp",
             "--no-warnings",
