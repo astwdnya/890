@@ -48,23 +48,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir yt-dlp[default,curl-cffi] && \
     playwright install chromium --with-deps
 
-# کپی کد ربات
-COPY bot.py .
-COPY file_explorer_handler.py .
-COPY file_server.py .
-COPY FastTelethon.py .
-COPY github.py .
-COPY savep_handler.py .
-COPY snapwc_handler.py .
-COPY y2mate.py .
-COPY youtube_extractor.py .
-COPY yt_direct_handler.py .
-COPY happyscribe_subtitle.py .
-COPY xnxx_handler.py .
-COPY ytdlp_handler.py .
-COPY subtitle_extractor.py .
-COPY telegram_subtitle_handler.py .
-COPY uplod_ir_handler.py .
+# کپی کد ربات — همه‌ی ماژول‌های روت (yt_intermediary.py و بقیه)
+# با *.py بیلد در برابر اضافه/حذف شدن فایل‌ها نمی‌شکنه
+COPY *.py .
 COPY otherwebsiteshandler/ otherwebsiteshandler/
 COPY searcher/ searcher/
 
