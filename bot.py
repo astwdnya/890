@@ -7295,8 +7295,8 @@ YOUTUBE_RE = re.compile(r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com|youtu\.be)
 # ═══════════════ یوتیوب از طریق واسط (clipto formats + byte cascade) ═══════════════
 # لیست فرمت‌ها: clipto — دقیقاً فرمت‌های واقعی ویدیو (بدون هاردکد)
 # متادیتا: clipto + پروکسی Data API (mattw)
-# بایت‌ها: کسکید واسطه‌های دانلود (y2mate AJAX → savetube) — CDN واسطه،
-# هرگز اتصال مستقیم به یوتیوب. cobalt کلاً حذف شد.
+# بایت‌ها: موتور loader.to روی p.savenow.to (PoW + Bearer + progress) —
+# CDN واسطه، هرگز اتصال مستقیم به یوتیوب. cobalt/y2mate/savetube حذف شدن.
 
 ytvia_sessions: Dict[str, dict] = {}  # session_id → {meta, ordered, url, chat_id, ts, thumb_path}
 YTVIA_TTL = 3600  # عمر منوی انتخاب فرمت (ثانیه)
@@ -7509,6 +7509,8 @@ async def ytvia_pick_callback(event):
         await safe_edit(status_msg, f"⏬ دانلود از CDN واسطه...\n{kind} {title[:70]}")
         os.makedirs(OUTPUT_FOLDER, exist_ok=True)
         ext = want.get("ext") or ("mp4" if want["kind"] == "video" else "m4a")
+        if want["kind"] == "audio" and ext not in ("m4a", "mp3"):
+            ext = "mp3"   # واسطه‌ی بایت (loader.to) فقط m4a/mp3 تحویل می‌ده
         qtag = want["quality"]
         filepath = os.path.join(
             OUTPUT_FOLDER, f"yt_{_ytvia_sanitize(title)}_{qtag}.{ext}"

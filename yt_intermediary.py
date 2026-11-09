@@ -7,11 +7,15 @@
     همون چیزیه که واقعاً روی ویدیوئه — هیچ لیست هاردکدی وجود نداره.
 - متادیتای تکمیلی (دیسکریپشن/بازدید/لایک/تاریخ):
     پروکسی YouTube Data API  →  https://ytapi.apps.mattw.io/v3
-- بایت‌های دانلود از طریق سایت واسط (سرور واسطه از یوتیوب می‌گیره،
-    ما فقط از CDN خود واسطه دانلود می‌کنیم) — کسکید:
-    ۱) y2mate AJAX (analyzeV2 → fetchConvert → dlink روی CDN خودش)
-    ۲) savetube (info → download → downloadUrl روی CDN خودش)
-    ارائه‌دهنده‌ی سالم cache می‌شه و دفعه‌های بعد همون استفاده می‌شه.
+- بایت‌های دانلود از طریق موتور loader.to (host API: p.savenow.to —
+    y2mate و savetube و ddownr قدیمیNXDOMAIN شدن و کاملاً مُردن):
+    ۱) PoW:  GET /api/pow/challenge → حل sha256(salt + ":" + nonce) با
+       «difficulty» صفرِ هگز اولیه (چند هزار تلاش، <۱ ثانیه)
+    ۲) POST /api/pow/verify → Bearer token (≈۱۰ دقیقه اعتبار — کش می‌شه)
+    ۳) GET /api/v2/download?format=<q>&url=...&apikey=<کلید عمومی فرانت‌اند>
+    ۴) poll /api/progress?id=... تا success=1 → download_url روی CDN خودش
+       (paulineNN.savenow.to) — نه googlevideo، نه قفل IP → از Railway هم
+       مستقیم قابل دانلوده. (تست زنده: 720p ~۱.۴MB/s، m4a، mp3 ✓)
 
 نکته‌ی شفاف: clipto لینک‌هایش را به IP سرور خودش قفل می‌کند (تست شد، 403
 cross-IP) پس فقط «لیست فرمت/متادیتا» از آن می‌آید؛ بایت‌ها همیشه از
@@ -19,13 +23,16 @@ cross-IP) پس فقط «لیست فرمت/متادیتا» از آن می‌آی
 """
 
 import asyncio
+import hashlib
 import logging
 import re
 import time
 from typing import Dict, List, Optional
+from urllib.parse import quote
 
 import aiohttp
 from aiohttp import ClientTimeout
+from curl_cffi.requests import AsyncSession
 
 logger = logging.getLogger("YtIntermediary")
 
@@ -39,13 +46,23 @@ CLIPTO_API = "https://www.clipto.com/api/youtube"
 META_API = "https://ytapi.apps.mattw.io/v3"
 META_KEY = "foo1"
 
-# ─── ارائه‌دهنده‌های بایت (دانلود پراکسی‌شده) — به ترتیب امتحان ───
-Y2MATE_HOSTS = ["https://www.y2mate.com", "https://y2mate.is", "https://y2mate.pro"]
-SAVETUBE_API = "https://api.savetube.me"
+# ─── ارائه‌دهنده‌ی بایت: موتور loader.to روی p.savenow.to ───
+SAVENOW_BASE = "https://p.savenow.to"
+SAVENOW_KEY = "dfcb6d76f2f6a9894gjkege8a4ab232222"   # کلید عمومی فرانت‌اند loader.to
+SAVENOW_REF = "https://en.loader.to/"
 
 CACHE_TTL = 600            # کش meta/formats (ثانیه)
 _dl_health: Dict[str, float] = {}   # provider name → آخرین موفقیت
 _meta_cache: Dict[str, dict] = {}
+_savenow_tok: Dict[str, object] = {}   # {"token": str, "exp": float}
+_sn_sess: Optional[AsyncSession] = None   # سشن curl_cffi مشترک (فینگرپرینت کروم)
+
+
+def _sn_session() -> AsyncSession:
+    global _sn_sess
+    if _sn_sess is None:
+        _sn_sess = AsyncSession(impersonate="chrome124")
+    return _sn_sess
 
 
 def extract_youtube_id(url: str) -> Optional[str]:
@@ -216,132 +233,136 @@ async def fetch_thumb_bytes(thumb_url: str) -> Optional[bytes]:
         return None
 
 
-# ═══════════════ بایت‌ها: کسکید واسطه‌های دانلود ═══════════════
+# ═══════════════ بایت‌ها: موتور loader.to (p.savenow.to) ═══════════════
 
 
-async def _bytes_via_y2mate(session: aiohttp.ClientSession, video_url: str,
-                            want: dict) -> Optional[str]:
-    """y2mate: analyzeV2 → fetchConvert → dlink روی CDN خود y2mate."""
+def _savenow_fmt(want: dict) -> str:
+    """فرمت savenow: ویدیو → «1080/720/480/360»، صدا → «m4a/mp3»."""
+    if want["kind"] == "audio":
+        return "m4a" if (want.get("ext") or "") == "m4a" else "mp3"
+    h = int(want.get("height") or 360)
+    for q in (1080, 720, 480, 360):
+        if h >= q:
+            return str(q)
+    return "360"
+
+
+async def _savenow_token() -> str:
+    """PoW challenge → حل → verify → Bearer token (با کش تا انقضا).
+
+    مهم: کل فلو با curl_cffi (جعل TLS کروم) می‌ره — سرور به کلاینت‌های
+    با فینگرپرینت پایتون/aiohttp جواب api_key_required/403 می‌ده.
+    """
+    now = time.time()
+    tok = _savenow_tok.get("token")
+    if tok and now < float(_savenow_tok.get("exp") or 0) - 60:
+        return str(tok)
+    s = _sn_session()
+    r = await s.get(
+        SAVENOW_BASE + "/api/pow/challenge",
+        timeout=25, headers={"User-Agent": UA, "Referer": SAVENOW_REF},
+    )
+    ch = r.json()
+    salt = str(ch.get("salt") or "")
+    diff = int(ch.get("difficulty") or 3)
+    prefix = "0" * diff
+
+    def _solve() -> str:
+        n = 0
+        while True:
+            ns = str(n)
+            if hashlib.sha256(f"{salt}:{ns}".encode()).hexdigest().startswith(prefix):
+                return ns
+            n += 1
+
+    nonce = await asyncio.to_thread(_solve)
+    payload = {
+        "salt": ch.get("salt"), "difficulty": ch.get("difficulty"),
+        "expires_at": ch.get("expires_at"), "signature": ch.get("signature"),
+        "nonce": nonce,
+    }
+    r2 = await s.post(
+        SAVENOW_BASE + "/api/pow/verify", json=payload,
+        timeout=25, headers={"User-Agent": UA, "Referer": SAVENOW_REF},
+    )
+    d = r2.json()
+    if not d.get("success") or not d.get("token"):
+        raise RuntimeError(f"pow verify: {str(d)[:100]}")
+    _savenow_tok.clear()
+    _savenow_tok.update({
+        "token": d["token"],
+        "exp": float(d.get("expires_at") or (now + 540)),
+    })
+    return str(d["token"])
+
+
+async def _bytes_via_savenow(video_url: str, want: dict) -> Optional[str]:
+    """loader.to: PoW → v2/download → poll progress → CDN خودش (بدون قید IP)."""
+    tok = await _savenow_token()
+    s = _sn_session()
+    hdr = {"User-Agent": UA, "Referer": SAVENOW_REF, "Authorization": f"Bearer {tok}"}
+    fmt = _savenow_fmt(want)
+    chain = [fmt]
+    if want["kind"] == "video":
+        order = ["1080", "720", "480", "360"]
+        i = order.index(fmt) if fmt in order else len(order) - 1
+        chain = order[i:i + 2]   # کیفیت خواسته + یک پله پایین‌تر به‌عنوان فالبک
     last_err = ""
-    for host in Y2MATE_HOSTS:
+    for f in chain:
         try:
-            async with session.post(
-                f"{host}/mates/analyzeV2/ajax",
-                data={"k_query": video_url, "k_av": "true", "k_mode": "ajax", "k_auto": "0"},
-                timeout=ClientTimeout(total=30),
-                headers={"User-Agent": UA, "X-Requested-With": "XMLHttpRequest",
-                         "Origin": host, "Referer": f"{host}/",
-                         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
-            ) as r:
-                if r.status != 200:
-                    continue
-                d = await r.json(content_type=None)
-            if d.get("status") != "ok":
-                last_err = str(d)[:80]
+            # url باید دقیقاً مثل مرورگر کامل quote بشه — yarl دستکاریش می‌کنه
+            full = (SAVENOW_BASE + "/api/v2/download?format=" + f
+                    + "&url=" + quote(video_url, safe="") + "&apikey=" + SAVENOW_KEY)
+            r = await s.get(full, timeout=45, headers=hdr)
+            d = r.json()
+            if not d.get("success") or not d.get("id"):
+                last_err = f"{f}: {str(d)[:100]}"
                 continue
-            links = d.get("links") or {}
-            best = None
-            for ext, qs in links.items():
-                for q, info in (qs or {}).items():
-                    if not isinstance(info, dict) or not info.get("k_id"):
-                        continue
-                    if want["kind"] == "audio":
-                        if ext in ("mp3", "m4a") and (best is None or ext == "mp3"):
-                            best = info
-                    else:
-                        m = re.match(r"(\d{3,4})p", str(info.get("q") or q))
-                        if m and int(m.group(1)) == int(want.get("height") or 0):
-                            best = info
-                            break
-                if best and want["kind"] == "video":
+            pid = d["id"]
+            deadline = time.time() + (300 if want["kind"] == "video" else 150)
+            while time.time() < deadline:
+                await asyncio.sleep(3)
+                pr = await s.get(
+                    SAVENOW_BASE + "/api/progress?id=" + str(pid),
+                    timeout=25, headers=hdr,
+                )
+                p = pr.json()
+                if p.get("success") == 1 and p.get("download_url"):
+                    dl = str(p["download_url"])
+                    if "googlevideo.com" in dl:   # هرگز مستقیم از یوتیوب
+                        last_err = f"{f}: googlevideo link رد شد"
+                        break
+                    _dl_health["savenow"] = time.time()
+                    return dl
+                if p.get("success") not in (0, 1):
+                    last_err = f"{f}: progress {str(p)[:100]}"
                     break
-            if not best:
-                last_err = "quality not offered by y2mate"
+            else:
+                last_err = f"{f}: timeout progress"
                 continue
-            fd = {"k_id": best["k_id"], "k_token": best.get("k_token", ""),
-                  "k_type": best.get("k", ""), "k_type2": best.get("k", ""),
-                  "k_stream": "", "k_mode": "ajax"}
-            d2 = {}
-            for _ in range(6):  # گاهی processing برمی‌گردونه
-                async with session.post(
-                    f"{host}/mates/fetchConvert/ajax", data=fd,
-                    timeout=ClientTimeout(total=40),
-                    headers={"User-Agent": UA, "X-Requested-With": "XMLHttpRequest",
-                             "Origin": host, "Referer": f"{host}/"},
-                ) as r:
-                    d2 = await r.json(content_type=None)
-                dlink = d2.get("dlink") or ""
-                if d2.get("status") == "ok" and dlink:
-                    if dlink.startswith("/"):
-                        dlink = host + dlink
-                    _dl_health["y2mate"] = time.time()
-                    return dlink
-                await asyncio.sleep(2.5)
-            last_err = f"fetchConvert: {str(d2)[:80]}"
+            if last_err:
+                continue
         except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            continue
-    logger.info(f"[YTVIA] y2mate failed: {last_err}")
+            last_err = f"{f}: {type(e).__name__}: {str(e)[:80]}"
+    logger.info(f"[YTVIA] savenow failed: {last_err}")
     return None
-
-
-async def _bytes_via_savetube(session: aiohttp.ClientSession, video_url: str,
-                              want: dict) -> Optional[str]:
-    """savetube: info → download → downloadUrl روی CDN خودش."""
-    try:
-        q = "audio" if want["kind"] == "audio" else str(want.get("height") or "")
-        async with session.get(
-            SAVETUBE_API + "/info", params={"url": video_url},
-            timeout=ClientTimeout(total=25),
-            headers={"User-Agent": UA, "Accept": "application/json"},
-        ) as r:
-            if r.status != 200:
-                return None
-            d = await r.json(content_type=None)
-        data = d.get("data") or {}
-        avail = data.get("availableQualities") or []
-        if avail and q != "audio":
-            qs = [str(x) for x in avail]
-            h = str(want.get("height") or "")
-            if h not in qs:
-                lowers = [x for x in qs if x.isdigit() and int(x) <= int(h or 0)]
-                if not lowers:
-                    return None
-                q = max(lowers, key=int)
-        async with session.get(
-            SAVETUBE_API + "/download", params={"url": video_url, "quality": q},
-            timeout=ClientTimeout(total=30),
-            headers={"User-Agent": UA, "Accept": "application/json"},
-        ) as r:
-            if r.status != 200:
-                return None
-            d2 = await r.json(content_type=None)
-        dl = ((d2.get("data") or {}).get("downloadUrl")) or ""
-        if dl and "googlevideo.com" not in dl:
-            _dl_health["savetube"] = time.time()
-            return dl
-        return None
-    except Exception as e:
-        logger.info(f"[YTVIA] savetube failed: {type(e).__name__}: {e}")
-        return None
 
 
 async def get_download_url(video_url: str, want: dict) -> str:
     """لینک دانلود از واسطه — هرگز googlevideo مستقیم. خطا → RuntimeError."""
-    order = ["y2mate", "savetube"]
+    order = ["savenow"]
     order.sort(key=lambda n: -_dl_health.get(n, 0))
-    providers = {"y2mate": _bytes_via_y2mate, "savetube": _bytes_via_savetube}
+    providers = {"savenow": _bytes_via_savenow}
     errs = []
-    async with aiohttp.ClientSession() as s:
-        for name in order:
-            try:
-                url = await providers[name](s, video_url, want)
-            except Exception as e:
-                url = None
-                errs.append(f"{name}: {type(e).__name__}")
-            if url:
-                return url
-            errs.append(name)
+    for name in order:
+        try:
+            url = await providers[name](video_url, want)
+        except Exception as e:
+            url = None
+            errs.append(f"{name}: {type(e).__name__}")
+        if url:
+            return url
+        errs.append(name)
     raise RuntimeError(
-        "واسطه‌های دانلود (y2mate/savetube) به این کیفیت جواب ندادن: " + "; ".join(errs[:2])
+        "واسطه‌ی دانلود (loader.to) به این کیفیت جواب نداد: " + "; ".join(errs[:2])
     )
