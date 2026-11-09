@@ -15,7 +15,7 @@ import json
 import shutil
 import uuid
 from urllib.parse import quote
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Callable
 
 from flask import Flask
 from threading import Thread
@@ -17507,7 +17507,7 @@ async def comic_page_callback(event):
 
     comics = state.get("comics", [])
     site_key = state.get("site_key", "")
-    site_name = SITES.get(site_key, {}).get("display_name", "Comic") if site_key else "Comic"
+    site_name = COMIC_SITES.get(site_key, {}).get("display_name", "Comic") if site_key else "Comic"
 
     buttons = _build_comic_search_buttons(session_id, comics, offset)
     page_num = offset // 20 + 1
