@@ -2951,6 +2951,7 @@ async def send_file_with_progress(
     thumb_filepath: str = None,
     ul_id: str = None,
     force_document: bool = False,
+    force_audio: bool = False,
 ):
     file_size = os.path.getsize(filepath)
     start_time = time.time()
@@ -2964,8 +2965,18 @@ async def send_file_with_progress(
             active_uploads[ul_id] = {"paused": False, "cancelled": False}
 
     duration, width, height = await get_video_info(filepath)
-    is_video = duration is not None and duration > 0 and width > 0 and height > 0
-    is_audio = ext in (".mp3", ".m4a", ".ogg", ".wav", ".flac", ".aac", ".wma", ".opus")
+    is_audio = force_audio or ext in (
+        ".mp3", ".m4a", ".ogg", ".wav", ".flac", ".aac", ".wma", ".opus"
+    )
+    # m4a با کاور داخلی، تو ffprobe یه استریم ویدیو (کاور) گزارش می‌کنه؛
+    # فایل صوتی باید همیشه به‌شکل موزیک تلگرام بره، نه ویدیو
+    is_video = (
+        not is_audio
+        and duration is not None
+        and duration > 0
+        and width > 0
+        and height > 0
+    )
 
     # ---- Preprocessing ----
     orig_filepath = filepath
@@ -7537,6 +7548,7 @@ async def ytvia_pick_callback(event):
             status_msg,
             supports_streaming=(want["kind"] == "video"),
             thumb_filepath=sess.get("thumb_path") or None,
+            force_audio=(want["kind"] == "audio"),
         )
         try:
             os.remove(got_path)
