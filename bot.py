@@ -7431,7 +7431,7 @@ async def process_ytvia_request(event, url: str, status_msg):
 
     try:
         if thumb_path and os.path.exists(thumb_path):
-            await event.client.send_file(
+            menu_msg = await event.client.send_file(
                 event.chat_id,
                 thumb_path,
                 caption=caption,
@@ -7440,10 +7440,11 @@ async def process_ytvia_request(event, url: str, status_msg):
                 force_document=False,
             )
         else:
-            await event.client.send_message(
+            menu_msg = await event.client.send_message(
                 event.chat_id, caption, buttons=buttons, parse_mode="markdown",
                 link_preview=False,
             )
+        ytvia_sessions[session_id]["menu_msg"] = menu_msg
         await status_msg.delete()
     except Exception as e:
         logger.warning(f"[YTVIA] menu send failed: {e}")
@@ -7545,6 +7546,12 @@ async def ytvia_pick_callback(event):
             await status_msg.delete()
         except Exception:
             pass
+        menu_msg = sess.get("menu_msg")
+        if menu_msg is not None:
+            try:
+                await menu_msg.delete()
+            except Exception:
+                pass
     except Exception as e:
         logger.warning(f"[YTVIA] pick failed: {e}")
         try:
