@@ -257,6 +257,8 @@ from otherwebsiteshandler.rule34_handler import (
 from otherwebsiteshandler.pornhub_handler import (
     is_pornhub_url as is_pornhub_handler_url,
     extract_pornhub_qualities,
+    fetch_video_thumbs,
+    cleanup_thumb_files,
     download_pornhub_video,
     pornhub_sessions,
 )
@@ -10106,16 +10108,32 @@ async def xnxx_cancel_callback(event):
 
 
 async def process_pornhub_request(event, url: str, status_msg):
-    qualities, title = await extract_pornhub_qualities(url)
+    qualities, title, thumb_url = await extract_pornhub_qualities(url)
     if not qualities:
         await safe_edit(status_msg, "❌ کیفیتی پیدا نشد. لینک رو چک کن.")
         return
     session_id = f"pornhub_{event.chat_id}_{event.id}_{int(time.time())}"
+
+    # تامبنیل ویدیو: عکس باکیفیت تو چت + نسخه کوچیک برای تامبنیل فایل آپلودی
+    thumb_assets = None
+    if thumb_url:
+        try:
+            thumb_assets = await asyncio.wait_for(
+                fetch_video_thumbs(thumb_url, OUTPUT_FOLDER), timeout=25
+            )
+            if thumb_assets and thumb_assets[0]:
+                await event.client.send_file(event.chat_id, thumb_assets[0])
+        except Exception as e:
+            logger.warning(f"[PH] thumb failed: {e}")
+            cleanup_thumb_files(thumb_assets)
+            thumb_assets = None
+
     pornhub_sessions[session_id] = {
         "url": url,
         "title": title,
         "qualities": qualities,
         "chat_id": event.chat_id,
+        "thumb_assets": thumb_assets,
     }
     title_display = title[:60] if title else "ویدیو PornHub"
     text = f"🎬 **{title_display}**\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
@@ -10189,6 +10207,7 @@ async def pornhub_quality_callback(event):
             status_msg=status_msg,
             buttons=None,
             supports_streaming=True,
+            thumb_filepath=(entry.get("thumb_assets") or (None, None))[1],
             ul_id=ul_id,
         )
     except asyncio.CancelledError:
@@ -10201,6 +10220,7 @@ async def pornhub_quality_callback(event):
         await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
     finally:
         active_downloads.pop(dl_id, None)
+        cleanup_thumb_files(entry.get("thumb_assets"))
         try:
             if filepath and os.path.exists(filepath):
                 os.remove(filepath)
@@ -10211,7 +10231,9 @@ async def pornhub_quality_callback(event):
 async def pornhub_cancel_callback(event):
     data = event.data.decode()
     session_id = data.replace("pornhub_cancel_", "")
-    pornhub_sessions.pop(session_id, None)
+    entry = pornhub_sessions.pop(session_id, None)
+    if entry:
+        cleanup_thumb_files(entry.get("thumb_assets"))
     await event.answer("❌ لغو شد", alert=False)
     try:
         await event.edit("❌ **لغو شد.**", buttons=None)
