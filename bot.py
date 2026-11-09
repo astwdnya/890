@@ -10113,20 +10113,42 @@ async def process_pornhub_request(event, url: str, status_msg):
         await safe_edit(status_msg, "❌ کیفیتی پیدا نشد. لینک رو چک کن.")
         return
     session_id = f"pornhub_{event.chat_id}_{event.id}_{int(time.time())}"
+    title_display = title[:60] if title else "ویدیو PornHub"
+    text = f"🎬 **{title_display}**\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
+    buttons = []
+    for i, q in enumerate(qualities):
+        buttons.append([Button.inline(q["label"], f"pornhub_q_{session_id}_{i}")])
+    buttons.append([Button.inline("❌ لغو", f"pornhub_cancel_{session_id}")])
 
-    # تامبنیل ویدیو: عکس باکیفیت تو چت + نسخه کوچیک برای تامبنیل فایل آپلودی
+    # تامبنیل ویدیو: عکس و منوی کیفیت تو «یک پیام» (عکس با کپشن + دکمه‌ها)
+    # + نسخه کوچیک عکس برای تامبنیل فایل آپلودی
     thumb_assets = None
+    menu_sent = False
     if thumb_url:
         try:
             thumb_assets = await asyncio.wait_for(
                 fetch_video_thumbs(thumb_url, OUTPUT_FOLDER), timeout=25
             )
             if thumb_assets and thumb_assets[0]:
-                await event.client.send_file(event.chat_id, thumb_assets[0])
+                await event.client.send_file(
+                    event.chat_id,
+                    thumb_assets[0],
+                    caption=text,
+                    buttons=buttons,
+                )
+                menu_sent = True
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning(f"[PH] thumb failed: {e}")
             cleanup_thumb_files(thumb_assets)
             thumb_assets = None
+
+    if not menu_sent:
+        # بدون عکس: منوی متنی مثل قبل
+        await safe_edit(status_msg, text, buttons=buttons)
 
     pornhub_sessions[session_id] = {
         "url": url,
@@ -10135,13 +10157,6 @@ async def process_pornhub_request(event, url: str, status_msg):
         "chat_id": event.chat_id,
         "thumb_assets": thumb_assets,
     }
-    title_display = title[:60] if title else "ویدیو PornHub"
-    text = f"🎬 **{title_display}**\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
-    buttons = []
-    for i, q in enumerate(qualities):
-        buttons.append([Button.inline(q["label"], f"pornhub_q_{session_id}_{i}")])
-    buttons.append([Button.inline("❌ لغو", f"pornhub_cancel_{session_id}")])
-    await safe_edit(status_msg, text, buttons=buttons)
 
 
 async def pornhub_quality_callback(event):
