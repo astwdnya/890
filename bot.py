@@ -52,6 +52,13 @@ from github import (
 from savep_handler import process_savep_request, trigger_savep_cancel
 # File Explorer + Rename — واکنش به داکیومنت‌ها (zip/apk/rar/7z/...) با ۲ دکمه شیشه‌ای
 from file_explorer_handler import register_file_explorer_handlers, upload_file_via_chain
+# صف سراسری دانلود/آپلود — هر لحظه فقط یه کاربر دانلود+آپلود داره، بقیه تو صف
+from download_queue import (
+    AlreadyInQueueError,
+    DownloadQueue,
+    QueueCancelledError,
+    ACTIVE_STALL_SECONDS,
+)
 # YouTube direct download (InnerTube ANDROID_VR + cobalt fallback — RE'd)
 from yt_direct_handler import (
     is_youtube_url as is_ytdirect_url,
@@ -713,6 +720,114 @@ user_state: Dict[int, Dict] = {}
 admin_pending_add: Dict[int, bool] = {}
 active_downloads: Dict[str, Dict] = {}
 active_uploads: Dict[str, Dict] = {}
+
+
+# ═══════════════ صف سراسری دانلود/آپلود ═══════════════
+# قاعده: هر لحظه فقط «یک» کاربر دانلود+آپلود کامل داره. بقیه پیام
+# «تو صف هستی — نفر N» می‌گیرن و موقعیت‌شون زنده آپدیت می‌شه؛ به‌محض
+# تموم شدن کار فعال (آپلود کامل ویدیو)، نفر بعدی FIFO نوبتش می‌رسه.
+dl_queue = DownloadQueue()
+
+
+def _fa_digits(n) -> str:
+    """عدد لاتین → رقم فارسی (برای نمایش موقعیت صف)."""
+    return str(n).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+
+
+async def dlq_take_ticket(event, dl_id: Optional[str], title: str = ""):
+    """بلیت صف سراسری — بلافاصله قبل از شروع هر دانلود/آپلود.
+
+    - نوبت فوری بود → job برمی‌گرده (بدون هیچ پیام اضافه).
+    - صف شلوغ بود → پیام «🕒 تو صف هستی — نفر N» می‌فرسته و موقعیت رو
+      زنده آپدیت می‌کنه (هر بار کسی جلوتر تموم/لغو بشه)؛ اگه کاربر
+      «🚫 لغو نوبت» بزنه → پیام لغو و None.
+    - dl_id داده بشه، آزادسازی خودکاره: وقتی فلو خودش dl_id رو از
+      active_downloads حذف کرد (پایان دانلود/آپلود در finally)، نفر
+      بعدی grant می‌شه. dl_id=None → caller خودش dl_queue.done(job)
+      صدا می‌زنه.
+    """
+    job = None
+    q_msg = None
+
+    async def _pos_cb(j, pos):
+        nonlocal q_msg
+        try:
+            if pos <= 1:
+                if q_msg:
+                    try:
+                        await q_msg.delete()
+                    except Exception:
+                        pass
+                    q_msg = None
+                return
+            txt = f"🕒 تو صف هستی — **نفر {_fa_digits(pos)}**"
+            _at = dl_queue.active_title()
+            if _at:
+                txt += f"\n⏬ کار فعال: `{_at[:60]}`"
+            _btns = [[Button.inline("🚫 لغو نوبت", f"dlqcancel_{j.id}")]]
+            if q_msg:
+                try:
+                    await q_msg.edit(txt, parse_mode="markdown", buttons=_btns)
+                except Exception:
+                    pass
+            else:
+                q_msg = await event.client.send_message(
+                    event.chat_id, txt, parse_mode="markdown", buttons=_btns
+                )
+        except Exception:
+            pass
+
+    try:
+        job = await dl_queue.join(
+            event.sender_id, title=str(title or "")[:60], on_position=_pos_cb
+        )
+    except AlreadyInQueueError:
+        try:
+            await event.client.send_message(
+                event.chat_id,
+                "⚠️ یه درخواست فعال تو صف/دانلود داری. اول همون تموم شه.",
+            )
+        except Exception:
+            pass
+        return None
+
+    dl_queue.stall_check()
+
+    if not job.turn_ready:
+        try:
+            await dl_queue.wait(job)
+        except QueueCancelledError:
+            if q_msg:
+                try:
+                    await q_msg.edit("🚫 **نوبت لغو شد.**", buttons=None)
+                except Exception:
+                    pass
+            return None
+
+    if dl_id:
+        async def _release_watch():
+            # پایان کار فعال = حذف dl_id از رجیستری‌ها (فلو خودش تو finally پاک می‌کنه)
+            while (dl_id in active_downloads) or (dl_id in erome_active_downloads):
+                if time.time() - job.since > ACTIVE_STALL_SECONDS + 120:
+                    logger.error("[DLQ] dl_id=%s stuck >6h — force release", dl_id[:28])
+                    break
+                await asyncio.sleep(2)
+            dl_queue.done(job)
+
+        asyncio.ensure_future(_release_watch())
+
+    return job
+
+
+async def dlq_cancel_callback(event):
+    """دکمه‌ی «🚫 لغو نوبت» — حذف کاربر از صف دانلود."""
+    job_id = event.data.decode().replace("dlqcancel_", "", 1)
+    if dl_queue.leave(job_id):
+        await event.answer("🚫 نوبتت لغو شد", alert=False)
+    else:
+        await event.answer("⏰ دیگه تو صف نیستی", alert=True)
+
+
 pdfimg_sessions: Dict[str, Dict] = {}  # نگه‌داری مسیر عکس‌ها برای send all
 comictr_sessions: Dict[str, Dict] = {}  # ترجمه کامیک PDF (مسیر فایل + chat_id)
 snapwc_sessions: Dict[str, SnapWCSession] = {}  # SnapWC session references
@@ -2942,6 +3057,10 @@ async def do_download_and_send(
 ) -> bool:
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
 
     filepath, dl_error, final_size = await download_with_controls(
         direct_url, status_msg, dl_id, referer=source_url, extra_headers=extra_headers
@@ -5671,6 +5790,10 @@ async def generic_url_handler(event):
 
             dl_id = f"dc_{event.chat_id}_{event.id}_{int(time.time())}"
             active_downloads[dl_id] = {"paused": False, "cancelled": False}
+            _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+            if _qjob is None:
+                active_downloads.pop(dl_id, None)
+                return
 
             video_path = await diycraft_download(
                 video_url, out_dir,
@@ -6736,6 +6859,10 @@ async def generic_url_handler(event):
     )
     dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     status_msg = await event.reply("⏬ Downloading...")
     try:
         filepath, error, size = await download_with_controls(
@@ -7138,6 +7265,10 @@ async def process_y2mate_request(event, url: str, status_msg):
         extra_ext = ".mp3" if is_audio else ".mp4"
         dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
         active_downloads[dl_id] = {"paused": False, "cancelled": False}
+        _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+        if _qjob is None:
+            active_downloads.pop(dl_id, None)
+            return
         filepath, dl_error, final_size = await download_with_controls(
             dl_url,
             status_msg,
@@ -9487,15 +9618,27 @@ async def snapwc_select_callback(event):
                     event.chat_id, "✅ File downloaded via browser! Uploading..."
                 )
                 caption_start = f"🎬 {title}" if title else "📄 **SnapWC Download**"
-                await send_file_with_progress(
-                    client=event.client,
-                    chat_id=event.chat_id,
-                    filepath=filepath,
-                    caption=(
-                        f"{caption_start}\n📦 Size: {human_readable_size(file_size)}"
-                    ),
-                    status_msg=status_msg,
-                )
+                # 🆕 صف سراسری: آپلود هم نوبتی می‌شه (خودم done رو صدا می‌زنم)
+                _qjob = await dlq_take_ticket(event, None, str(title or "SnapWC"))
+                if _qjob is None:
+                    try:
+                        os.remove(filepath)
+                    except Exception:
+                        pass
+                    user_state.pop(event.chat_id, None)
+                    return
+                try:
+                    await send_file_with_progress(
+                        client=event.client,
+                        chat_id=event.chat_id,
+                        filepath=filepath,
+                        caption=(
+                            f"{caption_start}\n📦 Size: {human_readable_size(file_size)}"
+                        ),
+                        status_msg=status_msg,
+                    )
+                finally:
+                    dl_queue.done(_qjob)
                 try:
                     os.remove(filepath)
                 except Exception:
@@ -9787,6 +9930,10 @@ async def y2mate_quality_callback(event):
         is_audio = q.get("format") == "mp3" or "kbps" in q.get("label", "").lower()
         dl_id = f"dl_{event.chat_id}_{event.id}_{int(time.time())}"
         active_downloads[dl_id] = {"paused": False, "cancelled": False}
+        _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+        if _qjob is None:
+            active_downloads.pop(dl_id, None)
+            return
         filepath, dl_error, final_size = await download_with_controls(
             dl_url,
             status_msg,
@@ -10073,6 +10220,10 @@ async def xnxx_quality_callback(event):
     filepath = os.path.join(OUTPUT_FOLDER, filename)
     dl_id = f"xnxx_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -10209,6 +10360,10 @@ async def pornhub_quality_callback(event):
 
     dl_id = f"pornhub_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -10333,6 +10488,10 @@ async def cartoonporn_quality_callback(event):
 
     dl_id = f"cp_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -10468,6 +10627,10 @@ async def cartoonprn_quality_callback(event):
 
     dl_id = f"cprn_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -10603,6 +10766,10 @@ async def pornhex_quality_callback(event):
 
     dl_id = f"phx_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -10817,6 +10984,10 @@ async def rule34video_quality_callback(event):
 
     dl_id = f"r34v_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -10953,6 +11124,10 @@ async def xanimu_quality_callback(event):
 
     dl_id = f"xa_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -11084,6 +11259,10 @@ async def porntrex_quality_callback(event):
 
     dl_id = f"pt_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -11215,6 +11394,10 @@ async def heavyr_quality_callback(event):
 
     dl_id = f"hr_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -11346,6 +11529,10 @@ async def wonporn_quality_callback(event):
 
     dl_id = f"wp_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -11477,6 +11664,10 @@ async def leaksextape_quality_callback(event):
 
     dl_id = f"ls_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -11608,6 +11799,10 @@ async def xxxpublicpornvideos_quality_callback(event):
 
     dl_id = f"xp_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -11739,6 +11934,10 @@ async def cartoonporncom_quality_callback(event):
 
     dl_id = f"cc_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -11870,6 +12069,10 @@ async def hihentaiporn_quality_callback(event):
 
     dl_id = f"hh_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -12001,6 +12204,10 @@ async def fetishshrine_quality_callback(event):
 
     dl_id = f"fs_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -12132,6 +12339,10 @@ async def bigfuck_quality_callback(event):
 
     dl_id = f"bf_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -12263,6 +12474,10 @@ async def babestube_quality_callback(event):
 
     dl_id = f"bb_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -12394,6 +12609,10 @@ async def pornwhite_quality_callback(event):
 
     dl_id = f"pw_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -12527,6 +12746,10 @@ async def porndroids_quality_callback(event):
 
     dl_id = f"pd_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -12660,6 +12883,10 @@ async def hdtube_quality_callback(event):
 
     dl_id = f"hd_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -12793,6 +13020,10 @@ async def sleazyneasy_quality_callback(event):
 
     dl_id = f"sn_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -12926,6 +13157,10 @@ async def shameless_quality_callback(event):
 
     dl_id = f"sl_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -13059,6 +13294,10 @@ async def hqporner_quality_callback(event):
 
     dl_id = f"hq_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -13192,6 +13431,10 @@ async def youjizz_quality_callback(event):
 
     dl_id = f"yj_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -13325,6 +13568,10 @@ async def severeporn_quality_callback(event):
 
     dl_id = f"sp_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -13458,6 +13705,10 @@ async def mat6tube_quality_callback(event):
 
     dl_id = f"m6_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -13591,6 +13842,10 @@ async def peekvids_quality_callback(event):
 
     dl_id = f"pv_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -13724,6 +13979,10 @@ async def paradisehill_quality_callback(event):
 
     dl_id = f"ph_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -13857,6 +14116,10 @@ async def sxyprn_quality_callback(event):
 
     dl_id = f"sx_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -13986,6 +14249,10 @@ async def kick_quality_callback(event):
 
     dl_id = f"kc_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -14134,6 +14401,10 @@ async def luxuretv_quality_callback(event):
 
     dl_id = f"lx_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -14530,15 +14801,20 @@ def _imdb_server_buttons(servers: list, quality_label: str, is_episode: bool, ex
     return buttons
 
 
-def _imdb_dest_buttons() -> list:
-    """🆕 دکمه‌های مقصد خروجی — تلگرام یا حافظه‌ی ابری سرورمون."""
-    return [
-        [Button.inline("📨 ارسال همینجا (تلگرام)", "imd_dest_tg")],
-        [Button.inline("☁️ حافظه‌ی ابری سرورمون (لینک مستقیم)", "imd_dest_cloud")],
-        [Button.inline("🐱 لیترباکس (لینک ۷۲ ساعته)", "imd_dest_lb")],
-        [Button.inline("📦 کت‌باکس (لینک دائمی)", "imd_dest_cb")],
-        [Button.inline("🚫 بستن", "imd_close")],
-    ]
+def _imdb_dest_buttons(is_main_admin: bool = False) -> list:
+    """🆕 دکمه‌های مقصد خروجی — تلگرام یا حافظه‌ی ابری سرورمون.
+
+    🆕 گیت دسترسی: گزینه‌ی «حافظه‌ی ابری سرورمون» فقط برای ادمین اصلی
+    نمایش داده می‌شه؛ ادمین‌های عادی فقط تلگرام/لیترباکس/کت‌باکس."""
+    buttons = [[Button.inline("📨 ارسال همینجا (تلگرام)", "imd_dest_tg")]]
+    if is_main_admin:
+        buttons.append(
+            [Button.inline("☁️ حافظه‌ی ابری سرورمون (لینک مستقیم)", "imd_dest_cloud")]
+        )
+    buttons.append([Button.inline("🐱 لیترباکس (لینک ۷۲ ساعته)", "imd_dest_lb")])
+    buttons.append([Button.inline("📦 کت‌باکس (لینک دائمی)", "imd_dest_cb")])
+    buttons.append([Button.inline("🚫 بستن", "imd_close")])
+    return buttons
 
 
 def _imdb_sub_buttons(subs: list, is_episode: bool, fsubs: list = None,
@@ -14817,6 +15093,10 @@ async def _imdb_iran_inline_download(event, user_id, url, quality_label, server_
     os.makedirs(out_dir, exist_ok=True)
     dl_id = f"iran_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
     video_path = None
     status_msg = None
@@ -15119,6 +15399,13 @@ async def imdb_cb_dest(event):
         return
     pending = state.get("pending") or {"with_subtitle": False, "softsub": None}
     if data.endswith("cloud"):
+        # 🆕 گیت دسترسی: آپلود روی «سرور خودمون» فقط ادمین اصلی
+        if user_id != ADMIN_ID:
+            await event.answer(
+                "⛔ آپلود روی سرور خودمون فقط برای ادمین اصلیه. از تلگرام/لیترباکس/کت‌باکس استفاده کن.",
+                alert=True,
+            )
+            return
         state["delivery"] = "cloud"
     elif data.endswith("lb"):
         state["delivery"] = "lb"      # 🆕 لیترباکس مستقیم
@@ -15184,7 +15471,7 @@ async def imdb_cb_sub(event):
         state["pending"] = {"with_subtitle": True, "softsub": None}
         await event.edit(
             "✅ زیرنویس: imdbplay (softsub)\n\n📬 خروجی کجا بفرستم؟",
-            buttons=_imdb_dest_buttons(),
+            buttons=_imdb_dest_buttons(event.sender_id == ADMIN_ID),
             parse_mode="md",
         )
     elif data == "imd_softsub":
@@ -15193,7 +15480,7 @@ async def imdb_cb_sub(event):
         state["pending"] = {"with_subtitle": True, "softsub": True}
         await event.edit(
             "✅ نحوه‌ی زیرنویس: softsub\n\n📬 خروجی کجا بفرستم؟",
-            buttons=_imdb_dest_buttons(),
+            buttons=_imdb_dest_buttons(event.sender_id == ADMIN_ID),
             parse_mode="md",
         )
     elif data == "imd_sepsub":
@@ -15202,7 +15489,7 @@ async def imdb_cb_sub(event):
         state["pending"] = {"with_subtitle": True, "softsub": False}
         await event.edit(
             "✅ نحوه‌ی زیرنویس: فایل جداگانه\n\n📬 خروجی کجا بفرستم؟",
-            buttons=_imdb_dest_buttons(),
+            buttons=_imdb_dest_buttons(event.sender_id == ADMIN_ID),
             parse_mode="md",
         )
     else:
@@ -15240,21 +15527,21 @@ async def imdb_cb_esub(event):
         state["pending"] = {"with_subtitle": True, "softsub": None}
         await event.edit(
             "✅ زیرنویس: imdbplay (softsub)\n\n📬 خروجی کجا بفرستم؟",
-            buttons=_imdb_dest_buttons(),
+            buttons=_imdb_dest_buttons(event.sender_id == ADMIN_ID),
             parse_mode="md",
         )
     elif data == "imd_softsub":
         state["pending"] = {"with_subtitle": True, "softsub": True}
         await event.edit(
             "✅ نحوه‌ی زیرنویس: softsub\n\n📬 خروجی کجا بفرستم؟",
-            buttons=_imdb_dest_buttons(),
+            buttons=_imdb_dest_buttons(event.sender_id == ADMIN_ID),
             parse_mode="md",
         )
     elif data == "imd_sepsub":
         state["pending"] = {"with_subtitle": True, "softsub": False}
         await event.edit(
             "✅ نحوه‌ی زیرنویس: فایل جداگانه\n\n📬 خروجی کجا بفرستم؟",
-            buttons=_imdb_dest_buttons(),
+            buttons=_imdb_dest_buttons(event.sender_id == ADMIN_ID),
             parse_mode="md",
         )
     else:
@@ -15352,7 +15639,7 @@ async def imdb_cb_nosub(event):
         return
     # 🆕 بدون زیرنویس → انتخاب مقصد خروجی
     state["pending"] = {"with_subtitle": False, "softsub": None}
-    await event.edit("⏭ بدون زیرنویس\n\n📬 خروجی کجا بفرستم؟", buttons=_imdb_dest_buttons())
+    await event.edit("⏭ بدون زیرنویس\n\n📬 خروجی کجا بفرستم؟", buttons=_imdb_dest_buttons(event.sender_id == ADMIN_ID))
 
 
 async def imdb_cb_enosub(event):
@@ -15363,7 +15650,7 @@ async def imdb_cb_enosub(event):
         return
     # 🆕 بدون زیرنویس → انتخاب مقصد خروجی
     state["pending"] = {"with_subtitle": False, "softsub": None}
-    await event.edit("⏭ بدون زیرنویس\n\n📬 خروجی کجا بفرستم؟", buttons=_imdb_dest_buttons())
+    await event.edit("⏭ بدون زیرنویس\n\n📬 خروجی کجا بفرستم؟", buttons=_imdb_dest_buttons(event.sender_id == ADMIN_ID))
 
 
 async def _imdb_download_cover(url: str, out_dir: str) -> Optional[str]:
@@ -15546,6 +15833,10 @@ async def _imdb_download_task(event, user_id: int, with_subtitle: bool, softsub:
 
     dl_id = f"imd_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     video_path = None
@@ -16108,6 +16399,10 @@ async def _iran_download_task(event, user_id, url, quality_label):
     os.makedirs(out_dir, exist_ok=True)
     dl_id = f"iran_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("\u274C Cancel", f"dlcancel_{dl_id}")]]
     try:
         try:
@@ -16574,6 +16869,10 @@ async def _itchio_perform_download(client, chat_id, status_msg, game_url, upload
 
     dl_id = f"itchio_{chat_id}_{upload_id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
 
     # progress callback
     last_edit = [0.0]
@@ -18084,6 +18383,10 @@ async def diycraft_cb_episode(event):
 
     dl_id = f"dcep_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
 
     video_path = await diycraft_download(
         video_url, out_dir,
@@ -18703,6 +19006,10 @@ async def ytdlp_quality_callback(event):
     filepath = os.path.join(OUTPUT_FOLDER, filename)
     dl_id = f"ytdlp_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -18874,6 +19181,10 @@ def _make_site_handler(
 
         dl_id = f"{prefix}_dl_{event.chat_id}_{event.id}_{int(time.time())}"
         active_downloads[dl_id] = {"paused": False, "cancelled": False}
+        _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+        if _qjob is None:
+            active_downloads.pop(dl_id, None)
+            return
         cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
         try:
@@ -19739,6 +20050,10 @@ async def xxxbp_quality_callback(event):
 
     dl_id = f"xb_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -19870,6 +20185,10 @@ async def sexxxx_quality_callback(event):
 
     dl_id = f"sx_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -20001,6 +20320,10 @@ async def elliniko_quality_callback(event):
 
     dl_id = f"el_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -20132,6 +20455,10 @@ async def rapelust_quality_callback(event):
 
     dl_id = f"rp_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -20263,6 +20590,10 @@ async def rapeinass_quality_callback(event):
 
     dl_id = f"ra_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -20394,6 +20725,10 @@ async def forcedlove_quality_callback(event):
 
     dl_id = f"fl_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -20525,6 +20860,10 @@ async def rapedws_quality_callback(event):
 
     dl_id = f"rd_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -20656,6 +20995,10 @@ async def sextvx_quality_callback(event):
 
     dl_id = f"st_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -20787,6 +21130,10 @@ async def porndos_quality_callback(event):
 
     dl_id = f"pn_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -20918,6 +21265,10 @@ async def shahvani_quality_callback(event):
 
     dl_id = f"sh_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -21049,6 +21400,10 @@ async def deviants_quality_callback(event):
 
     dl_id = f"dv_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -21180,6 +21535,10 @@ async def xxxvids_quality_callback(event):
 
     dl_id = f"xx_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -21311,6 +21670,10 @@ async def mutterfickt_quality_callback(event):
 
     dl_id = f"mf_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -21442,6 +21805,10 @@ async def rulexporn_quality_callback(event):
 
     dl_id = f"rx_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -21573,6 +21940,10 @@ async def robbyporn_quality_callback(event):
 
     dl_id = f"rb_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -21704,6 +22075,10 @@ async def bgxmonster_quality_callback(event):
 
     dl_id = f"bg_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -21835,6 +22210,10 @@ async def jebacina_quality_callback(event):
 
     dl_id = f"jb_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -21972,6 +22351,10 @@ async def ersties_quality_callback(event):
 
     dl_id = f"es_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -22118,6 +22501,10 @@ async def whoreshub_quality_callback(event):
 
     dl_id = f"wh_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -22258,6 +22645,10 @@ async def reddit_quality_callback(event):
 
     dl_id = f"red_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -22393,6 +22784,10 @@ async def xfetish_quality_callback(event):
 
     dl_id = f"xf_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -22531,6 +22926,10 @@ async def erome_pick_callback(event):
 
     dl_id = f"er_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     erome_active_downloads[dl_id] = {"paused": False, "cancelled": False}
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
@@ -22698,6 +23097,10 @@ async def beeg_quality_callback(event):
 
     dl_id = f"bee_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -22828,6 +23231,10 @@ async def spankbang_quality_callback(event):
 
     dl_id = f"sb_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -22958,6 +23365,10 @@ async def ixxx_quality_callback(event):
 
     dl_id = f"ix_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -23083,6 +23494,10 @@ async def youporn_quality_callback(event):
 
     dl_id = f"yp_dl_{event.chat_id}_{event.id}_{int(time.time())}"
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
+    _qjob = await dlq_take_ticket(event, dl_id, str(locals().get('title') or ''))
+    if _qjob is None:
+        active_downloads.pop(dl_id, None)
+        return
     cancel_btn = [[Button.inline("❌ Cancel", f"dlcancel_{dl_id}")]]
 
     try:
@@ -23194,6 +23609,9 @@ async def main():
     )
     client.add_event_handler(
         dl_cancel_callback, events.CallbackQuery(pattern=r"dlcancel_(.+)")
+    )
+    client.add_event_handler(
+        dlq_cancel_callback, events.CallbackQuery(pattern=r"dlqcancel_(.+)")
     )
     client.add_event_handler(
         ul_cancel_callback, events.CallbackQuery(pattern=r"ulcancel_(.+)")

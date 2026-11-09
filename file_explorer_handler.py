@@ -648,6 +648,22 @@ async def _litterbox_upload(remote_name: str, local_path: str, prog) -> dict:
 
 
 # ───────── 🆕 سرور خودم (PUBLIC_BASE_URL) — لینک پابلیک بدون آپلود شبکه‌ای ─────────
+def _main_admin_id() -> int:
+    """🆕 ادمین اصلی ربات — فقط همون اجازه‌ی آپلود روی «سرور خودمون» رو داره.
+
+    ادمین‌های عادی (AUTHORIZED_USERS) فقط هاست‌های خارجی؛ هرگز self.
+    (همون منطق پارس bot.py — از env می‌خونیم تا import چرخشی نشه.)"""
+    raw = (
+        os.environ.get("AUTHORIZED_MAINADMIN")
+        or os.environ.get("ADMIN_ID")
+        or "818185073"
+    ).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 818185073
+
+
 def _self_server_base() -> str:
     r"""دامنه‌ی عمومی سرور خودم — از PUBLIC_BASE_URL؛ خالی/نامعتبر → "".
 
@@ -758,6 +774,10 @@ async def upload_file_via_chain(local_path: str, remote_name: str,
         }
         if only not in _FA_ONLY:
             raise _FeError(f"هاست نامعتبر: {_esc(only)}")
+        if only == "self" and user_id is not None and user_id != _main_admin_id():
+            raise _FeError(
+                "⛔ آپلود روی «سرور خودمون» فقط برای ادمین اصلی مجازه."
+            )
         if only == "self" and not _self_server_base():
             raise _FeError(
                 "سرور خودت در دسترس نیست: PUBLIC_BASE_URL تنظیم نشده یا نامعتبره."
@@ -780,7 +800,13 @@ async def upload_file_via_chain(local_path: str, remote_name: str,
         chain: list = [only]
     else:
         chain: list = []
-        if _self_server_base() and size <= SELF_MAX_BYTES:
+        # 🆕 گیت دسترسی: «سرور خودمون» فقط برای ادمین اصلی — بقیه مستقیم
+        # می‌رن سراغ هاست‌های خارجی (پیکسل‌درین/لیترباکس/کت‌باکس/...)
+        if (
+            _self_server_base()
+            and size <= SELF_MAX_BYTES
+            and (user_id is None or user_id == _main_admin_id())
+        ):
             chain.append("self")
         if api_key and size <= PIXDRAIN_MAX_BYTES:
             chain.append("pixeldrain")
@@ -3516,7 +3542,12 @@ async def fe_vlc_cb(event):
         # (هاست‌هایی که سقف‌شون کمتر از حجم فایله حذف میشن)
         api_key = (os.environ.get("PIXDRAIN_API_KEY") or "").strip()
         chain: list = []
-        if _self_server_base() and size <= SELF_MAX_BYTES:
+        # 🆕 گیت دسترسی: «سرور خودمون» فقط برای ادمین اصلی
+        if (
+            _self_server_base()
+            and size <= SELF_MAX_BYTES
+            and event.sender_id == _main_admin_id()
+        ):
             chain.append("self")
         if api_key and size <= PIXDRAIN_MAX_BYTES:
             chain.append("pixeldrain")
