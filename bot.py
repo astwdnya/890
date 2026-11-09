@@ -931,9 +931,7 @@ async def dlq_take_ticket(event, dl_id: Optional[str], title: str = ""):
                     q_msg = None
                 return
             txt = f"🕒 تو صف هستی — **نفر {_fa_digits(pos)}**"
-            _at = dl_queue.active_title()
-            if _at:
-                txt += f"\n⏬ کار فعال: `{_at[:60]}`"
+            # حریم خصوصی: عنوان کارِ فعالِ کاربر دیگه نمایش داده نمی‌شه
             _btns = [[Button.inline("🚫 لغو نوبت", f"dlqcancel_{j.id}")]]
             if q_msg:
                 try:
