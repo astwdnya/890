@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Tuple
 import aiohttp
 from aiohttp import ClientTimeout
 
+from otherwebsiteshandler.video_thumb import pick_best_thumb_url
+
 logger = logging.getLogger("YtdlpHandler")
 
 USER_AGENT = (
@@ -73,11 +75,11 @@ def get_site_name(url: str) -> str:
     return "video"
 
 
-async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
+async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str, "Optional[str]"]:
     """
     Extract available qualities using yt-dlp --dump-json.
     Returns:
-        (qualities, title)
+        (qualities, title, best_thumb_url)
         qualities: list of dict with keys: label, format_id, method, ext, height
         title: video title
     """
@@ -101,20 +103,20 @@ async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
                 await process.wait()
             except Exception:
                 pass
-            return [], "yt-dlp timed out (30s)"
+            return [], "yt-dlp timed out (30s)", None
         if process.returncode != 0:
             stderr_text = stderr.decode(errors="replace")[:300]
-            return [], f"yt-dlp error: {stderr_text}"
+            return [], f"yt-dlp error: {stderr_text}", None
 
         try:
             data = json.loads(stdout.decode(errors="replace"))
         except json.JSONDecodeError:
             stderr_text = stderr.decode(errors="replace")[:300]
-            return [], f"Failed to parse yt-dlp output: {stderr_text}"
+            return [], f"Failed to parse yt-dlp output: {stderr_text}", None
     except FileNotFoundError:
-        return [], "yt-dlp not found on server"
+        return [], "yt-dlp not found on server", None
     except Exception as e:
-        return [], str(e)[:120]
+        return [], str(e)[:120], None
 
     title = data.get("title", "") or ""
     if title:
@@ -141,8 +143,8 @@ async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
                     "height": 0,
                 }
             )
-            return qualities, title if title else "video"
-        return [], "No formats found"
+            return qualities, title if title else "video", pick_best_thumb_url(data)
+        return [], "No formats found", None
 
     formats.sort(
         key=lambda f: (f.get("height", 0) or 0, f.get("tbr", 0) or 0), reverse=True
@@ -190,7 +192,7 @@ async def extract_qualities_ytdlp(url: str) -> Tuple[List[dict], str]:
             }
         )
 
-    return qualities, title
+    return qualities, title, pick_best_thumb_url(data)
 
 
 def _parse_ytdlp_progress_msg(text: str) -> str:

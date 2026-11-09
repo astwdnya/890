@@ -254,11 +254,15 @@ from otherwebsiteshandler.rule34_handler import (
     extract_rule34_post,
     download_rule34,
 )
+from otherwebsiteshandler.video_thumb import (
+    cleanup_thumb_files,
+    fetch_page_thumb,
+    fetch_video_thumbs,
+    pick_best_thumb_url,
+)
 from otherwebsiteshandler.pornhub_handler import (
     is_pornhub_url as is_pornhub_handler_url,
     extract_pornhub_qualities,
-    fetch_video_thumbs,
-    cleanup_thumb_files,
     download_pornhub_video,
     pornhub_sessions,
 )
@@ -9985,25 +9989,67 @@ async def savep_cancel_callback(event):
 # ====================== XNXX HANDLER ======================
 
 
+async def _thumb_menu_for(event, thumb_url, status_msg, text: str, buttons):
+    """عکس تامبنیل و منوی کیفیت تو «یک پیام» (عکس با کپشن + دکمه‌ها).
+
+    خروجی: (thumb_assets, menu_sent) — thumb_assets برای تامبنیل آپلود و پاکسازی.
+    """
+    thumb_assets = None
+    menu_sent = False
+    if not thumb_url:
+        return None, False
+    try:
+        thumb_assets = await asyncio.wait_for(
+            fetch_video_thumbs(thumb_url, OUTPUT_FOLDER), timeout=25
+        )
+        if thumb_assets and thumb_assets[0]:
+            await event.client.send_file(
+                event.chat_id, thumb_assets[0], caption=text, buttons=buttons
+            )
+            menu_sent = True
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"[THUMB] menu failed: {e}")
+        cleanup_thumb_files(thumb_assets)
+        thumb_assets = None
+    return thumb_assets, menu_sent
+
+
 async def process_xnxx_request(event, url: str, status_msg):
+    thumb_task = asyncio.create_task(fetch_page_thumb(url))
     qualities, title = await extract_xnxx_qualities(url)
     if not qualities:
+        thumb_task.cancel()
         await safe_edit(status_msg, "❌ کیفیتی پیدا نشد. لینک رو چک کن.")
         return
     session_id = f"xnxx_{event.chat_id}_{event.id}_{int(time.time())}"
-    xnxx_sessions[session_id] = {
-        "url": url,
-        "title": title,
-        "qualities": qualities,
-        "chat_id": event.chat_id,
-    }
     title_display = title[:60] if title else "ویدیو XNXX"
     text = f"🎬 **{title_display}**\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
     buttons = []
     for i, q in enumerate(qualities):
         buttons.append([Button.inline(q["label"], f"xnxx_q_{session_id}_{i}")])
     buttons.append([Button.inline("❌ لغو", f"xnxx_cancel_{session_id}")])
-    await safe_edit(status_msg, text, buttons=buttons)
+
+    try:
+        thumb_url = await asyncio.wait_for(thumb_task, timeout=30)
+    except Exception:
+        thumb_url = None
+    thumb_assets, menu_sent = await _thumb_menu_for(
+        event, thumb_url, status_msg, text, buttons
+    )
+    if not menu_sent:
+        await safe_edit(status_msg, text, buttons=buttons)
+
+    xnxx_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+        "thumb_assets": thumb_assets,
+    }
 
 
 async def xnxx_quality_callback(event):
@@ -10074,6 +10120,7 @@ async def xnxx_quality_callback(event):
             status_msg=status_msg,
             buttons=None,
             supports_streaming=True,
+            thumb_filepath=(entry.get("thumb_assets") or (None, None))[1],
             ul_id=ul_id,
         )
     except asyncio.CancelledError:
@@ -10086,6 +10133,7 @@ async def xnxx_quality_callback(event):
         await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
     finally:
         active_downloads.pop(dl_id, None)
+        cleanup_thumb_files(entry.get("thumb_assets"))
         try:
             if os.path.exists(filepath):
                 os.remove(filepath)
@@ -10096,7 +10144,9 @@ async def xnxx_quality_callback(event):
 async def xnxx_cancel_callback(event):
     data = event.data.decode()
     session_id = data.replace("xnxx_cancel_", "")
-    xnxx_sessions.pop(session_id, None)
+    entry = xnxx_sessions.pop(session_id, None)
+    if entry:
+        cleanup_thumb_files(entry.get("thumb_assets"))
     await event.answer("❌ لغو شد", alert=False)
     try:
         await event.edit("❌ **لغو شد.**", buttons=None)
@@ -10122,30 +10172,9 @@ async def process_pornhub_request(event, url: str, status_msg):
 
     # تامبنیل ویدیو: عکس و منوی کیفیت تو «یک پیام» (عکس با کپشن + دکمه‌ها)
     # + نسخه کوچیک عکس برای تامبنیل فایل آپلودی
-    thumb_assets = None
-    menu_sent = False
-    if thumb_url:
-        try:
-            thumb_assets = await asyncio.wait_for(
-                fetch_video_thumbs(thumb_url, OUTPUT_FOLDER), timeout=25
-            )
-            if thumb_assets and thumb_assets[0]:
-                await event.client.send_file(
-                    event.chat_id,
-                    thumb_assets[0],
-                    caption=text,
-                    buttons=buttons,
-                )
-                menu_sent = True
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning(f"[PH] thumb failed: {e}")
-            cleanup_thumb_files(thumb_assets)
-            thumb_assets = None
-
+    thumb_assets, menu_sent = await _thumb_menu_for(
+        event, thumb_url, status_msg, text, buttons
+    )
     if not menu_sent:
         # بدون عکس: منوی متنی مثل قبل
         await safe_edit(status_msg, text, buttons=buttons)
@@ -18624,18 +18653,12 @@ async def inline_start_callback(event):
 
 
 async def process_ytdlp_request(event, url: str, status_msg):
-    qualities, title = await extract_qualities_ytdlp(url)
+    qualities, title, thumb_url = await extract_qualities_ytdlp(url)
     if not qualities:
         err_detail = f" — `{title[:150]}`" if title else ""
         await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
         return
     session_id = f"ytdlp_{event.chat_id}_{event.id}_{int(time.time())}"
-    ytdlp_sessions[session_id] = {
-        "url": url,
-        "title": title,
-        "qualities": qualities,
-        "chat_id": event.chat_id,
-    }
     title_display = title[:60] if title else "ویدیو"
     site_name = get_site_name(url).upper()
     text = f"🎬 **{title_display}**\n🌐 {site_name}\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
@@ -18643,7 +18666,20 @@ async def process_ytdlp_request(event, url: str, status_msg):
     for i, q in enumerate(qualities):
         buttons.append([Button.inline(q["label"], f"ytdlp_q_{session_id}_{i}")])
     buttons.append([Button.inline("❌ لغو", f"ytdlp_cancel_{session_id}")])
-    await safe_edit(status_msg, text, buttons=buttons)
+
+    thumb_assets, menu_sent = await _thumb_menu_for(
+        event, thumb_url, status_msg, text, buttons
+    )
+    if not menu_sent:
+        await safe_edit(status_msg, text, buttons=buttons)
+
+    ytdlp_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+        "thumb_assets": thumb_assets,
+    }
 
 
 async def ytdlp_quality_callback(event):
@@ -18710,6 +18746,7 @@ async def ytdlp_quality_callback(event):
             status_msg=status_msg,
             buttons=None,
             supports_streaming=True,
+            thumb_filepath=(entry.get("thumb_assets") or (None, None))[1],
             ul_id=ul_id,
         )
     except asyncio.CancelledError:
@@ -18722,6 +18759,7 @@ async def ytdlp_quality_callback(event):
         await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
     finally:
         active_downloads.pop(dl_id, None)
+        cleanup_thumb_files(entry.get("thumb_assets"))
         try:
             if os.path.exists(filepath):
                 os.remove(filepath)
@@ -18732,7 +18770,9 @@ async def ytdlp_quality_callback(event):
 async def ytdlp_cancel_callback(event):
     data = event.data.decode()
     session_id = data.replace("ytdlp_cancel_", "")
-    ytdlp_sessions.pop(session_id, None)
+    entry = ytdlp_sessions.pop(session_id, None)
+    if entry:
+        cleanup_thumb_files(entry.get("thumb_assets"))
     await event.answer("❌ لغو شد", alert=False)
     try:
         await event.edit("❌ **لغو شد.**", buttons=None)
@@ -18754,25 +18794,61 @@ def _make_site_handler(
     """ساخت handler های process, quality_callback, cancel_callback برای یه سایت خاص."""
 
     async def process_request(event, url: str, status_msg):
-        qualities, title = await extract_fn(url)
+        # تامبنیل: موازی با استخراج کیفیت، og:image صفحه رو می‌گیریم
+        thumb_task = asyncio.create_task(fetch_page_thumb(url))
+        try:
+            qualities, title = await extract_fn(url)
+        except Exception:
+            thumb_task.cancel()
+            raise
         if not qualities:
+            thumb_task.cancel()
             err_detail = f" — `{title[:150]}`" if title else ""
             await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
             return
         session_id = f"{prefix}_{event.chat_id}_{event.id}_{int(time.time())}"
-        sessions_dict[session_id] = {
-            "url": url,
-            "title": title,
-            "qualities": qualities,
-            "chat_id": event.chat_id,
-        }
         title_display = title[:60] if title else f"ویدیو {display_name}"
         text = f"🎬 **{title_display}**\n🌐 {display_name}\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
         buttons = []
         for i, q in enumerate(qualities):
             buttons.append([Button.inline(q["label"], f"{prefix}_q_{session_id}_{i}")])
         buttons.append([Button.inline("❌ لغو", f"{prefix}_cancel_{session_id}")])
-        await safe_edit(status_msg, text, buttons=buttons)
+
+        # عکس تامبنیل و منوی کیفیت تو «یک پیام» (عکس با کپشن + دکمه‌ها)
+        thumb_assets = None
+        menu_sent = False
+        try:
+            thumb_url = await asyncio.wait_for(thumb_task, timeout=30)
+        except Exception:
+            thumb_url = None
+        if thumb_url:
+            try:
+                thumb_assets = await asyncio.wait_for(
+                    fetch_video_thumbs(thumb_url, OUTPUT_FOLDER), timeout=25
+                )
+                if thumb_assets and thumb_assets[0]:
+                    await event.client.send_file(
+                        event.chat_id, thumb_assets[0], caption=text, buttons=buttons
+                    )
+                    menu_sent = True
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"[{display_name}] thumb failed: {e}")
+                cleanup_thumb_files(thumb_assets)
+                thumb_assets = None
+        if not menu_sent:
+            await safe_edit(status_msg, text, buttons=buttons)
+
+        sessions_dict[session_id] = {
+            "url": url,
+            "title": title,
+            "qualities": qualities,
+            "chat_id": event.chat_id,
+            "thumb_assets": thumb_assets,
+        }
 
     async def quality_callback(event):
         data = event.data.decode()
@@ -18843,6 +18919,7 @@ def _make_site_handler(
                 status_msg=status_msg,
                 buttons=None,
                 supports_streaming=True,
+                thumb_filepath=(entry.get("thumb_assets") or (None, None))[1],
                 ul_id=ul_id,
             )
         except asyncio.CancelledError:
@@ -18855,6 +18932,7 @@ def _make_site_handler(
             await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
         finally:
             active_downloads.pop(dl_id, None)
+            cleanup_thumb_files(entry.get("thumb_assets"))
             try:
                 if os.path.exists(filepath):
                     os.remove(filepath)
@@ -18864,7 +18942,9 @@ def _make_site_handler(
     async def cancel_callback(event):
         data = event.data.decode()
         session_id = data.replace(f"{prefix}_cancel_", "")
-        sessions_dict.pop(session_id, None)
+        entry = sessions_dict.pop(session_id, None)
+        if entry:
+            cleanup_thumb_files(entry.get("thumb_assets"))
         await event.answer("❌ لغو شد", alert=False)
         try:
             await event.edit("❌ **لغو شد.**", buttons=None)
@@ -21979,28 +22059,41 @@ async def process_whoreshub_request(event, url: str, status_msg):
         except Exception:
             pass
 
+    thumb_task = asyncio.create_task(fetch_page_thumb(url))
     qualities, title, info = await extract_whoreshub_qualities(
         url,
         progress_cb=progress_cb,
     )
     if not qualities:
+        thumb_task.cancel()
         err_detail = f" — `{title[:150]}`" if title else ""
         await safe_edit(status_msg, f"❌ کیفیتی پیدا نشد{err_detail}")
         return
     session_id = f"wh_{event.chat_id}_{event.id}_{int(time.time())}"
-    whoreshub_sessions[session_id] = {
-        "url": url,
-        "title": title,
-        "qualities": qualities,
-        "chat_id": event.chat_id,
-    }
     title_display = title[:60] if title else "ویدیو WhoresHub"
     text = f"🎬 **{title_display}**\n🌐 WhoresHub\n\n🎚 کیفیت مورد نظر رو انتخاب کن:"
     buttons = []
     for i, q in enumerate(qualities):
         buttons.append([Button.inline(q["label"], f"wh_q_{session_id}_{i}")])
     buttons.append([Button.inline("❌ لغو", f"wh_cancel_{session_id}")])
-    await safe_edit(status_msg, text, buttons=buttons)
+
+    try:
+        thumb_url = await asyncio.wait_for(thumb_task, timeout=30)
+    except Exception:
+        thumb_url = None
+    thumb_assets, menu_sent = await _thumb_menu_for(
+        event, thumb_url, status_msg, text, buttons
+    )
+    if not menu_sent:
+        await safe_edit(status_msg, text, buttons=buttons)
+
+    whoreshub_sessions[session_id] = {
+        "url": url,
+        "title": title,
+        "qualities": qualities,
+        "chat_id": event.chat_id,
+        "thumb_assets": thumb_assets,
+    }
 
 
 async def whoreshub_quality_callback(event):
@@ -22071,6 +22164,7 @@ async def whoreshub_quality_callback(event):
             status_msg=status_msg,
             buttons=None,
             supports_streaming=True,
+            thumb_filepath=(entry.get("thumb_assets") or (None, None))[1],
             ul_id=ul_id,
         )
     except asyncio.CancelledError:
@@ -22083,6 +22177,7 @@ async def whoreshub_quality_callback(event):
         await safe_edit(status_msg, f"❌ خطا: `{str(e)[:100]}`")
     finally:
         active_downloads.pop(dl_id, None)
+        cleanup_thumb_files(entry.get("thumb_assets"))
         try:
             if filepath and os.path.exists(filepath):
                 os.remove(filepath)
@@ -22093,7 +22188,9 @@ async def whoreshub_quality_callback(event):
 async def whoreshub_cancel_callback(event):
     data = event.data.decode()
     session_id = data.replace("wh_cancel_", "")
-    whoreshub_sessions.pop(session_id, None)
+    entry = whoreshub_sessions.pop(session_id, None)
+    if entry:
+        cleanup_thumb_files(entry.get("thumb_assets"))
     await event.answer("❌ لغو شد", alert=False)
     try:
         await event.edit("❌ **لغو شد.**", buttons=None)

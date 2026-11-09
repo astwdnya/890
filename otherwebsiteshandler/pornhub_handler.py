@@ -11,7 +11,6 @@ pornhub_handler.py
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -325,109 +324,17 @@ async def extract_pornhub_qualities(url: str) -> Tuple[List[dict], str, Optional
         title[:60],
         has_ffmpeg,
     )
-    return qualities, title, _pick_best_thumb_url(data)
+    return qualities, title, pick_best_thumb_url(data)
 
 
-# ─── Thumbnail ──────────────────────────────────────────────
+# ─── Thumbnail (مشترک — پیاده‌سازی تو video_thumb.py) ───────
 
-
-def _pick_best_thumb_url(data: dict) -> Optional[str]:
-    """بزرگ‌ترین تامبنیل موجود رو از خروجی yt-dlp انتخاب می‌کنه."""
-    candidates: List[Tuple[int, str]] = []
-    for t in data.get("thumbnails") or []:
-        u = t.get("url")
-        if not u:
-            continue
-        if u.startswith("//"):
-            u = "https:" + u
-        candidates.append(((t.get("width") or 0) * (t.get("height") or 0), u))
-    main = data.get("thumbnail")
-    if main:
-        if main.startswith("//"):
-            main = "https:" + main
-        candidates.append((0, main))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda c: c[0], reverse=True)
-    return candidates[0][1]
-
-
-async def fetch_video_thumbs(
-    thumb_url: str, out_dir: str
-) -> Optional[Tuple[str, Optional[str]]]:
-    """
-    دانلود و آماده‌سازی تامبنیل ویدیو.
-
-    Returns:
-        (photo_path, tg_thumb_path)
-          - photo_path: تصویر باکیفیت برای نمایش تو چت (JPEG، لبه بزرگ ≤ 1280)
-          - tg_thumb_path: نسخه کوچیک JPEG برای تامبنیل فایل آپلودی (≤ 320)
-        اگه هر چیزی به خطا خورد None برمی‌گرده؛ هیچ‌وقت exception نمی‌ده.
-    """
-    try:
-        import io
-
-        from PIL import Image
-    except Exception:
-        Image = None
-
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-        digest = hashlib.md5(thumb_url.encode()).hexdigest()[:12]
-        base = os.path.join(out_dir, f"thumb_{digest}")
-
-        timeout = aiohttp.ClientTimeout(total=20)
-        headers = {"User-Agent": _USER_AGENT, "Referer": "https://www.google.com/"}
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(thumb_url) as resp:
-                if resp.status != 200:
-                    logger.warning("Thumb download failed: HTTP %s", resp.status)
-                    return None
-                raw = await resp.read()
-
-        if not raw or len(raw) < 1024:
-            return None
-
-        photo_path = base + "_hd.jpg"
-        tg_path = base + "_tg.jpg"
-
-        if Image is not None:
-            try:
-                im = Image.open(io.BytesIO(raw)).convert("RGB")
-                im.save(photo_path, "JPEG", quality=88)
-                tg = im.copy()
-                tg.thumbnail((320, 320), Image.LANCZOS)
-                tg.save(tg_path, "JPEG", quality=85)
-                return photo_path, tg_path
-            except Exception as e:
-                logger.warning("Thumb convert error: %s", e)
-                return None
-
-        # بدون Pillow: فقط اگه خود فایل JPEG مناسبه
-        if raw[:3] == b"\xff\xd8\xff":
-            with open(photo_path, "wb") as f:
-                f.write(raw)
-            if len(raw) <= 200 * 1024:
-                with open(tg_path, "wb") as f:
-                    f.write(raw)
-                return photo_path, tg_path
-            return photo_path, None
-        return None
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        logger.warning("Thumb fetch error: %s", e)
-        return None
-
-
-def cleanup_thumb_files(assets: Tuple[Optional[str], Optional[str]]) -> None:
-    """حذف فایل‌های موقت تامبنیل."""
-    for p in assets or ():
-        if p and os.path.exists(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+from otherwebsiteshandler.video_thumb import (  # noqa: E402
+    cleanup_thumb_files,
+    fetch_page_thumb,
+    fetch_video_thumbs,
+    pick_best_thumb_url,
+)
 
 
 # ─── Download: Multi-segment (fast) ────────────────────────
