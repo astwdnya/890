@@ -59,8 +59,7 @@ from file_explorer_handler import register_file_explorer_handlers, upload_file_v
 from yt_intermediary import (
     extract_youtube_id as ytvia_extract_id,
     fetch_video_meta as ytvia_fetch_meta,
-    resolve_formats as ytvia_resolve,
-    refresh_format as ytvia_refresh_format,
+    get_download_url as ytvia_get_dl_url,
     fetch_thumb_bytes as ytvia_fetch_thumb_bytes,
 )
 from xnxx_handler import (
@@ -7293,12 +7292,13 @@ async def generic_url_handler(event):
 
 YOUTUBE_RE = re.compile(r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com|youtu\.be)/")
 
-# ═══════════════ یوتیوب از طریق واسط (cobalt tunnel + پروکسی متادیتا) ═══════════════
-# بدون هیچ اتصال مستقیمی به یوتیوب: متادیتا از پروکسی Data API، کشف فرمت‌های
-# واقعی و بایت‌های دانلود همگی از سرور واسط (cobalt). چیزی که به کاربر
-# نمایش داده می‌شه فقط کیفیت‌هاییه که واسطه واقعاً تأیید کرده.
+# ═══════════════ یوتیوب از طریق واسط (clipto formats + byte cascade) ═══════════════
+# لیست فرمت‌ها: clipto — دقیقاً فرمت‌های واقعی ویدیو (بدون هاردکد)
+# متادیتا: clipto + پروکسی Data API (mattw)
+# بایت‌ها: کسکید واسطه‌های دانلود (y2mate AJAX → savetube) — CDN واسطه،
+# هرگز اتصال مستقیم به یوتیوب. cobalt کلاً حذف شد.
 
-ytvia_sessions: Dict[str, dict] = {}  # session_id → {meta, fmts, chat_id, ts}
+ytvia_sessions: Dict[str, dict] = {}  # session_id → {meta, ordered, url, chat_id, ts, thumb_path}
 YTVIA_TTL = 3600  # عمر منوی انتخاب فرمت (ثانیه)
 
 
@@ -7316,8 +7316,8 @@ def _ytvia_fmt_duration(sec) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def _ytvia_caption(meta: dict, for_file: bool = False) -> str:
-    """کپشن کامل متادیتا — هم منو، هم زیر ویدیوی تحویلی."""
+def _ytvia_caption(meta: dict) -> str:
+    """کپشن کامل متادیتا — هم منو، هم زیر فایل تحویلی."""
     desc = (meta.get("description") or "").strip()
     if len(desc) > 700:
         desc = desc[:700].rstrip() + " …"
@@ -7340,7 +7340,7 @@ def _ytvia_caption(meta: dict, for_file: bool = False) -> str:
         lines.append(f"📝 {desc}")
     lines.append("")
     lines.append(f"🔗 {meta.get('link') or ''}")
-    lines.append("_دانلود از طریق سرور واسط — بدون اتصال مستقیم به یوتیوب_")
+    lines.append("_دانلود از طریق سایت واسط — بدون اتصال مستقیم به یوتیوب_")
     return "\n".join(lines)
 
 
@@ -7349,14 +7349,34 @@ def _ytvia_sanitize(name: str) -> str:
     return (name[:80] or "video")
 
 
+def _ytvia_ordered(meta: dict) -> list:
+    """فرمت‌ها به ترتیب نمایش: ویدیوها از بالا به پایین، بعد صداها."""
+    fmts = meta.get("formats") or []
+    vids = sorted([f for f in fmts if f["kind"] == "video"],
+                  key=lambda f: (-f.get("height", 0), -f.get("bitrate", 0)))
+    auds = sorted([f for f in fmts if f["kind"] == "audio"],
+                  key=lambda f: -f.get("bitrate", 0))
+    return vids + auds
+
+
+def _ytvia_btn_label(f: dict) -> str:
+    size = ""
+    if f.get("size_est"):
+        size = f" ~{human_readable_size(f['size_est'])}"
+    if f["kind"] == "audio":
+        return f"🎵 {f['quality']} {f['ext'].upper()}{size}"
+    fps = f" {f['fps']}fps" if f.get("fps") and f["fps"] > 30 else ""
+    return f"🎬 {f['quality']}{fps} {f['ext'].upper()}{size}"
+
+
 async def process_ytvia_request(event, url: str, status_msg):
-    """یوتیوب → متادیتا + لیست فرمت‌های واقعی → منوی انتخاب."""
+    """یوتیوب → متادیتا + فرمت‌های واقعی (clipto) → منوی انتخاب."""
     vid = ytvia_extract_id(url)
     if not vid:
         await safe_edit(status_msg, "❌ لینک یوتیوب معتبر نیست.")
         return
 
-    await safe_edit(status_msg, "📄 در حال دریافت اطلاعات ویدیو از واسط...")
+    await safe_edit(status_msg, "📄 در حال دریافت اطلاعات و فرمت‌های واقعی از واسط...")
     try:
         meta = await ytvia_fetch_meta(url)
     except Exception as e:
@@ -7364,20 +7384,14 @@ async def process_ytvia_request(event, url: str, status_msg):
         await safe_edit(status_msg, f"❌ دریافت اطلاعات ناموفق بود: {e}")
         return
 
-    await safe_edit(
-        status_msg,
-        f"🔎 کشف کیفیت‌های واقعی از واسط...\n🎬 {meta.get('title', '')[:70]}",
-    )
-    try:
-        fmts = await ytvia_resolve(url)
-    except Exception as e:
-        logger.warning(f"[YTVIA] resolve failed: {e}")
-        await safe_edit(status_msg, f"❌ هیچ واسطه‌ای این ویدیو رو پشتیبانی نکرد: {e}")
+    ordered = _ytvia_ordered(meta)
+    if not ordered:
+        await safe_edit(status_msg, "❌ واسطه هیچ فرمتی برای این ویدیو برنگردوند.")
         return
 
     session_id = f"yv{event.chat_id}_{int(time.time()) % 100000}"
     thumb_path = ""
-    thumb_bytes = await ytvia_fetch_thumb_bytes(meta.get("thumb_url") or "")
+    thumb_bytes = await ytvia_fetch_thumb_bytes(meta.get("thumbnail") or "")
     if thumb_bytes:
         try:
             os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -7389,31 +7403,31 @@ async def process_ytvia_request(event, url: str, status_msg):
 
     ytvia_sessions[session_id] = {
         "meta": meta,
-        "fmts": fmts,
+        "ordered": ordered,
         "url": url,
         "chat_id": event.chat_id,
         "ts": time.time(),
         "thumb_path": thumb_path,
     }
 
-    # دکمه‌ها — فقط فرمت‌های تأییدشده‌ی واسطه؛ data محدود به ۶۴ بایت
-    q_list = sorted(fmts["videos"].keys(), key=lambda s: int(s[:-1]), reverse=True)
+    # دکمه‌ها — فقط فرمت‌های واقعی برگشتی از واسطه (دو تا در هر ردیف)
     buttons = []
     row = []
-    for i, q in enumerate(q_list):
-        row.append(Button.inline(f"🎬 {q}", f"ytvia_p_{session_id}_{i}"))
+    for i, f in enumerate(ordered):
+        row.append(Button.inline(_ytvia_btn_label(f), f"ytvia_p_{session_id}_{i}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
-    if fmts.get("audio"):
-        buttons.append([Button.inline("🎧 فقط صدا (Opus)", f"ytvia_p_{session_id}_-1")])
     buttons.append([Button.inline("❌ لغو", f"ytvia_c_{session_id}")])
 
     caption = _ytvia_caption(meta)
-    qline = " / ".join(q_list) + (" + صدا" if fmts.get("audio") else "")
-    caption += f"\n\n**کیفیت‌های موجود:** {qline}"
+    qline = " • ".join(
+        (f["quality"] if f["kind"] == "video" else f"🎵{f['quality']}") + f["ext"]
+        for f in ordered[:14]
+    )
+    caption += f"\n\n**فرمت‌های واقعی این ویدیو:**\n{qline}"
 
     try:
         if thumb_path and os.path.exists(thumb_path):
@@ -7440,7 +7454,7 @@ async def process_ytvia_request(event, url: str, status_msg):
 
 
 async def ytvia_pick_callback(event):
-    """انتخاب فرمت → بلیت صف → دانلود از tunnel واسط → ارسال با کپشن کامل."""
+    """انتخاب فرمت → بلیت صف → لینک از واسطه → دانلود → ارسال با کپشن کامل."""
     data = event.data.decode()
     try:
         prefix, idx_s = data.rsplit("_", 1)
@@ -7455,17 +7469,11 @@ async def ytvia_pick_callback(event):
     if event.chat_id != sess.get("chat_id"):
         return await event.answer("⛔ این منو مال این چت نیست.", alert=True)
 
-    fmts = sess["fmts"]
+    ordered = sess["ordered"]
+    if idx < 0 or idx >= len(ordered):
+        return await event.answer("Invalid", alert=True)
+    want = ordered[idx]
     meta = sess["meta"]
-    if idx == -1:
-        if not fmts.get("audio"):
-            return await event.answer("صدا موجود نیست.", alert=True)
-        quality, audio = None, True
-    else:
-        q_list = sorted(fmts["videos"].keys(), key=lambda s: int(s[:-1]), reverse=True)
-        if idx >= len(q_list):
-            return await event.answer("Invalid", alert=True)
-        quality, audio = q_list[idx], False
 
     await event.answer()
     status_msg = await event.client.send_message(
@@ -7476,7 +7484,6 @@ async def ytvia_pick_callback(event):
     active_downloads[dl_id] = {"paused": False, "cancelled": False}
     title = meta.get("title") or "YouTube"
     job = None
-    filepath = None
     try:
         job = await dlq_take_ticket(event, dl_id, title)
         if job is None:
@@ -7491,37 +7498,33 @@ async def ytvia_pick_callback(event):
                     pass
                 return
 
-        fmt = fmts["audio"] if audio else fmts["videos"][quality]
+        kind = "🎧" if want["kind"] == "audio" else "🎬"
         await safe_edit(
             status_msg,
-            f"⏬ دانلود از سرور واسط...\n🎬 {title[:70]}\n"
-            f"🎯 {'🎧 صدا' if audio else quality}",
+            f"🔗 درخواست لینک از سایت واسط...\n{kind} {title[:70]}\n"
+            f"🎯 {_ytvia_btn_label(want)[2:]}",
         )
+        dl_url = await ytvia_get_dl_url(sess["url"], want)
+
+        await safe_edit(status_msg, f"⏬ دانلود از CDN واسطه...\n{kind} {title[:70]}")
         os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-        ext = fmt.get("ext") or (".opus" if audio else ".mp4")
+        ext = want.get("ext") or ("mp4" if want["kind"] == "video" else "m4a")
+        qtag = want["quality"]
         filepath = os.path.join(
-            OUTPUT_FOLDER,
-            f"yt_{_ytvia_sanitize(title)}{'_audio' if audio else '_' + (quality or '')}{ext}",
+            OUTPUT_FOLDER, f"yt_{_ytvia_sanitize(title)}_{qtag}.{ext}"
         )
-        got_path, err, _sz = await _download_via_curl_cffi(
-            fmt["tunnel"], filepath, status_msg, dl_id
-        )
+        got_path, err, _sz = await _download_via_curl_cffi(dl_url, filepath, status_msg, dl_id)
         if not got_path:
-            # tunnel ممکنه منقضی شده باشه → یه بار دوباره resolve کن
-            refreshed = await ytvia_refresh_format(sess["url"], quality, audio)
-            if refreshed:
-                got_path, err, _sz = await _download_via_curl_cffi(
-                    refreshed["tunnel"], filepath, status_msg, dl_id
-                )
+            # لینک واسطه ممکنه کوتاه‌عمر باشه → یه بار دیگه از اول
+            await safe_edit(status_msg, "🔁 لینک منقضی شده — درخواست مجدد از واسطه...")
+            dl_url = await ytvia_get_dl_url(sess["url"], want)
+            got_path, err, _sz = await _download_via_curl_cffi(dl_url, filepath, status_msg, dl_id)
         if not got_path:
             await safe_edit(status_msg, f"❌ دانلود ناموفق: {err or 'نامشخص'}")
             return
 
-        caption = _ytvia_caption(meta, for_file=True)
-        if audio:
-            caption += f"\n🎧 **فقط صدا — Opus**"
-        else:
-            caption += f"\n🎯 **{quality}** (h264)"
+        caption = _ytvia_caption(meta)
+        caption += f"\n{'🎧' if want['kind'] == 'audio' else '🎯'} **{_ytvia_btn_label(want)[2:]}**"
 
         await send_file_with_progress(
             event.client,
@@ -7529,7 +7532,7 @@ async def ytvia_pick_callback(event):
             got_path,
             caption,
             status_msg,
-            supports_streaming=not audio,
+            supports_streaming=(want["kind"] == "video"),
             thumb_filepath=sess.get("thumb_path") or None,
         )
         try:
@@ -7566,6 +7569,40 @@ async def ytvia_cancel_callback(event):
     except Exception:
         pass
 
+
+async def ytvia_test_command(event):
+    """عیب‌یابی: /yttest <لینک یوتیوب> — فرمت‌های واقعی + وضعیت واسطه‌های دانلود."""
+    if event.sender_id not in AUTHORIZED_USERS:
+        return await event.reply("⛔ Unauthorized")
+    parts = (event.raw_text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return await event.reply("Usage: `/yttest <youtube url>`", parse_mode="markdown")
+    url = parts[1].strip()
+    status = await event.reply("🔎 yttest: دریافت متادیتا و فرمت‌ها...")
+    try:
+        meta = await ytvia_fetch_meta(url)
+    except Exception as e:
+        return await safe_edit(status, f"❌ meta: {e}")
+    ordered = _ytvia_ordered(meta)
+    lines = [
+        f"🎬 {meta.get('title', '')[:70]}",
+        f"👤 {meta.get('author', '')} | ⏱ {_ytvia_fmt_duration(meta.get('duration'))}",
+        f"فرمت‌ها ({len(ordered)}):",
+    ]
+    for f in ordered[:18]:
+        lines.append(f"  {_ytvia_btn_label(f)}  [itag={f.get('format_id')}]")
+    # کوچک‌ترین فرمت ویدیویی → resolve بایت از کسکید واسطه‌ها (بدون دانلود)
+    vids = [f for f in ordered if f["kind"] == "video"]
+    if vids:
+        smallest = min(vids, key=lambda f: f.get("height", 0))
+        await safe_edit(status, "🔎 yttest: تست resolve بایت از واسطه‌ها (کوچک‌ترین کیفیت)...")
+        try:
+            dl = await ytvia_get_dl_url(url, smallest)
+            host = re.match(r"https?://([^/]+)", dl)
+            lines.append(f"\n✅ resolve موفق ({smallest['quality']}): {host.group(1) if host else '?'}")
+        except Exception as e:
+            lines.append(f"\n❌ resolve ناموفق: {e}")
+    await safe_edit(status, "\n".join(lines))
 
 # ====================== VIDEO RECEIVE -> GITHUB OFFER ======================
 
@@ -23346,6 +23383,9 @@ async def main():
     )
     client.add_event_handler(
         ytvia_cancel_callback, events.CallbackQuery(pattern=r"ytvia_c_.+")
+    )
+    client.add_event_handler(
+        ytvia_test_command, events.NewMessage(pattern=r"^/yttest(\s|$)", incoming=True)
     )
     client.add_event_handler(
         savep_cancel_callback, events.CallbackQuery(pattern=r"savep_cancel_.+")
