@@ -184,6 +184,14 @@ from otherwebsiteshandler.hentaihaven_handler import (
     download_hentaihaven_m3u8,
     hentaihaven_sessions,
 )
+# 🆕 madou.io (麻豆) — MacCMS صفحه‌ی پخش → player_aaaa → HLS t0.97img.com
+from otherwebsiteshandler.madou_handler import (
+    is_madou_url,
+    extract_madou_qualities,
+    download_madou_direct,
+    download_madou_m3u8,
+    madou_sessions,
+)
 from otherwebsiteshandler.rat_handler import (
     is_rat_url,
     extract_rat_qualities,
@@ -6783,6 +6791,15 @@ async def generic_url_handler(event):
             processing_messages.discard(msg_id)
         return
 
+    if is_madou_url(target_url):
+        logger.info(f"[URL] Madou detected | url={target_url[:120]}")
+        status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
+        try:
+            await process_madou_request(event, target_url, status_msg)
+        finally:
+            processing_messages.discard(msg_id)
+        return
+
     if is_rat_url(target_url):
         logger.info(f"[URL] Rat detected | url={target_url[:120]}")
         status_msg = await event.reply("🔍 در حال استخراج کیفیت‌ها...")
@@ -7147,6 +7164,7 @@ async def generic_url_handler(event):
         or is_teensexvideos_url(target_url)
         or is_usersporn_url(target_url)
         or is_hentaihaven_url(target_url)
+        or is_madou_url(target_url)
         or is_rat_url(target_url)
         or is_youporn_url(target_url)
         or is_sexvid_url(target_url)
@@ -19984,6 +20002,20 @@ process_xgroovy_request, xgroovy_quality_callback, xgroovy_cancel_callback = (
     "HentaiHaven",
 )
 
+# 🆕 madou.io (麻豆) — منوی کیفیت + دانلود HLS با همون ساز‌و‌کار بقیه سایت‌ها
+(
+    process_madou_request,
+    madou_quality_callback,
+    madou_cancel_callback,
+) = _make_site_handler(
+    "madou",
+    extract_madou_qualities,
+    download_madou_direct,
+    download_madou_m3u8,
+    madou_sessions,
+    "Madou",
+)
+
 (
     process_rat_request,
     rat_quality_callback,
@@ -24601,6 +24633,13 @@ async def main():
     )
     client.add_event_handler(
         hentaihaven_cancel_callback, events.CallbackQuery(pattern=r"hh_cancel_.+")
+    )
+    # 🆕 madou.io — منوی کیفیت + لغو
+    client.add_event_handler(
+        madou_quality_callback, events.CallbackQuery(pattern=r"madou_q_.+")
+    )
+    client.add_event_handler(
+        madou_cancel_callback, events.CallbackQuery(pattern=r"madou_cancel_.+")
     )
     client.add_event_handler(
         rat_quality_callback, events.CallbackQuery(pattern=r"rat_q_.+")
