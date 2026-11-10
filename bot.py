@@ -5869,6 +5869,14 @@ async def generic_url_handler(event):
                 "image_path": temp_path,
                 "chat_id": event.chat_id,
             }
+            # 🆕 meta روی دیسک — نشست rds از ری‌استارت بات هم جان سالم به در ببره
+            try:
+                with open(_rds_meta_path(session_id), "w", encoding="utf-8") as f:
+                    json.dump(
+                        {"image_path": temp_path, "chat_id": event.chat_id, "ts": time.time()}, f
+                    )
+            except Exception:
+                pass
             await event.reply(
                 "📷 عکس دریافت شد!",
                 buttons=[
@@ -5899,6 +5907,15 @@ async def generic_url_handler(event):
                     "image_path": temp_path,
                     "chat_id": event.chat_id,
                 }
+                # 🆕 meta روی دیسک — نشست rds از ری‌استارت بات هم جان سالم به در ببره
+                try:
+                    with open(_rds_meta_path(session_id), "w", encoding="utf-8") as f:
+                        json.dump(
+                            {"image_path": temp_path, "chat_id": event.chat_id, "ts": time.time()},
+                            f,
+                        )
+                except Exception:
+                    pass
                 await event.reply(
                     "📷 فایل تصویر دریافت شد!",
                     buttons=[
@@ -17929,10 +17946,59 @@ def _rds_session_get(sid: str):
     return st
 
 
+def _rds_meta_path(sid: str) -> str:
+    return os.path.join(OUTPUT_FOLDER, f"rds_meta_{sid}.json")
+
+
+def _rds_session_save(sid: str):
+    """ذخیره‌ی نشست روی دیسک — تا ری‌استارت/دیپلوی وسط کار، نشست نمره.
+
+    🆕 فیکس «نشست منقضی شده»: قبلاً نشست فقط تو مموری بود و هر ری‌استارتِ
+    بات (دیپلوی خودکار و…) بین باز کردن پنل و زدن Apply همه‌چیز رو می‌بخت."""
+    st = rds_sessions.get(sid)
+    if not st:
+        return
+    st["ts"] = time.time()
+    try:
+        tmp = _rds_meta_path(sid) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({k: v for k, v in st.items() if k != "panel_msg"}, f)
+        os.replace(tmp, _rds_meta_path(sid))
+    except Exception:
+        pass
+
+
+def _rds_session_load(sid: str):
+    """نشست از مموری، اگه نبود از دیسک (بعد از ری‌استارت) — منقضی → None."""
+    st = _rds_session_get(sid)
+    if st:
+        return st
+    try:
+        with open(_rds_meta_path(sid), "r", encoding="utf-8") as f:
+            st = json.load(f)
+    except Exception:
+        return None
+    if time.time() - st.get("ts", 0) > RDS_TTL:
+        try:
+            os.remove(_rds_meta_path(sid))
+        except Exception:
+            pass
+        return None
+    if not os.path.exists(st.get("image_path", "")):
+        return None
+    rds_sessions[sid] = st
+    rds_active_by_chat.setdefault(st.get("chat_id"), sid)
+    return st
+
+
 def _rds_session_drop(sid: str):
     st = rds_sessions.pop(sid, None)
     if st:
         rds_active_by_chat.pop(st.get("chat_id"), None)
+    try:
+        os.remove(_rds_meta_path(sid))
+    except Exception:
+        pass
 
 
 def _rds_cycle(cycle, cur):
@@ -18032,7 +18098,14 @@ async def rds_open_callback(event):
     data = event.data.decode()
     session_id = data.replace("rdsopen_", "")
     state = ocr_sessions.get(session_id)
-    if not state:
+    if not state and os.path.exists(_rds_meta_path(session_id)):
+        # 🆕 ری‌استارت شده و ocr_sessions خالی شده — از فایل meta منو نجات بده
+        try:
+            with open(_rds_meta_path(session_id), "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = None
+    if not state or not os.path.exists(state.get("image_path", "")):
         await event.answer("⏰ نشست منقضی شده.", alert=True)
         return
     await event.answer("⚙️ پنل تنظیمات باز شد", alert=False)
@@ -18047,6 +18120,7 @@ async def rds_open_callback(event):
     except Exception:
         rds_sessions[session_id]["panel_msg"] = None
     rds_active_by_chat[state["chat_id"]] = session_id
+    _rds_session_save(session_id)
     await event.edit(
         _rds_panel_text(rds_sessions[session_id]),
         parse_mode="md",
@@ -18092,6 +18166,7 @@ async def rds_set_callback(event):
     else:
         return
     st["ts"] = time.time()
+    _rds_session_save(sid)
     await event.edit(_rds_panel_text(st), parse_mode="md", buttons=_rds_buttons(sid))
 
 
@@ -18099,7 +18174,7 @@ async def rds_apply_callback(event):
     """✅ Apply — کاهش حجم با پایپلاین سایت و ارسال به‌صورت فایل."""
     data = event.data.decode()
     session_id = data.replace("rdsapply_", "")
-    st = _rds_session_get(session_id)
+    st = _rds_session_load(session_id)
     if not st:
         await event.answer("⏰ نشست منقضی شده.", alert=True)
         return
@@ -18195,8 +18270,14 @@ async def rds_filebin_callback(event):
 
 
 def _rds_session_get_ocr_source(session_id: str):
-    """عکسِ منبع برای آپلود filebin — از نشست OCR (مستقل از نشست تنظیمات rds)."""
+    """عکسِ منبع برای آپلود filebin — نشست OCR یا فایل meta (بعد از ری‌استارت)."""
     state = ocr_sessions.get(session_id)
+    if not state and os.path.exists(_rds_meta_path(session_id)):
+        try:
+            with open(_rds_meta_path(session_id), "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = None
     if not state:
         return None
     return state["image_path"], state["chat_id"]
@@ -18208,7 +18289,7 @@ async def rds_handle_config_message(event) -> bool:
     sid = rds_active_by_chat.get(event.chat_id)
     if not sid:
         return False
-    st = rds_sessions.get(sid)
+    st = _rds_session_load(sid)
     if not st:
         rds_active_by_chat.pop(event.chat_id, None)
         return False
