@@ -2757,6 +2757,7 @@ async def download_with_controls(
                                     )
                                 except Exception:
                                     pass
+                                active_downloads.pop(dl_id, None)
                                 return None, "Cancelled by user", 0
 
                             if active_downloads.get(dl_id, {}).get("paused"):
@@ -2779,6 +2780,7 @@ async def download_with_controls(
                                             )
                                         except Exception:
                                             pass
+                                        active_downloads.pop(dl_id, None)
                                         return None, "Cancelled by user", 0
                                     await asyncio.sleep(0.5)
                                 last_update = 0.0
@@ -7124,6 +7126,7 @@ async def generic_url_handler(event):
             ul_id_all = f"ul_{event.chat_id}_{event.id}_{int(time.time())}"
             active_uploads[ul_id_all] = {"paused": False, "cancelled": False}
             upload_failed = False
+            upload_cancelled = False
             for i, part_path in enumerate(parts):
                 if active_uploads.get(ul_id_all, {}).get("cancelled"):
                     await safe_edit(status_msg, "🚫 Multi-part upload cancelled.")
@@ -7133,6 +7136,7 @@ async def generic_url_handler(event):
                         except:
                             pass
                     upload_failed = True
+                    upload_cancelled = True
                     break
                 part_size = os.path.getsize(part_path)
                 part_label = os.path.basename(part_path)
@@ -7163,6 +7167,7 @@ async def generic_url_handler(event):
                     )
                 except asyncio.CancelledError:
                     upload_failed = True
+                    upload_cancelled = True
                     for remaining in parts[i:]:
                         try:
                             os.remove(remaining)
@@ -7187,6 +7192,12 @@ async def generic_url_handler(event):
                     pass
 
             active_uploads.pop(ul_id_all, None)
+
+            if upload_failed and upload_cancelled:
+                await event.client.send_message(
+                    event.chat_id,
+                    "🚫 آپلود کنسل شد — پارت‌های باقی‌مونده از سرور پاک شدن.",
+                )
 
             if not upload_failed:
                 orig_fname = os.path.basename(filepath)
@@ -7315,8 +7326,27 @@ async def generic_url_handler(event):
                     await status_msg.delete()
                 except Exception:
                     pass
+            except asyncio.CancelledError:
+                # کنسل آپلود → فایل باید از سرور پاک بشه
+                active_uploads.pop(_ul_id, None)
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+                try:
+                    await status_msg.edit(
+                        "🚫 آپلود کنسل شد — فایل از سرور پاک شد.", buttons=None
+                    )
+                except Exception:
+                    pass
+                return
             except Exception as e:
                 active_uploads.pop(_ul_id, None)
+                # آپلود شکست خورد → فایل مرده روی سرور نمی‌مونه
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
                 await safe_edit(status_msg, f"❌ Upload failed: {str(e)[:100]}")
                 return
             try:
