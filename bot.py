@@ -694,7 +694,12 @@ def _parse_authorized_users() -> set:
 AUTHORIZED_USERS = _parse_authorized_users()
 
 MAX_FILE_SIZE_MB = 50000  # allow up to ~50GB (bot will split into 2GB parts)
-MAX_PART_SIZE = 1900 * 1024 * 1024  # هدف تکه‌تکه‌کردن (1.9GB — حاشیه‌ی امن برای کلیدفریم‌ها؛ خودِ تلگرام سقف بالاتری داره)
+# سقف واقعی آپلود MTProto برای اکانت عادی: 4000 پارت × 512KB = 2,097,152,000 بایت
+# (منبع: TDLib PartsManager.h — MAX_PART_COUNT=4000, MAX_PART_SIZE=512<<10)
+MAX_PART_SIZE = 2000 * 1024 * 1024
+# هدف برش کلیدفریمی ffmpeg — برش روی کلیدفریم ممکنه پارت رو تا اندازه‌ی یک GOP
+# بزرگ‌تر کنه؛ ۱۶ مگ حاشیه می‌ذاریم و پارت اورسایز (اگر پیش بیاد) دوباره تکه می‌شه
+FFMPEG_PART_TARGET = MAX_PART_SIZE - 16 * 1024 * 1024
 
 # ═══ سقف واقعی و بایت‌به‌بایت آپلود تلگرام (MTProto/Telethon) ═══
 #   بدون پریمیوم (شامل بات‌ها — بات نمی‌تونه پریمیوم بگیره):
@@ -1178,7 +1183,7 @@ async def split_video_smart(
     if shutil.which("ffmpeg"):
         duration = await _get_video_duration(filepath)
         if duration > 0:
-            num_parts = math.ceil(file_size / max_part_size)
+            num_parts = math.ceil(file_size / FFMPEG_PART_TARGET)
             segment_seconds = int(duration / num_parts)
             base, ext = os.path.splitext(filepath)
             if not ext: ext = ".mp4"
@@ -1202,6 +1207,21 @@ async def split_video_smart(
                 if proc.returncode == 0:
                     part_files = sorted(glob.glob(os.path.join(OUTPUT_FOLDER, f"{os.path.basename(base)}_part*{ext}")))
                     if part_files:
+                        # برش کلیدفریمی ممکنه پارتی رو از سقف 2GB رد کرده باشه → همون پارت دوباره تکه می‌شه
+                        final_parts = []
+                        for pf in part_files:
+                            if os.path.getsize(pf) > MAX_PART_SIZE:
+                                logger.warning(f"[SPLIT] ffmpeg part oversize → binary re-split: {pf}")
+                                final_parts.extend(
+                                    await split_file_into_parts(pf, MAX_PART_SIZE, status_msg)
+                                )
+                                try:
+                                    os.remove(pf)
+                                except Exception:
+                                    pass
+                            else:
+                                final_parts.append(pf)
+                        part_files = final_parts
                         logger.info(f"[SPLIT] FFmpeg -c copy split {len(part_files)} video parts successfully")
                         return part_files
             except Exception as e:
@@ -7062,7 +7082,7 @@ async def generic_url_handler(event):
         file_size = os.path.getsize(filepath)
 
         # 🆕 z18: فایل تا 2,097,152,000 بایت (سقف دقیق تلگرام) مستقیم آپلود می‌شه؛
-        # فقط بالاتر از سقف واقعی تکه‌تکه می‌شه (هدف پارت‌ها 1900MB می‌مونه برای حاشیه‌ی کلیدفریم)
+        # فقط بالاتر از سقف واقعی تکه‌تکه می‌شه (پارت‌ها تا سقف 2000MiB — هدف کلیدفریمی 1984MiB)
         if file_size > TG_UPLOAD_MAX_BYTES:
             # Large file — split into parts and upload each separately
             need_space = file_size + 512 * 1024 * 1024  # extra 512MB margin
