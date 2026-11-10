@@ -2163,7 +2163,7 @@ async def _download_single_curl_cffi(
                 "Accept-Language": "en-US,en;q=0.9",
             },
             allow_redirects=True,
-            timeout=600,
+            timeout=3600,   # 🆕 فایل‌های رنسکدِ بزرگِ واسطه روی CDN کند بیش از 10min طول می‌کشن
             stream=True,
         )
 
@@ -7628,6 +7628,34 @@ async def _ytvia_send_full_desc(event, meta: dict):
             break
 
 
+def _ytvia_is_truncated(meta: dict, real_dur: float) -> bool:
+    """🆕 نصفه‌دانلود: moov اولِ فایل mp4 سavenowئه و فایلِ ناقص هم پخش می‌شه
+    (کاربر فکر می‌کنه کیفیت پایینه!) — مدتِ واقعی با مدتِ ویدیو چک می‌شه."""
+    exp = float((meta or {}).get("duration") or 0)
+    if exp <= 0 or not real_dur or real_dur <= 0:
+        return False
+    return real_dur < exp * 0.9
+
+
+def _ytvia_integrity_note(want: dict, real_h: int, real_dur: float, real_size: int) -> str:
+    """🆕 یادداشتِ صادق کپشنِ فایلِ تحویلی: ارتفاعِ واقعی + بیت‌ریتِ رنسکد واسطه."""
+    note = ""
+    if (want or {}).get("kind") != "video":
+        return note
+    req_h = int(want.get("height") or 0)
+    if real_h and req_h and real_h < req_h - 60:
+        note += f"\n⚠️ واسطه دقیقاً {req_h}p نداشت — نزدیک‌ترین {real_h}p تحویل شد"
+    orig_br = int(want.get("bitrate") or 0)
+    if real_dur > 0 and real_size > 0 and orig_br > 0:
+        real_br = real_size * 8 / real_dur / 1000   # kbps کل (ویدیو+صدا)
+        if real_br < (orig_br / 1000) * 0.6:        # orig_br بر حسب bps است!
+            note += (
+                f"\nℹ️ واسطه رنسکد می‌کنه: ~{real_br:.0f}kbps در برابر "
+                f"استریم اصلیِ یوتوب ~{orig_br / 1000:.0f}kbps"
+            )
+    return note
+
+
 def _ytvia_sanitize(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|]+', "_", name or "video").strip()
     return (name[:80] or "video")
@@ -7714,6 +7742,7 @@ async def process_ytvia_request(event, url: str, status_msg):
         for f in ordered[:14]
     )
     caption += f"\n\n**فرمت‌های واقعی این ویدیو:**\n{qline}"
+    caption += "\nℹ️ حجم‌ها برآوردِ استریمِ اصلیِ یوتوبه؛ واسطه رنسکد می‌کنه و معمولاً کم‌حجم‌تر تحویل می‌ده"
     if len(caption) > 1024:
         caption = caption[:1021].rstrip() + " …"
 
@@ -7795,9 +7824,6 @@ async def ytvia_pick_callback(event):
             f"🔗 درخواست لینک از سایت واسط...\n{kind} {title[:70]}\n"
             f"🎯 {_ytvia_btn_label(want)[2:]}",
         )
-        dl_url = await ytvia_get_dl_url(sess["url"], want)
-
-        await safe_edit(status_msg, f"⏬ دانلود از CDN واسطه...\n{kind} {title[:70]}")
         os.makedirs(OUTPUT_FOLDER, exist_ok=True)
         ext = want.get("ext") or ("mp4" if want["kind"] == "video" else "m4a")
         if want["kind"] == "audio" and ext not in ("m4a", "mp3"):
@@ -7806,32 +7832,51 @@ async def ytvia_pick_callback(event):
         filepath = os.path.join(
             OUTPUT_FOLDER, f"yt_{_ytvia_sanitize(title)}_{qtag}.{ext}"
         )
-        got_path, err, _sz = await _download_via_curl_cffi(dl_url, filepath, status_msg, dl_id)
-        if not got_path:
-            # لینک واسطه ممکنه کوتاه‌عمر باشه → یه بار دیگه از اول
-            await safe_edit(status_msg, "🔁 لینک منقضی شده — درخواست مجدد از واسطه...")
-            dl_url = await ytvia_get_dl_url(sess["url"], want)
+
+        got_path, err, _sz = None, None, 0
+        _h_i, _d_i = 0, 0.0
+        for attempt in range(2):
+            try:
+                dl_url = await ytvia_get_dl_url(sess["url"], want)
+            except Exception as e:
+                err = f"واسطه: {e}"
+                break
+            attempt_tag = f"\n🔁 تلاش {attempt + 1}/2" if attempt else ""
+            await safe_edit(
+                status_msg,
+                f"⏬ دانلود از CDN واسطه...\n{kind} {title[:70]}{attempt_tag}",
+            )
             got_path, err, _sz = await _download_via_curl_cffi(dl_url, filepath, status_msg, dl_id)
+            if not got_path:
+                continue
+            # 🆕 سلامت‌سنجی — moov اولِ فایله و نصفه‌دانلود هم پخش می‌شه؛
+            # مدتِ واقعی رو با مدتِ ویدیو چک می‌کنیم و ناقص رو رد می‌کنیم
+            _h_i, _d_i = 0, 0.0
+            try:
+                _d_i, _w_i, _h_i = await get_video_info(got_path)
+            except Exception:
+                pass
+            if want["kind"] == "video" and _ytvia_is_truncated(meta, float(_d_i or 0)):
+                logger.warning(
+                    f"[YTVIA] truncated file: real {float(_d_i or 0):.0f}s "
+                    f"vs expected {float(meta.get('duration') or 0):.0f}s"
+                )
+                try:
+                    os.remove(got_path)
+                except Exception:
+                    pass
+                got_path, err = None, f"فایل ناقص اومد ({float(_d_i or 0):.0f} از {float(meta.get('duration') or 0):.0f} ثانیه)"
+                continue
+            break
         if not got_path:
             await safe_edit(status_msg, f"❌ دانلود ناموفق: {err or 'نامشخص'}")
             return
 
-        # 🆕 صحت‌سنجی کیفیت واقعی با ffprobe + حجم واقعی → کپشن صادق
-        # (واسطه‌ی بایت ترنسکد می‌کنه؛ گاهی ارتفاع واقعی با خواسته فرق داره)
-        q_note = ""
-        if want["kind"] == "video":
-            _h_i = 0
-            try:
-                _d_i, _w_i, _h_i = await get_video_info(got_path)
-            except Exception:
-                _h_i = 0
-            req_h = int(want.get("height") or 0)
-            if _h_i and req_h and _h_i < req_h - 60:
-                q_note = f"\n⚠️ واسطه دقیقاً {req_h}p نداشت — نزدیک‌ترین {_h_i}p تحویل شد"
         try:
             real_size = os.path.getsize(got_path)
         except Exception:
             real_size = 0
+        q_note = _ytvia_integrity_note(want, int(_h_i or 0), float(_d_i or 0), real_size)
 
         # توضیحاتِ کامل در پیام جدا بعد از آپلود میاد → کپشنِ فایل بدون توضیحات
         caption = _ytvia_caption(meta, desc_budget=0)
