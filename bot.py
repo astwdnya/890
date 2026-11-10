@@ -725,6 +725,7 @@ user_state: Dict[int, Dict] = {}
 admin_pending_add: Dict[int, bool] = {}
 active_downloads: Dict[str, Dict] = {}
 active_uploads: Dict[str, Dict] = {}
+ul_parts: Dict[str, Dict] = {}  # 🆕 پنل تیک‌زدن پارت‌های آپلود (key: ul_id)
 
 
 # ═══════════════ صف سراسری دانلود/آپلود ═══════════════
@@ -3095,8 +3096,13 @@ async def send_file_with_progress(
             ul_buttons = [Button.inline("❌ Cancel", f"ulcancel_{ul_id}")]
 
         async def progress_cb(current: int, total: int):
-            if ul_id and active_uploads.get(ul_id, {}).get("cancelled"):
-                raise asyncio.CancelledError("Upload cancelled by user")
+            if ul_id:
+                st_up = active_uploads.get(ul_id) or {}
+                if st_up.get("cancelled"):
+                    raise asyncio.CancelledError("Upload cancelled by user")
+                if st_up.get("skip"):
+                    # 🆕 پارتِ در حال آپلود تیکش برداشته شد → همین پارت کنسل
+                    raise asyncio.CancelledError("Part skipped by user")
             now = time.time()
             if now - last_update[0] < 3.0 and current != total:
                 return
@@ -7167,10 +7173,40 @@ async def generic_url_handler(event):
             total_parts = len(parts)
             base_name = os.path.basename(filepath)
             ul_id_all = f"ul_{event.chat_id}_{event.id}_{int(time.time())}"
+
+            # 🆕 پنل تیک‌زدن پارت‌ها — پارت‌هایی که از قبل داری رو ⬜ کن تا آپلود نشن
+            ul_parts[ul_id_all] = {
+                "states": [True] * total_parts,
+                "sizes": [os.path.getsize(p) for p in parts],
+                "chat_id": event.chat_id,
+                "current": -1,
+                "go": asyncio.Event(),
+                "panel_msg": None,
+            }
+            try:
+                ul_parts[ul_id_all]["panel_msg"] = await event.client.send_message(
+                    event.chat_id,
+                    _ul_parts_text(ul_id_all),
+                    buttons=_ul_parts_buttons(ul_id_all),
+                    parse_mode="md",
+                    link_preview=False,
+                )
+            except Exception as e:
+                logger.warning(f"[ULParts] panel send failed: {e}")
+            try:
+                # حداکثر ۱۵ دقیقه وقت داری تیک بزنی؛ بعدش خودکار با تیک‌های فعلی شروع می‌شه
+                await asyncio.wait_for(ul_parts[ul_id_all]["go"].wait(), timeout=900)
+            except asyncio.TimeoutError:
+                pass
+
             active_uploads[ul_id_all] = {"paused": False, "cancelled": False}
             upload_failed = False
             upload_cancelled = False
-            total_upload_bytes = sum(os.path.getsize(p) for p in parts)
+            skipped_parts: list = []
+            states_ref = ul_parts[ul_id_all]["states"]
+            total_upload_bytes = sum(
+                os.path.getsize(p) for i, p in enumerate(parts) if states_ref[i]
+            )
             uploaded_so_far = 0
             for i, part_path in enumerate(parts):
                 if active_uploads.get(ul_id_all, {}).get("cancelled"):
@@ -7183,6 +7219,19 @@ async def generic_url_handler(event):
                     upload_failed = True
                     upload_cancelled = True
                     break
+                # 🆕 پارت تیک‌نخورده → ردش کن و برو سراغ پارت بعدی
+                if not states_ref[i]:
+                    skipped_parts.append(i + 1)
+                    try:
+                        os.remove(part_path)
+                    except:
+                        pass
+                    await safe_edit(
+                        status_msg,
+                        f"⏭️ پارت {i + 1}/{total_parts} تیک‌نخورده بود — رد شد.",
+                    )
+                    continue
+                ul_parts[ul_id_all]["current"] = i
                 part_size = os.path.getsize(part_path)
                 part_label = os.path.basename(part_path)
                 pct_done = (
@@ -7218,6 +7267,19 @@ async def generic_url_handler(event):
                         progress_total=total_upload_bytes,
                     )
                 except asyncio.CancelledError:
+                    if active_uploads.get(ul_id_all, {}).get("skip"):
+                        # 🆕 تیک همین پارت وسط آپلود برداشته شد → فقط همین پارت کنسل می‌شه
+                        active_uploads[ul_id_all]["skip"] = False
+                        skipped_parts.append(i + 1)
+                        try:
+                            os.remove(part_path)
+                        except:
+                            pass
+                        await safe_edit(
+                            status_msg,
+                            f"⏭️ پارت {i + 1}/{total_parts} وسط آپلود کنسل شد — می‌رم پارت بعدی.",
+                        )
+                        continue
                     upload_failed = True
                     upload_cancelled = True
                     for remaining in parts[i:]:
@@ -7245,6 +7307,31 @@ async def generic_url_handler(event):
                     pass
 
             active_uploads.pop(ul_id_all, None)
+
+            # 🆕 جمع‌بندی پنل پارت‌ها
+            st_p = ul_parts.pop(ul_id_all, None)
+            if st_p:
+                pm = st_p.get("panel_msg")
+                if pm is not None:
+                    try:
+                        done_n = total_parts - len(skipped_parts)
+                        head = (
+                            "🚫 **آپلود پارت‌ها کنسل شد**"
+                            if upload_cancelled or upload_failed
+                            else "🧩 **آپلود پارت‌ها تموم شد**"
+                        )
+                        summary = (
+                            f"{head}\n\n"
+                            f"📤 آپلودشده: {done_n}/{total_parts} پارت\n"
+                            f"⏭️ ردشده (تیک‌نخورده): {len(skipped_parts)} پارت"
+                        )
+                        if skipped_parts:
+                            summary += (
+                                f"\n⏱ شماره‌ها: {', '.join(map(str, skipped_parts))}"
+                            )
+                        await pm.edit(summary, buttons=None, parse_mode="md")
+                    except Exception:
+                        pass
 
             if upload_failed and upload_cancelled:
                 await event.client.send_message(
@@ -7437,11 +7524,11 @@ def _ytvia_fmt_duration(sec) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def _ytvia_caption(meta: dict) -> str:
-    """کپشن کامل متادیتا — هم منو، هم زیر فایل تحویلی."""
+def _ytvia_caption(meta: dict, desc_budget: int = 700) -> str:
+    """کپشن کامل متادیتا — هم منو، هم زیر فایل تحویلی. سقف کپشن تلگرام 1024 → کلمپ می‌شه."""
     desc = (meta.get("description") or "").strip()
-    if len(desc) > 700:
-        desc = desc[:700].rstrip() + " …"
+    if len(desc) > desc_budget:
+        desc = desc[:desc_budget].rstrip() + " …"
     lines = [f"🎬 **{meta.get('title') or 'بدون عنوان'}**"]
     if meta.get("author"):
         lines.append(f"👤 {meta['author']}")
@@ -7461,7 +7548,11 @@ def _ytvia_caption(meta: dict) -> str:
         lines.append(f"📝 {desc}")
     lines.append("")
     lines.append(f"🔗 {meta.get('link') or ''}")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if len(text) > 1024:
+        # سقف سخت کپشن تلگرام (media caption = 1024)
+        text = text[:1021].rstrip() + " …"
+    return text
 
 
 def _ytvia_sanitize(name: str) -> str:
@@ -7547,7 +7638,14 @@ async def process_ytvia_request(event, url: str, status_msg):
         (f["quality"] if f["kind"] == "video" else f"🎵{f['quality']}") + f["ext"]
         for f in ordered[:14]
     )
-    caption += f"\n\n**فرمت‌های واقعی این ویدیو:**\n{qline}"
+    qblock = f"\n\n**فرمت‌های واقعی این ویدیو:**\n{qline}"
+    if len(caption) + len(qblock) > 1024:
+        # 🆕 کپشن بلندتر از سقف 1024 تلگرام نشه — بخش توضیحات رو کم می‌کنیم
+        overflow = len(caption) + len(qblock) - 1015
+        caption = _ytvia_caption(meta, desc_budget=max(0, 700 - overflow))
+    caption += qblock
+    if len(caption) > 1024:
+        caption = caption[:1021].rstrip() + " …"
 
     try:
         if thumb_path and os.path.exists(thumb_path):
@@ -16454,43 +16552,8 @@ async def sarrast_pdf_translated_callback(event):
 
 
 async def itchio_watch_callback(event):
-    """شروع دنبال کردن قیمت یه بازی itch.io (دکمه‌ی 👀)."""
-    data = event.data.decode()
-    # فرمت: itwatch_<msg_id>
-    msg_id = data.replace("itwatch_", "")
-    state_key = f"{event.chat_id}_{msg_id}"
-    state = itchio_states.get(state_key)
-    if not state:
-        await event.answer("⏰ نشست منقضی شده. لینک بازی رو دوباره بفرست.", alert=True)
-        return
-
-    url = state.get("url", "")
-    info = state.get("info", {})
-    title = info.get("title", "بازی")
-    actual_price = info.get("actual_price") or 0
-
-    if not url:
-        await event.answer("❌ خطا در پیدا کردن بازی.", alert=True)
-        return
-
-    itchio_watchers[url] = {
-        "chat_id": event.chat_id,
-        "title": title,
-        "last_price": actual_price,
-        "added_at": time.time(),
-    }
-    await event.answer(f"👀 دنبال کردن «{title[:30]}» فعال شد!", alert=False)
-    try:
-        await event.edit(
-            f"👀 **{title}** دنبال میشه.\n\n"
-            f"💰 قیمت فعلی: **${actual_price / 100:.2f}**\n"
-            f"🔄 هر ساعت چک می‌کنم و به محض رایگان شدن، خودکار دانلودش می‌کنم و برات می‌فرستم.\n\n"
-            f"⏹ برای لغو: /itchwatch off",
-            buttons=None,
-            parse_mode="md",
-        )
-    except Exception:
-        pass
+    """🚫 ItchIoWatcher غیرفعال شد (به‌خواست کاربر) — حلقه‌ی چک قیمت دیگه اجرا نمی‌شه."""
+    await event.answer("👀 ItchIoWatcher غیرفعاله.", alert=True)
 
 
 async def itchio_watch_off_command(event):
@@ -17196,9 +17259,12 @@ async def faceswap_init_callback(event):
     session_id = data.replace("fsinit_", "")
 
     # پیدا کردن عکس target از OCR sessions
-    ocr_state = ocr_sessions.get(session_id)
+    ocr_state = _ocr_session_or_meta(session_id)
     if not ocr_state:
         await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    if not os.path.exists(ocr_state.get("image_path", "")):
+        await event.answer("⌛ عکس از سرور پاک شده — لطفاً عکس رو دوباره بفرست.", alert=True)
         return
 
     target_image_path = ocr_state["image_path"]
@@ -17309,9 +17375,12 @@ async def bgrm_init_callback(event):
     data = event.data.decode()
     session_id = data.replace("bgrm_", "")
 
-    ocr_state = ocr_sessions.get(session_id)
+    ocr_state = _ocr_session_or_meta(session_id)
     if not ocr_state:
         await event.answer("⏰ نشست منقضی شده. عکس رو دوباره بفرست.", alert=True)
+        return
+    if not os.path.exists(ocr_state.get("image_path", "")):
+        await event.answer("⌛ عکس از سرور پاک شده — لطفاً عکس رو دوباره بفرست.", alert=True)
         return
 
     # Image path is stored in OCR session — reuse it
@@ -17856,7 +17925,7 @@ async def ocr_extract_callback(event):
     """استخراج متن از تصویر با کلیک روی دکمه شیشه‌ای."""
     data = event.data.decode()
     session_id = data.replace("ocrex_", "")
-    state = ocr_sessions.get(session_id)
+    state = _ocr_session_or_meta(session_id)
     if not state:
         await event.answer("⏰ نشست منقضی شده.", alert=True)
         return
@@ -17864,7 +17933,7 @@ async def ocr_extract_callback(event):
 
     image_path = state["image_path"]
     if not os.path.exists(image_path):
-        await event.edit("❌ فایل تصویر پیدا نشد. دوباره عکس رو بفرست.")
+        await event.edit("❌ عکس از سرور پاک شده. دوباره عکس رو بفرست.")
         ocr_sessions.pop(session_id, None)
         return
 
@@ -17890,13 +17959,10 @@ async def ocr_extract_callback(event):
         logger.error(f"[OCR] Callback error: {e}", exc_info=True)
         await event.edit(f"❌ خطا: {e}", buttons=None)
     finally:
-        # Cleanup
-        try:
-            if os.path.exists(image_path):
-                os.unlink(image_path)
-        except Exception:
-            pass
-        ocr_sessions.pop(session_id, None)
+        # 🆕 عکس و نشست حذف نمی‌شن — دکمه‌های منوی برگشت (📉 کاهش حجم /
+        # 🗑 بکگراند / ☁️ Filebin) بعد از OCR هنوز باید کار کنن.
+        # پاک‌سازی خودکار با janitor (فایل‌های قدیمی‌تر از ۶ ساعت).
+        pass
 
 
 # ═══════════════ 📉 کاهش حجم عکس (مهندسی معکوس reduceimages.com) ═══════════════
@@ -17948,6 +18014,148 @@ def _rds_session_get(sid: str):
 
 def _rds_meta_path(sid: str) -> str:
     return os.path.join(OUTPUT_FOLDER, f"rds_meta_{sid}.json")
+
+
+def _ocr_session_or_meta(session_id: str):
+    """🆕 نشست عکس — اول مموری، اگه بعد از ری‌استارت نبود → فایل meta دیسک.
+
+    None یعنی هیچی معلوم نیست؛ «image غ» یعنی نشست هست ولی فایل عکس پاک شده."""
+    state = ocr_sessions.get(session_id)
+    if not state and os.path.exists(_rds_meta_path(session_id)):
+        try:
+            with open(_rds_meta_path(session_id), "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = None
+    return state
+
+
+async def _menu_file_janitor():
+    """🆕 حلقه‌ی پاک‌سازی: عکس‌های منو (ocr_img_*/ocr_doc_*) و فایل‌های meta
+    قدیمی‌تر از ۶ ساعت رو پاک می‌کنه — چون OCR دیگه عکس رو حذف نمی‌کنه."""
+    logger.info("[Janitor] started (menu images + rds meta, TTL 6h)")
+    while True:
+        try:
+            await asyncio.sleep(1800)
+            now = time.time()
+            for name in os.listdir(OUTPUT_FOLDER):
+                if not (
+                    name.startswith(("ocr_img_", "ocr_doc_", "rds_meta_", "rds_"))
+                ):
+                    continue
+                path = os.path.join(OUTPUT_FOLDER, name)
+                try:
+                    if os.path.isfile(path) and now - os.path.getmtime(path) > 6 * 3600:
+                        os.remove(path)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[Janitor] loop error: {e}")
+
+
+# ═══════════════ 🆕 پنل تیک‌زدن پارت‌های آپلود (آپلود پارت‌پارتی) ═══════════════
+
+def _ul_parts_text(ul_id: str) -> str:
+    st = ul_parts.get(ul_id) or {}
+    states = st.get("states") or []
+    sizes = st.get("sizes") or []
+    sel = [i for i, s in enumerate(states) if s]
+    sel_bytes = sum(sizes[i] for i in sel if i < len(sizes))
+    lines = [
+        "🧩 **پنل آپلود پارت‌پارتی**",
+        "",
+        "پارت‌هایی که از قبل داری رو ⬜ کن تا دوباره آپلود نشن؛",
+        "بقیه ✅ می‌مونن و آپلود می‌شن.",
+        "",
+        f"☑️ انتخاب‌شده: {len(sel)}/{len(states)} پارت — {human_readable_size(sel_bytes)}",
+    ]
+    return "\n".join(lines)
+
+
+def _ul_parts_buttons(ul_id: str) -> list:
+    st = ul_parts.get(ul_id) or {}
+    states = st.get("states") or []
+    sizes = st.get("sizes") or []
+    buttons = []
+    row = []
+    for i, ticked in enumerate(states):
+        size_str = human_readable_size(sizes[i]) if i < len(sizes) else "?"
+        mark = "✅" if ticked else "⬜"
+        row.append(
+            Button.inline(
+                f"🧩 پارت {i + 1} {mark} · {size_str}", f"ulpt_{ul_id}_{i}"
+            )
+        )
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append(
+        [
+            Button.inline("🚀 شروع آپلود", f"ulgo_{ul_id}"),
+            Button.inline("☑️ همه", f"ulpt_{ul_id}_all"),
+            Button.inline("⬜ هیچ", f"ulpt_{ul_id}_none"),
+        ]
+    )
+    return buttons
+
+
+async def ulparts_toggle_callback(event):
+    """تیک/برداشتن تیک هر پارت — اگه پارتِ در حالِ آپلود تیکش بره، همون پارت کنسل می‌شه."""
+    data = event.data.decode()
+    body = data.replace("ulpt_", "")
+    if not body:
+        return
+    await event.answer()
+    if body.endswith("_all") or body.endswith("_none"):
+        ul_id = body[:-4] if body.endswith("_all") else body[:-5]
+        st = ul_parts.get(ul_id)
+        if not st:
+            await event.answer("⏰ این آپلود تموم شده.", alert=True)
+            return
+        st["states"][:] = [body.endswith("_all")] * len(st["states"])
+    else:
+        try:
+            ul_id, idx_s = body.rsplit("_", 1)
+            idx = int(idx_s)
+        except ValueError:
+            return
+        st = ul_parts.get(ul_id)
+        if not st or not (0 <= idx < len(st["states"])):
+            await event.answer("⏰ این آپلود تموم شده.", alert=True)
+            return
+        st["states"][idx] = not st["states"][idx]
+        # 🆕 اگه همین پارت الان داره آپلود می‌شه و تیکش برداشته شد → کنسلش کن
+        if (
+            not st["states"][idx]
+            and st.get("current") == idx
+            and ul_id in active_uploads
+        ):
+            active_uploads[ul_id]["skip"] = True
+            await event.answer(f"⏭️ پارت {idx + 1} کنسل می‌شه...", alert=False)
+    try:
+        await event.edit(_ul_parts_text(ul_id), parse_mode="md", buttons=_ul_parts_buttons(ul_id))
+    except Exception:
+        pass
+
+
+async def ulparts_go_callback(event):
+    """🚀 شروع آپلود فقط پارت‌های تیک‌خورده."""
+    data = event.data.decode()
+    ul_id = data.replace("ulgo_", "")
+    st = ul_parts.get(ul_id)
+    if not st:
+        await event.answer("⏰ این آپلود تموم شده.", alert=True)
+        return
+    if not any(st["states"]):
+        await event.answer("حداقل یه پارت رو تیک بزن.", alert=True)
+        return
+    if not st["go"].is_set():
+        st["go"].set()
+        await event.answer("🚀 آپلود شروع شد", alert=False)
 
 
 def _rds_session_save(sid: str):
@@ -18097,16 +18305,13 @@ async def rds_open_callback(event):
     """📉 کاهش حجم عکس — پنل تنظیمات با دیفالت‌های reduceimages.com."""
     data = event.data.decode()
     session_id = data.replace("rdsopen_", "")
-    state = ocr_sessions.get(session_id)
-    if not state and os.path.exists(_rds_meta_path(session_id)):
-        # 🆕 ری‌استارت شده و ocr_sessions خالی شده — از فایل meta منو نجات بده
-        try:
-            with open(_rds_meta_path(session_id), "r", encoding="utf-8") as f:
-                state = json.load(f)
-        except Exception:
-            state = None
-    if not state or not os.path.exists(state.get("image_path", "")):
+    state = _ocr_session_or_meta(session_id)
+    if not state:
         await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    if not os.path.exists(state.get("image_path", "")):
+        # 🆕 ری‌استارت/پاک‌سازی → فایل عکس رفته؛ پیام واضح به‌جای «منقضی»
+        await event.answer("⌛ عکس از سرور پاک شده — لطفاً عکس رو دوباره بفرست.", alert=True)
         return
     await event.answer("⚙️ پنل تنظیمات باز شد", alert=False)
     # هر بار باز شدن = دیفالت‌های سایت (Width 70 / Height 70 / percent / JPG / Q90 / سفید)
@@ -18271,13 +18476,7 @@ async def rds_filebin_callback(event):
 
 def _rds_session_get_ocr_source(session_id: str):
     """عکسِ منبع برای آپلود filebin — نشست OCR یا فایل meta (بعد از ری‌استارت)."""
-    state = ocr_sessions.get(session_id)
-    if not state and os.path.exists(_rds_meta_path(session_id)):
-        try:
-            with open(_rds_meta_path(session_id), "r", encoding="utf-8") as f:
-                state = json.load(f)
-        except Exception:
-            state = None
+    state = _ocr_session_or_meta(session_id)
     if not state:
         return None
     return state["image_path"], state["chat_id"]
@@ -24416,6 +24615,9 @@ async def main():
 
     # ─── New site handlers (27 sites) ─────────────────
     # ثبت callback‌های همه‌ی سایت‌های جدید
+    # 🆕 پنل تیک‌زدن پارت‌های آپلود
+    client.add_event_handler(ulparts_toggle_callback, events.CallbackQuery(pattern=r"^ulpt_"))
+    client.add_event_handler(ulparts_go_callback, events.CallbackQuery(pattern=r"^ulgo_"))
     client.add_event_handler(hellporno_quality_callback, events.CallbackQuery(pattern=r"hpo_q_.+"))
     client.add_event_handler(hellporno_cancel_callback, events.CallbackQuery(pattern=r"hpo_cancel_.+"))
     client.add_event_handler(alphaporno_quality_callback, events.CallbackQuery(pattern=r"apo_q_.+"))
@@ -24686,8 +24888,10 @@ async def main():
         f"[BOOT] GitHub enabled: {GITHUB_ENABLED} | repo: {GITHUB_REPO if github_configured() else 'not configured'}"
     )
     print(f"✅ Bot is online → @{me.username}")
-    # شروع حلقه‌ی مراقبت قیمت itch.io
-    asyncio.create_task(_itchio_watcher_loop())
+    # 🆕 حلقه‌ی پاک‌سازی خودکار عکس‌های منو و فایل‌های meta
+    asyncio.create_task(_menu_file_janitor())
+    # 🚫 ItchIoWatcher غیرفعال شد (به‌خواست کاربر) — برای فعال‌سازی خط بعد رو از کامنت دربیار
+    # asyncio.create_task(_itchio_watcher_loop())
 
     await client.run_until_disconnected()
 
