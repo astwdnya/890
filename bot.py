@@ -5907,7 +5907,20 @@ async def generic_url_handler(event):
         if mime.startswith("image/"):
             try:
                 temp_path = os.path.join(OUTPUT_FOLDER, f"ocr_doc_{event.chat_id}_{event.id}")
-                await event.message.download_media(temp_path)
+                saved_path = await event.message.download_media(temp_path)
+                # 🆕 Tele وقتی مسیر پسوند نداره خودش پسوند اصلی (مثلاً .jpg/.png)
+                # اضافه می‌کنه و فایل رو با اون اسم ذخیره می‌کنه — مسیر واقعی رو استفاده کن
+                # (قبلاً نشست با مسیرِ بدون پسوند ذخیره می‌شد → «عکس از سرور پاک شده»)
+                actual_path = saved_path or temp_path
+                if not os.path.isfile(actual_path):
+                    for ext in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"):
+                        if os.path.isfile(temp_path + ext):
+                            actual_path = temp_path + ext
+                            break
+                if not os.path.isfile(actual_path):
+                    await event.reply("❌ دانلود فایل تصویر ناموفق بود — دوباره بفرست.")
+                    return
+                temp_path = actual_path
                 session_id = f"ocr_{event.chat_id}_{event.id}_{int(time.time())}"
                 ocr_sessions[session_id] = {
                     "image_path": temp_path,
@@ -7525,9 +7538,12 @@ def _ytvia_fmt_duration(sec) -> str:
 
 
 def _ytvia_caption(meta: dict, desc_budget: int = 700) -> str:
-    """کپشن کامل متادیتا — هم منو، هم زیر فایل تحویلی. سقف کپشن تلگرام 1024 → کلمپ می‌شه."""
+    """کپشن متادیتا — هم منو، هم زیر فایل تحویلی. سقف کپشن تلگرام 1024 → کلمپ می‌شه.
+    desc_budget=0 → توضیحات کلاً حذف می‌شه (برای منو؛ توضیحات کامل در پیام جدا میاد)."""
     desc = (meta.get("description") or "").strip()
-    if len(desc) > desc_budget:
+    if desc_budget <= 0:
+        desc = ""
+    elif len(desc) > desc_budget:
         desc = desc[:desc_budget].rstrip() + " …"
     lines = [f"🎬 **{meta.get('title') or 'بدون عنوان'}**"]
     if meta.get("author"):
@@ -7553,6 +7569,41 @@ def _ytvia_caption(meta: dict, desc_budget: int = 700) -> str:
         # سقف سخت کپشن تلگرام (media caption = 1024)
         text = text[:1021].rstrip() + " …"
     return text
+
+
+def _ytvia_split_text(text: str, limit: int = 3900) -> list:
+    """متنِ بلند رو به تکه‌های ≤ limit تقسیم می‌کنه (سقف پیام متنی تلگرام 4096)."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    parts = []
+    while text:
+        parts.append(text[:limit])
+        text = text[limit:]
+    return parts
+
+
+async def _ytvia_send_full_desc(event, meta: dict):
+    """🆕 توضیحاتِ کامل ویدیو («کپشن کامل») در پیام متنی جدا.
+    کپشنِ عکس سقف 1024 داره ولی پیام متنی تا 4096 جا داره؛ توضیحاتِ
+    بلندتر به چند پیام تقسیم می‌شه. parse_mode خام تا * و [ داخل
+    توضیحات به‌عنوان مارک‌داون تفسیر نشن."""
+    desc_full = (meta.get("description") or "").strip()
+    if not desc_full:
+        return
+    header = "📝 توضیحات کامل ویدیو:\n\n"
+    chunks = _ytvia_split_text(desc_full)
+    for i, ch in enumerate(chunks):
+        text = (header if i == 0 else "") + ch
+        if len(chunks) > 1:
+            text += f"\n\n— بخش {i + 1}/{len(chunks)} —"
+        try:
+            await event.client.send_message(
+                event.chat_id, text, link_preview=False, parse_mode=None
+            )
+        except Exception as e:
+            logger.warning(f"[YTVIA] full-desc send failed: {e}")
+            break
 
 
 def _ytvia_sanitize(name: str) -> str:
@@ -7633,17 +7684,14 @@ async def process_ytvia_request(event, url: str, status_msg):
         buttons.append(row)
     buttons.append([Button.inline("❌ لغو", f"ytvia_c_{session_id}")])
 
-    caption = _ytvia_caption(meta)
+    # 🆕 کپشنِ عکس کوتاه می‌مونه (سقف تلگرام 1024)؛ توضیحات کامل در پیام
+    # جدا بعد از منو میاد (سقف پیام متنی 4096) — دیگه «caption too long» نداریم
+    caption = _ytvia_caption(meta, desc_budget=0)
     qline = " • ".join(
         (f["quality"] if f["kind"] == "video" else f"🎵{f['quality']}") + f["ext"]
         for f in ordered[:14]
     )
-    qblock = f"\n\n**فرمت‌های واقعی این ویدیو:**\n{qline}"
-    if len(caption) + len(qblock) > 1024:
-        # 🆕 کپشن بلندتر از سقف 1024 تلگرام نشه — بخش توضیحات رو کم می‌کنیم
-        overflow = len(caption) + len(qblock) - 1015
-        caption = _ytvia_caption(meta, desc_budget=max(0, 700 - overflow))
-    caption += qblock
+    caption += f"\n\n**فرمت‌های واقعی این ویدیو:**\n{qline}"
     if len(caption) > 1024:
         caption = caption[:1021].rstrip() + " …"
 
@@ -7664,6 +7712,8 @@ async def process_ytvia_request(event, url: str, status_msg):
             )
         ytvia_sessions[session_id]["menu_msg"] = menu_msg
         await status_msg.delete()
+        # 🆕 کپشن کامل — توضیحاتِ کامل ویدیو در پیام متنی جدا زیر منو
+        await _ytvia_send_full_desc(event, meta)
     except Exception as e:
         logger.warning(f"[YTVIA] menu send failed: {e}")
         try:
