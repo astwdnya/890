@@ -947,6 +947,8 @@ async def dlq_take_ticket(event, dl_id: Optional[str], title: str = ""):
         except Exception:
             pass
 
+    # self-heal: کار فعالِ بالای سقف زمانی قبل از چکِ «کاربر تو صفه» آزاد بشه
+    dl_queue.stall_check()
     try:
         job = await dl_queue.join(
             event.sender_id, title=str(title or "")[:60], on_position=_pos_cb
@@ -960,8 +962,6 @@ async def dlq_take_ticket(event, dl_id: Optional[str], title: str = ""):
         except Exception:
             pass
         return None
-
-    dl_queue.stall_check()
 
     if not job.turn_ready:
         try:
@@ -2545,12 +2545,16 @@ async def download_with_controls(
                     url, headers=attempt_headers, allow_redirects=True
                 ) as response:
                     if response.status == 403:
+                        active_downloads.pop(dl_id, None)
                         return None, "HTTP_403", 0
                     if response.status not in (200, 206):
+                        active_downloads.pop(dl_id, None)
                         return None, f"HTTP {response.status}", 0
 
                     ct = (response.headers.get("Content-Type", "") or "").lower()
                     if "text/html" in ct:
+                        # بدون این pop، watcher صف تا ۶ ساعت نوبت رو آزاد نمی‌کنه
+                        active_downloads.pop(dl_id, None)
                         return (
                             None,
                             "Got HTML page instead of file (redirected to ad)",
@@ -2568,6 +2572,7 @@ async def download_with_controls(
                         else:
                             total = content_length
                         if total > MAX_FILE_SIZE_MB * 1024 * 1024:
+                            active_downloads.pop(dl_id, None)
                             return (
                                 None,
                                 f"File too large ({human_readable_size(total)})",
@@ -3267,6 +3272,7 @@ async def do_download_and_send(
             filepath, dl_error, final_size = await download_with_playwright(
                 direct_url, status_msg, dl_id3
             )
+            active_downloads.pop(dl_id3, None)
             if dl_error or not filepath:
                 await safe_edit(
                     status_msg,
@@ -7055,6 +7061,7 @@ async def generic_url_handler(event):
                 filepath, error, size = await download_with_playwright(
                     target_url, status_msg, dl_id2
                 )
+                active_downloads.pop(dl_id2, None)
                 if error or not filepath:
                     await safe_edit(
                         status_msg,
