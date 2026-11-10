@@ -2979,6 +2979,9 @@ async def send_file_with_progress(
     ul_id: str = None,
     force_document: bool = False,
     force_audio: bool = False,
+    progress_label: str = "📤 Uploading",
+    progress_base: int = 0,
+    progress_total: int = None,
 ):
     file_size = os.path.getsize(filepath)
     start_time = time.time()
@@ -3095,8 +3098,11 @@ async def send_file_with_progress(
             speed = (current - last_bytes[0]) / dt if dt > 0 else 0
             last_bytes[0] = current
             last_time[0] = now
+            # آپلود چندپارتی: گزارش پیوسته روی کل فایل (از پارت اول تا آخری)
+            rep_total = progress_total if progress_total else total
+            rep_current = min(progress_base + current, rep_total)
             text = build_progress_text(
-                "📤 Uploading", current, total, speed, start_time
+                progress_label, rep_current, rep_total, speed, start_time
             )
             asyncio.ensure_future(_safe_edit_text(status_msg, text, ul_buttons))
 
@@ -7127,6 +7133,8 @@ async def generic_url_handler(event):
             active_uploads[ul_id_all] = {"paused": False, "cancelled": False}
             upload_failed = False
             upload_cancelled = False
+            total_upload_bytes = sum(os.path.getsize(p) for p in parts)
+            uploaded_so_far = 0
             for i, part_path in enumerate(parts):
                 if active_uploads.get(ul_id_all, {}).get("cancelled"):
                     await safe_edit(status_msg, "🚫 Multi-part upload cancelled.")
@@ -7140,7 +7148,11 @@ async def generic_url_handler(event):
                     break
                 part_size = os.path.getsize(part_path)
                 part_label = os.path.basename(part_path)
-                pct_done = (i / total_parts) * 100
+                pct_done = (
+                    (uploaded_so_far / total_upload_bytes) * 100
+                    if total_upload_bytes
+                    else 0
+                )
                 await safe_edit(
                     status_msg,
                     f"📤 Uploading part {i + 1}/{total_parts} ({pct_done:.0f}% complete):\n{part_label}\n📏 {human_readable_size(part_size)}",
@@ -7164,6 +7176,9 @@ async def generic_url_handler(event):
                         ),
                         status_msg=status_msg,
                         ul_id=ul_id_all,
+                        progress_label=f"📤 Uploading part {i + 1}/{total_parts}",
+                        progress_base=uploaded_so_far,
+                        progress_total=total_upload_bytes,
                     )
                 except asyncio.CancelledError:
                     upload_failed = True
@@ -7186,6 +7201,7 @@ async def generic_url_handler(event):
                             pass
                     break
 
+                uploaded_so_far += part_size
                 try:
                     os.remove(part_path)
                 except:
