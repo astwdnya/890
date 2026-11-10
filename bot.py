@@ -14,6 +14,7 @@ import time
 import json
 import shutil
 import uuid
+import secrets
 from urllib.parse import quote
 from typing import Optional, Tuple, Dict, Callable
 
@@ -52,7 +53,13 @@ from github import (
 )
 from savep_handler import process_savep_request, trigger_savep_cancel
 # File Explorer + Rename — واکنش به داکیومنت‌ها (zip/apk/rar/7z/...) با ۲ دکمه شیشه‌ای
-from file_explorer_handler import register_file_explorer_handlers, upload_file_via_chain
+from file_explorer_handler import (
+    register_file_explorer_handlers,
+    upload_file_via_chain,
+    _filebin_upload,
+    _filebin_remote_name,
+    _ProgEdit,
+)
 # صف سراسری دانلود/آپلود: منطقش پایین‌تر (کنار dl_queue) داخل همین فایل تعریف
 # شده — فایل جداگانه نه (دیپلوی فقط bot.py رو سینک می‌کنه و ModuleNotFoundError می‌داد)
 # YouTube از طریق سایت واسط (بدون اتصال مستقیم به یوتیوب)
@@ -5732,6 +5739,11 @@ async def generic_url_handler(event):
         if handled:
             return
 
+    # ─── کاهش حجم عکس: پیام تنظیماتی برای نشست فعال («Width 90 Height 80») ───
+    if rds_active_by_chat and event.raw_text and not event.raw_text.startswith("/"):
+        if await rds_handle_config_message(event):
+            return
+
     # ─── itch.io: دریافت کوکی اکانت ───
     if event.chat_id in user_state and user_state[event.chat_id].get("action") == "wait_for_itchio_cookie":
         cookie_text = event.raw_text.strip()
@@ -5863,6 +5875,10 @@ async def generic_url_handler(event):
                     [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
                     [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
                     [Button.inline("🗑 Remove Background", f"bgrm_{session_id}")],
+                    [
+                        Button.inline("📉 کاهش حجم عکس", f"rdsopen_{session_id}"),
+                        Button.inline("☁️ آپلود به Filebin", f"rdsfb_{session_id}"),
+                    ],
                 ],
             )
         except Exception as e:
@@ -5889,6 +5905,10 @@ async def generic_url_handler(event):
                         [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
                         [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
                         [Button.inline("🗑 Remove Background", f"bgrm_{session_id}")],
+                        [
+                            Button.inline("📉 کاهش حجم عکس", f"rdsopen_{session_id}"),
+                            Button.inline("☁️ آپلود به Filebin", f"rdsfb_{session_id}"),
+                        ],
                     ],
                 )
             except Exception as e:
@@ -17319,6 +17339,10 @@ async def bgrm_back_callback(event):
             [Button.inline("📖 استخراج متن از عکس", f"ocrex_{session_id}")],
             [Button.inline("🎭 Face Swap", f"fsinit_{session_id}")],
             [Button.inline("🗑 Remove Background", f"bgrm_{session_id}")],
+            [
+                Button.inline("📉 کاهش حجم عکس", f"rdsopen_{session_id}"),
+                Button.inline("☁️ آپلود به Filebin", f"rdsfb_{session_id}"),
+            ],
         ],
     )
 
@@ -17856,6 +17880,384 @@ async def ocr_extract_callback(event):
         except Exception:
             pass
         ocr_sessions.pop(session_id, None)
+
+
+# ═══════════════ 📉 کاهش حجم عکس (مهندسی معکوس reduceimages.com) ═══════════════
+# یافته‌های مهندسی معکوس (image_processor.js / offline_mode.js / HTML):
+#   • سایت هیچ API سمت‌سروری نداره — پردازش ۱۰۰٪ تو مرورگر با canvas انجام می‌شه
+#     (drawImage + toDataURL('image/'+fmt, quality)). معادل پایتون: Pillow.
+#   • wantedWidth/Height از width_field/height_field (دیفالت 70/70) + selector_units
+#     (percent پیش‌فرض / pixels) — percent: w = floor(orig_w × W/100) مستقل برای هر محور
+#     (resizeImageByScale)، pixels: اندازه‌ی دقیق W×H (resizeImageBySize / stretch).
+#   • selector_extension: jpeg (پیش‌فرض) / png / gif
+#   • wantedQuality = کیفیت/100 (دیفالت 90) — فقط برای JPEG
+#   • background_color_field: #FFFFFF پیش‌فرض + دکمه‌های سفید/سیاه — فقط برای خروجی
+#     غیر PNG/GIF کانواس اول با رنگ پس‌زمینه پر می‌شه (شفاف → سفید/سیاه)
+RDS_DEFAULTS = {
+    "width": 70,          # width_field — دیفالت سایت
+    "height": 70,         # height_field — دیفالت سایت
+    "units": "percent",   # selector_units — درصد پیش‌فرض
+    "fmt": "jpeg",        # selector_extension — JPG پیش‌فرض
+    "quality": 90,        # campo_calidad — دیفالت سایت
+    "bg": "#FFFFFF",      # background_color_field — سفید پیش‌فرض
+}
+RDS_W_H_CYCLE_PERCENT = [10, 25, 50, 70, 90, 100]
+RDS_W_H_CYCLE_PIXELS = [320, 480, 640, 800, 1080, 1440, 1920]
+RDS_QUALITY_CYCLE = [40, 60, 75, 90, 95]
+RDS_FMT_CYCLE = ["jpeg", "png", "gif"]
+RDS_TTL = 3600  # عمر نشست تنظیمات (ثانیه)
+
+rds_sessions: Dict[str, dict] = {}        # session_id → تنظیمات + مسیر عکس
+rds_active_by_chat: Dict[int, str] = {}   # chat_id → session_id فعال (برای پیام متنی)
+
+_RDS_KV_RE = re.compile(r"(width|height|quality|عرض|ارتفاع|کیفیت)\s*[:=]?\s*(\d{1,4})", re.I)
+_RDS_FMT_RE = re.compile(r"format\s*[:=]?\s*(jpg|jpeg|png|gif)\b", re.I)
+_RDS_KNOWN_RE = re.compile(
+    r"width|height|quality|format|percent|pixels?|درصد|پیکسل|عرض|ارتفاع|کیفیت|فورمت", re.I
+)
+
+
+def _rds_session_get(sid: str):
+    """نشست معتبر با TTL — منقضی/ناموجود → None."""
+    st = rds_sessions.get(sid)
+    if not st:
+        return None
+    if time.time() - st.get("ts", 0) > RDS_TTL:
+        rds_sessions.pop(sid, None)
+        rds_active_by_chat.pop(st.get("chat_id"), None)
+        return None
+    return st
+
+
+def _rds_session_drop(sid: str):
+    st = rds_sessions.pop(sid, None)
+    if st:
+        rds_active_by_chat.pop(st.get("chat_id"), None)
+
+
+def _rds_cycle(cycle, cur):
+    try:
+        return cycle[(cycle.index(cur) + 1) % len(cycle)]
+    except ValueError:
+        return cycle[0]
+
+
+def _rds_panel_text(s: dict) -> str:
+    units_fa = "درصد ٪" if s["units"] == "percent" else "پیکسل px"
+    fmt_fa = {"jpeg": "JPG", "png": "PNG", "gif": "GIF"}[s["fmt"]]
+    bg_fa = "⬜ سفید" if s["bg"] == "#FFFFFF" else "⬛ سیاه"
+    return (
+        "⚙️ **تنظیمات کاهش حجم عکس** (reduceimages.com)\n\n"
+        f"📐 Width: `{s['width']}` | 📏 Height: `{s['height']}` | واحد: **{units_fa}**\n"
+        f"🖼 Format: **{fmt_fa}** | 🎚 Quality: `{s['quality']}` | پس‌زمینه: {bg_fa}\n\n"
+        "💡 با دکمه‌های شیشه‌ای عوض کن یا مستقیم پیام بفرست:\n"
+        "`Width 90 Height 80` — `Quality 80` — `Format PNG` — `percent` / `pixels`"
+    )
+
+
+def _rds_buttons(sid: str) -> list:
+    s = rds_sessions.get(sid) or {}
+    unit_label = "%" if s.get("units") == "percent" else "px"
+    fmt_fa = {"jpeg": "JPG", "png": "PNG", "gif": "GIF"}[s.get("fmt", "jpeg")]
+    return [
+        [
+            Button.inline(f"📐 Width: {s.get('width')}{unit_label}", f"rdsset_{sid}_w"),
+            Button.inline(f"📏 Height: {s.get('height')}{unit_label}", f"rdsset_{sid}_h"),
+        ],
+        [
+            Button.inline(
+                f"🔁 واحد: {'درصد ٪' if s.get('units') == 'percent' else 'پیکسل px'} — تبدیل",
+                f"rdsset_{sid}_u",
+            )
+        ],
+        [
+            Button.inline(f"🖼 Format: {fmt_fa}", f"rdsset_{sid}_f"),
+            Button.inline(f"🎚 Quality: {s.get('quality')}", f"rdsset_{sid}_q"),
+        ],
+        [
+            Button.inline(
+                f"{'⬜' if s.get('bg') == '#FFFFFF' else '⬛'} پس‌زمینه: {'سفید' if s.get('bg') == '#FFFFFF' else 'سیاه'} — عوض کن",
+                f"rdsset_{sid}_bg",
+            )
+        ],
+        [
+            Button.inline("✅ Apply — کاهش حجم و ارسال", f"rdsapply_{sid}"),
+            Button.inline("❌ بستن", f"rdsclose_{sid}"),
+        ],
+    ]
+
+
+def _rds_process_image(path: str, s: dict):
+    """بازپیاده‌سازی پایشلِ پایپلاین reduceimages.com → (out_path, dims_str)."""
+    from PIL import Image
+
+    img = Image.open(path)
+    img.load()
+    ow, oh = img.size
+    if s["units"] == "percent":
+        # سایت: Math.floor(sourceWidth * scaleX) — هر محور مستقل (ممکنه نسبت عوض شه)
+        tw = max(1, (ow * int(s["width"])) // 100)
+        th = max(1, (oh * int(s["height"])) // 100)
+    else:
+        tw = max(1, int(s["width"]))
+        th = max(1, int(s["height"]))
+    out = img.resize((tw, th), Image.LANCZOS)
+    fmt = s["fmt"]
+    stem = re.sub(r"[^\w\.-]", "_", os.path.splitext(os.path.basename(path))[0])[:60] or "image"
+    if fmt == "jpeg":
+        if out.mode != "RGB":
+            # معادل fillRect سایت: ناحیه‌ی شفاف با رنگ پس‌زمینه پر می‌شه
+            bg_hex = (s.get("bg") or "#FFFFFF").lstrip("#")
+            try:
+                bg_rgb = tuple(int(bg_hex[i : i + 2], 16) for i in (0, 2, 4))
+            except Exception:
+                bg_rgb = (255, 255, 255)
+            canvas = Image.new("RGB", out.size, bg_rgb)
+            rgba = out.convert("RGBA")
+            canvas.paste(rgba, mask=rgba.split()[-1])
+            out = canvas
+        out_path = os.path.join(OUTPUT_FOLDER, f"rds_{stem}_{int(time.time())}.jpg")
+        out.save(out_path, "JPEG", quality=int(s.get("quality", 90)), optimize=True)
+    elif fmt == "png":
+        out_path = os.path.join(OUTPUT_FOLDER, f"rds_{stem}_{int(time.time())}.png")
+        out.save(out_path, "PNG", optimize=True)
+    else:
+        out_path = os.path.join(OUTPUT_FOLDER, f"rds_{stem}_{int(time.time())}.gif")
+        out.save(out_path, "GIF")
+    return out_path, f"{ow}×{oh} → {tw}×{th}"
+
+
+async def rds_open_callback(event):
+    """📉 کاهش حجم عکس — پنل تنظیمات با دیفالت‌های reduceimages.com."""
+    data = event.data.decode()
+    session_id = data.replace("rdsopen_", "")
+    state = ocr_sessions.get(session_id)
+    if not state:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    await event.answer("⚙️ پنل تنظیمات باز شد", alert=False)
+    # هر بار باز شدن = دیفالت‌های سایت (Width 70 / Height 70 / percent / JPG / Q90 / سفید)
+    rds_sessions[session_id] = {**RDS_DEFAULTS, **{
+        "image_path": state["image_path"],
+        "chat_id": state["chat_id"],
+        "ts": time.time(),
+    }}
+    try:
+        rds_sessions[session_id]["panel_msg"] = await event.get_message()
+    except Exception:
+        rds_sessions[session_id]["panel_msg"] = None
+    rds_active_by_chat[state["chat_id"]] = session_id
+    await event.edit(
+        _rds_panel_text(rds_sessions[session_id]),
+        parse_mode="md",
+        buttons=_rds_buttons(session_id),
+    )
+
+
+async def rds_set_callback(event):
+    """دکمه‌های شیشه‌ای تنظیمات — سایکل مقادیر."""
+    body = event.data.decode().replace("rdsset_", "")
+    try:
+        sid, field = body.rsplit("_", 1)
+    except ValueError:
+        return
+    st = _rds_session_get(sid)
+    if not st:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    if field == "w":
+        cycle = RDS_W_H_CYCLE_PERCENT if st["units"] == "percent" else RDS_W_H_CYCLE_PIXELS
+        st["width"] = _rds_cycle(cycle, st["width"])
+        await event.answer(f"📐 Width: {st['width']}", alert=False)
+    elif field == "h":
+        cycle = RDS_W_H_CYCLE_PERCENT if st["units"] == "percent" else RDS_W_H_CYCLE_PIXELS
+        st["height"] = _rds_cycle(cycle, st["height"])
+        await event.answer(f"📏 Height: {st['height']}", alert=False)
+    elif field == "u":
+        st["units"] = "pixels" if st["units"] == "percent" else "percent"
+        await event.answer(
+            f"🔁 واحد: {'درصد ٪' if st['units'] == 'percent' else 'پیکسل px'}", alert=False
+        )
+    elif field == "f":
+        st["fmt"] = _rds_cycle(RDS_FMT_CYCLE, st["fmt"])
+        await event.answer(f"🖼 Format: {st['fmt'].upper()}", alert=False)
+    elif field == "q":
+        st["quality"] = _rds_cycle(RDS_QUALITY_CYCLE, st["quality"])
+        await event.answer(f"🎚 Quality: {st['quality']}", alert=False)
+    elif field == "bg":
+        st["bg"] = "#000000" if st["bg"] == "#FFFFFF" else "#FFFFFF"
+        await event.answer(
+            f"پس‌زمینه: {'سفید ⬜' if st['bg'] == '#FFFFFF' else 'سیاه ⬛'}", alert=False
+        )
+    else:
+        return
+    st["ts"] = time.time()
+    await event.edit(_rds_panel_text(st), parse_mode="md", buttons=_rds_buttons(sid))
+
+
+async def rds_apply_callback(event):
+    """✅ Apply — کاهش حجم با پایپلاین سایت و ارسال به‌صورت فایل."""
+    data = event.data.decode()
+    session_id = data.replace("rdsapply_", "")
+    st = _rds_session_get(session_id)
+    if not st:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    image_path = st["image_path"]
+    if not os.path.exists(image_path):
+        await event.answer("❌ فایل تصویر پیدا نشد.", alert=True)
+        _rds_session_drop(session_id)
+        return
+    await event.answer("📉 در حال کاهش حجم...", alert=False)
+    await event.edit("📉 در حال پردازش و کاهش حجم عکس...", buttons=None)
+    try:
+        out_path, dims = await asyncio.to_thread(_rds_process_image, image_path, st)
+    except Exception as e:
+        logger.error(f"[RDS] process error: {e}", exc_info=True)
+        await event.edit(f"❌ خطا در پردازش عکس: {e}", buttons=None)
+        return
+    try:
+        unit = "%" if st["units"] == "percent" else "px"
+        fmt_fa = {"jpeg": "JPG", "png": "PNG", "gif": "GIF"}[st["fmt"]]
+        cap = (
+            "📉 کاهش حجم عکس (reduceimages.com)\n"
+            f"📦 {human_readable_size(os.path.getsize(image_path))} → "
+            f"{human_readable_size(os.path.getsize(out_path))}\n"
+            f"🖼 {dims} | {fmt_fa} @ Q{st['quality']}\n"
+            f"⚙️ Width {st['width']}{unit} × Height {st['height']}{unit}"
+            + (f" | BG {'سفید' if st['bg'] == '#FFFFFF' else 'سیاه'}" if st["fmt"] == "jpeg" else "")
+        )
+        await event.client.send_file(
+            event.chat_id, out_path, force_document=True, caption=cap, silent=True
+        )
+    except Exception as e:
+        await event.edit(f"❌ خطا در ارسال فایل: {e}", buttons=None)
+        return
+    finally:
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+    _rds_session_drop(session_id)
+    await event.edit("✅ عکس کاهش‌حجم‌شده به‌صورت فایل ارسال شد.", buttons=None)
+
+
+async def rdsclose_callback(event):
+    """❌ بستن پنل تنظیمات کاهش حجم."""
+    data = event.data.decode()
+    session_id = data.replace("rdsclose_", "")
+    _rds_session_drop(session_id)
+    try:
+        await event.answer("بسته شد", alert=False)
+    except Exception:
+        pass
+    await event.edit("⚙️ پنل تنظیمات بسته شد.", buttons=None)
+
+
+async def rds_filebin_callback(event):
+    """☁️ آپلود عکس به filebin.net — از منوی عکس (عکس از قبل روی سرور دانلود شده)."""
+    data = event.data.decode()
+    session_id = data.replace("rdsfb_", "")
+    st = _rds_session_get_ocr_source(session_id)
+    if not st:
+        await event.answer("⏰ نشست منقضی شده.", alert=True)
+        return
+    image_path, chat_id = st
+    if not os.path.exists(image_path):
+        await event.answer("❌ فایل تصویر پیدا نشد.", alert=True)
+        return
+    await event.answer("☁️ شروع آپلود به Filebin...", alert=False)
+    bin_name = secrets.token_hex(4)
+    remote_name = _filebin_remote_name(os.path.basename(image_path))
+    try:
+        btn_msg = await event.get_message()
+    except Exception:
+        btn_msg = None
+    prog = _ProgEdit(btn_msg, "آپلود")
+    try:
+        await event.edit("☁️ در حال آپلود به Filebin...", buttons=None)
+        status, body = await _filebin_upload(bin_name, remote_name, image_path, prog)
+    except Exception as e:
+        status, body = 0, str(e)[:200]
+    finally:
+        prog.stop()
+    if status in (200, 201):
+        link = f"https://filebin.net/{bin_name}/{remote_name}"
+        await event.edit(
+            f"✅ آپلود به Filebin انجام شد!\n🔗 {link}\n\n⏳ باکس filebin بعد از ~۶ روز بی‌استفاده خودکار پاک می‌شه.",
+            buttons=None,
+        )
+    else:
+        await event.edit(
+            f"❌ آپلود به Filebin ناموفق بود (HTTP {status}):\n{body}", buttons=None
+        )
+
+
+def _rds_session_get_ocr_source(session_id: str):
+    """عکسِ منبع برای آپلود filebin — از نشست OCR (مستقل از نشست تنظیمات rds)."""
+    state = ocr_sessions.get(session_id)
+    if not state:
+        return None
+    return state["image_path"], state["chat_id"]
+
+
+async def rds_handle_config_message(event) -> bool:
+    """پیام متنی تنظیمات («Width 90 Height 80» / «Quality 80» / «Format PNG» /
+    «percent» / «pixels») برای نشست فعال کاهش حجم — True یعنی پیام مصرف شد."""
+    sid = rds_active_by_chat.get(event.chat_id)
+    if not sid:
+        return False
+    st = rds_sessions.get(sid)
+    if not st:
+        rds_active_by_chat.pop(event.chat_id, None)
+        return False
+    text = (event.raw_text or "").strip()
+    if not text or len(text) > 200:
+        return False
+    if text.startswith("/") or re.match(r"https?://", text, re.I):
+        return False
+    if not _RDS_KNOWN_RE.search(text):
+        return False
+    changed = []
+    for m in _RDS_KV_RE.finditer(text):
+        key = m.group(1).lower()
+        val = int(m.group(2))
+        if key in ("width", "عرض") and 1 <= val <= 20000:
+            st["width"] = val
+            changed.append(f"Width={val}")
+        elif key in ("height", "ارتفاع") and 1 <= val <= 20000:
+            st["height"] = val
+            changed.append(f"Height={val}")
+        elif key in ("quality", "کیفیت") and 1 <= val <= 100:
+            st["quality"] = val
+            changed.append(f"Quality={val}")
+    fm = _RDS_FMT_RE.search(text)
+    if fm:
+        st["fmt"] = "jpeg" if fm.group(1).lower() in ("jpg", "jpeg") else fm.group(1).lower()
+        changed.append(f"Format={st['fmt'].upper()}")
+    if re.search(r"percent|درصد", text, re.I):
+        st["units"] = "percent"
+        changed.append("واحد=درصد")
+    elif re.search(r"pixels?|پیکسل", text, re.I):
+        st["units"] = "pixels"
+        changed.append("واحد=پیکسل")
+    if not changed:
+        return False
+    st["ts"] = time.time()
+    try:
+        await event.reply("✅ تنظیم شد: " + " • ".join(changed))
+    except Exception:
+        pass
+    panel_msg = st.get("panel_msg")
+    if panel_msg:
+        try:
+            await panel_msg.edit(
+                _rds_panel_text(st), parse_mode="md", buttons=_rds_buttons(sid)
+            )
+        except Exception:
+            pass
+    return True
 
 
 async def comic_pdf_callback(event):
@@ -24128,6 +24530,12 @@ async def main():
     client.add_event_handler(comic_page_callback, events.CallbackQuery(pattern=r"cmpage_"))
     # OCR callback
     client.add_event_handler(ocr_extract_callback, events.CallbackQuery(pattern=r"ocrex_"))
+    # 📉 کاهش حجم عکس (reduceimages.com) + ☁️ آپلود عکس به filebin
+    client.add_event_handler(rds_open_callback, events.CallbackQuery(pattern=r"rdsopen_"))
+    client.add_event_handler(rds_set_callback, events.CallbackQuery(pattern=r"rdsset_"))
+    client.add_event_handler(rds_apply_callback, events.CallbackQuery(pattern=r"rdsapply_"))
+    client.add_event_handler(rdsclose_callback, events.CallbackQuery(pattern=r"rdsclose_"))
+    client.add_event_handler(rds_filebin_callback, events.CallbackQuery(pattern=r"rdsfb_"))
     # AI callbacks
     client.add_event_handler(ai_select_callback, events.CallbackQuery(pattern=r"aisel_"))
     client.add_event_handler(ai_count_callback, events.CallbackQuery(pattern=r"aicount_"))
