@@ -770,11 +770,25 @@ class _Job:
 
 
 class DownloadQueue:
+    # 🆕 حداکثر بلیتِ همزمان برای هر کاربر (فعال + در صف) — ضد اسپم
+    MAX_PER_USER = 3
+
     def __init__(self):
         self._active: Optional[_Job] = None
         self._waiters: list = []
-        self._by_user: dict = {}
+        self._by_user: dict = {}   # user_id → [job_id, ...] فعال + در انتظار
         self._ids = itertools.count(1)
+
+    def _remove_user_job(self, user_id, job_id):
+        ids = self._by_user.get(user_id)
+        if not ids:
+            return
+        try:
+            ids.remove(job_id)
+        except ValueError:
+            pass
+        if not ids:
+            self._by_user.pop(user_id, None)
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -815,14 +829,18 @@ class DownloadQueue:
 
     async def join(self, user_id, title: str = "",
                    on_position: Optional[Callable] = None) -> _Job:
-        """بلیت بگیر. اگر نوبت فوری بود future پر شده (turn_ready=True)."""
-        if user_id is not None and user_id in self._by_user:
+        """بلیت بگیر. اگر نوبت فوری بود future پر شده (turn_ready=True).
+
+        🆕 کاربر می‌تونه چند درخواست تو صف داشته باشه (سقف MAX_PER_USER):
+        درخواست دومِ همون کاربر «رد نمی‌شه» — تو صف می‌مونه و وقتی قبلی
+        تموم شد خودکار شروع می‌شه. فقط بالای سقف → AlreadyInQueueError."""
+        if user_id is not None and len(self._by_user.get(user_id, [])) >= self.MAX_PER_USER:
             raise AlreadyInQueueError(user_id)
         job = _Job(next(self._ids), user_id, title, on_position)
         if self._active is None:
             self._active = job
             if user_id is not None:
-                self._by_user[user_id] = job.id
+                self._by_user.setdefault(user_id, []).append(job.id)
             job.since = time.time()
             dlq_logger.info("[DLQ] job #%s (user %s) START now | %r",
                         job.id, user_id, job.title[:50])
@@ -832,7 +850,7 @@ class DownloadQueue:
             return job
         self._waiters.append(job)
         if user_id is not None:
-            self._by_user[user_id] = job.id
+            self._by_user.setdefault(user_id, []).append(job.id)
         pos = len(self._waiters) + 1
         dlq_logger.info("[DLQ] job #%s (user %s) queued at %d | %r",
                     job.id, user_id, pos, job.title[:50])
@@ -852,11 +870,11 @@ class DownloadQueue:
         if job is None:
             return
         if self._active is job:
-            self._by_user.pop(job.user_id, None)
+            self._remove_user_job(job.user_id, job.id)
             self._grant_next()
         elif job in self._waiters:
             self._waiters.remove(job)
-            self._by_user.pop(job.user_id, None)
+            self._remove_user_job(job.user_id, job.id)
             self._notify_waiters()
 
     def leave(self, job_id) -> bool:
@@ -864,7 +882,7 @@ class DownloadQueue:
         for w in self._waiters:
             if str(w.id) == str(job_id):
                 self._waiters.remove(w)
-                self._by_user.pop(w.user_id, None)
+                self._remove_user_job(w.user_id, w.id)
                 if not w.future.done():
                     w.future.set_exception(QueueCancelledError("cancelled from queue"))
                 self._notify_waiters()
@@ -900,7 +918,7 @@ class DownloadQueue:
         if a and time.time() - a.since > ACTIVE_STALL_SECONDS:
             dlq_logger.error("[DLQ] job #%s stalled >%ds — force releasing",
                          a.id, ACTIVE_STALL_SECONDS)
-            self._by_user.pop(a.user_id, None)
+            self._remove_user_job(a.user_id, a.id)
             self._grant_next()
             return None
         return a
@@ -914,13 +932,17 @@ def _fa_digits(n) -> str:
     return str(n).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
 
 
-async def dlq_take_ticket(event, dl_id: Optional[str], title: str = ""):
+async def dlq_take_ticket(event, dl_id: Optional[str], title: str = "",
+                          status_msg: Optional[Message] = None):
     """بلیت صف سراسری — بلافاصله قبل از شروع هر دانلود/آپلود.
 
     - نوبت فوری بود → job برمی‌گرده (بدون هیچ پیام اضافه).
     - صف شلوغ بود → پیام «🕒 تو صف هستی — نفر N» می‌فرسته و موقعیت رو
       زنده آپدیت می‌کنه (هر بار کسی جلوتر تموم/لغو بشه)؛ اگه کاربر
       «🚫 لغو نوبت» بزنه → پیام لغو و None.
+    - 🆕 status_msg داده بشه، همه‌ی این پیام‌ها «همون یک پیام» رو ادیت
+      می‌کنن (بدون پیام اضافه) و موقعِ رسیدنِ نوبت، همون پیام به جریان
+      دانلود سپرده می‌شه (دکمه‌ی لغو برداشته می‌شه).
     - dl_id داده بشه، آزادسازی خودکاره: وقتی فلو خودش dl_id رو از
       active_downloads حذف کرد (پایان دانلود/آپلود در finally)، نفر
       بعدی grant می‌شه. dl_id=None → caller خودش dl_queue.done(job)
@@ -933,7 +955,14 @@ async def dlq_take_ticket(event, dl_id: Optional[str], title: str = ""):
         nonlocal q_msg
         try:
             if pos <= 1:
-                if q_msg:
+                # نوبت رسید
+                if status_msg is not None:
+                    # 🆕 پیامِ وضعیتِ فلو می‌مونه و دانلود ادامه پیدا می‌کنه
+                    try:
+                        await status_msg.edit(status_msg.raw_text or "⏳", buttons=None)
+                    except Exception:
+                        pass
+                elif q_msg:
                     try:
                         await q_msg.delete()
                     except Exception:
@@ -943,7 +972,10 @@ async def dlq_take_ticket(event, dl_id: Optional[str], title: str = ""):
             txt = f"🕒 تو صف هستی — **نفر {_fa_digits(pos)}**"
             # حریم خصوصی: عنوان کارِ فعالِ کاربر دیگه نمایش داده نمی‌شه
             _btns = [[Button.inline("🚫 لغو نوبت", f"dlqcancel_{j.id}")]]
-            if q_msg:
+            if status_msg is not None:
+                # 🆕 یک پیام: همین پیامِ وضعیتِ فلو آپدیت می‌شه (بدون پیام اضافه)
+                await safe_edit(status_msg, txt, buttons=_btns)
+            elif q_msg:
                 try:
                     await q_msg.edit(txt, parse_mode="markdown", buttons=_btns)
                 except Exception:
@@ -963,10 +995,17 @@ async def dlq_take_ticket(event, dl_id: Optional[str], title: str = ""):
         )
     except AlreadyInQueueError:
         try:
-            await event.client.send_message(
-                event.chat_id,
-                "⚠️ یه درخواست فعال تو صف/دانلود داری. اول همون تموم شه.",
-            )
+            if status_msg is not None:
+                # 🆕 به‌جای پیام جدید — همین پیام ادیت می‌شه
+                await safe_edit(
+                    status_msg,
+                    "⚠️ یه درخواست فعال تو صف/دانلود داری. اول همون تموم شه.",
+                )
+            else:
+                await event.client.send_message(
+                    event.chat_id,
+                    "⚠️ یه درخواست فعال تو صف/دانلود داری. اول همون تموم شه.",
+                )
         except Exception:
             pass
         return None
@@ -975,11 +1014,13 @@ async def dlq_take_ticket(event, dl_id: Optional[str], title: str = ""):
         try:
             await dl_queue.wait(job)
         except QueueCancelledError:
-            if q_msg:
-                try:
+            try:
+                if status_msg is not None:
+                    await status_msg.edit("🚫 **نوبت لغو شد.**", buttons=None)
+                elif q_msg:
                     await q_msg.edit("🚫 **نوبت لغو شد.**", buttons=None)
-                except Exception:
-                    pass
+            except Exception:
+                pass
             return None
 
     if dl_id:
@@ -7805,7 +7846,7 @@ async def ytvia_pick_callback(event):
     title = meta.get("title") or "YouTube"
     job = None
     try:
-        job = await dlq_take_ticket(event, dl_id, title)
+        job = await dlq_take_ticket(event, dl_id, title, status_msg=status_msg)
         if job is None:
             return  # لغو نوبت — take_ticket خودش پیام می‌ده
         if not job.turn_ready:
