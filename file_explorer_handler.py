@@ -144,6 +144,10 @@ FILEBIN_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+# 🆕 کدهای موقتی filebin — ارزش تلاش مجدد دارن، حل نیستن با پسوند .zip:
+#   507 «Insufficient storage, please retry later» → حافظه‌ی خود سایت پره
+#   429 محدودیت موقت / 5xx خطای سرور
+FILEBIN_RETRY_CODES = {429, 500, 502, 503, 507}
 
 # ───────────────── 🍕 FilePizza (آپلود P2P — سیدر باید باز بمونه) ─────────────────
 # FilePizza v2 فایل ذخیره نمی‌کنه؛ مرورگرِ آپلودکننده سیدر می‌مونه و دانلود
@@ -423,6 +427,56 @@ async def _filebin_direct_url(bin_name: str, remote_name: str) -> Optional[str]:
     except Exception as e:
         logger.warning(f"[FileExplorer] filebin direct-url probe failed: {e}")
     return None
+
+
+# 🆕 Filebin بعضی وقتا 507 می‌ده («Insufficient storage, please retry later»)
+# یعنی حافظه‌ی خود سایت پره — نه تقصیر فایل کاربره نه با تلاش ساده حل میشه.
+# استراتژی: چند تلاش مجدد کوتاه روی 507/429/5xx، اگه نشد خودکار روی هاست
+# جایگزین (لیترباکس/گوفایل/کت‌باکس/اوگوو — همگی از قبل تو همین فایل هستن).
+async def _filebin_upload_retry(bin_name: str, remote_name: str, local_path: str, prog,
+                                tries: int = 3, delays=(4.0, 8.0)) -> tuple:
+    """آپلود به Filebin + تلاش مجدد روی خطاهای موقتی سرور (507/429/5xx).
+
+    پیام 507 خود سایت میگه «please retry later» — بعضی وقتا چند ثانیه بعد جا
+    باز میشه. خروجی مثل _filebin_upload: (status_code, body_text)."""
+    status, body = 0, ""
+    for i in range(max(int(tries), 1)):
+        if i:
+            await asyncio.sleep(delays[min(i - 1, len(delays) - 1)])
+        status, body = await _filebin_upload(bin_name, remote_name, local_path, prog)
+        if status in (200, 201, 202) or status not in FILEBIN_RETRY_CODES:
+            return status, body
+        logger.warning(
+            f"[FileExplorer] filebin transient HTTP {status} ({remote_name!r}) — "
+            f"retry {i + 1}/{tries}"
+        )
+    return status, body
+
+
+async def _filebin_fallback_upload(remote_name: str, local_path: str, prog) -> tuple:
+    """وقتی Filebin جا نداره (507) یا هر خطای دیگه داد → هاست جایگزین.
+
+    ترتیب بر اساس سقف حجم هر هاست (بزرگ‌تر اولویت):
+      Litterbox (۱ گیگ، ۷۲ ساعت) → Gofile → Catbox (۲۰۰ مگ، دائمی) → Uguu (۱۲۸ مگ، ۳ ساعت)
+    اولین هاست موفق برمی‌گرده: (اسم_هاست, result_dict, نوت_انقضا).
+    همه شکست بخورن → (None, None, "")."""
+    size = os.path.getsize(local_path)
+    hosts = []
+    if size <= LITTERBOX_MAX_BYTES:
+        hosts.append(("Litterbox", _litterbox_upload, "لینک لیترباکس ۷۲ ساعت اعتبار داره."))
+    hosts.append(("Gofile", _gofile_upload, ""))
+    if size <= 200 * 1024 * 1024:
+        hosts.append(("Catbox", _catbox_upload, "لینک Catbox دائمی‌ست."))
+    if size <= 128 * 1024 * 1024:
+        hosts.append(("Uguu", _uguu_upload, "لینک Uguu ۳ ساعت اعتبار داره."))
+    for label, fn, note in hosts:
+        try:
+            res = await fn(remote_name, local_path, prog)
+            if res and (res.get("dl_url") or res.get("play_url") or res.get("page_url")):
+                return label, res, note
+        except Exception as e:
+            logger.warning(f"[FileExplorer] fallback {label} failed for {remote_name!r}: {e}")
+    return None, None, ""
 
 
 # ═══════════════════ 🍕 FilePizza — آپلودر P2P با playwright هدلس ═══════════════════
@@ -3232,7 +3286,7 @@ async def fe_filebin_cb(event):
                 )
             try:
                 status_code, body = await _run_upload_with_abort(
-                    abort_token, _filebin_upload(bin_name, name, got, prog_up)
+                    abort_token, _filebin_upload_retry(bin_name, name, got, prog_up)
                 )
             except _UploadAborted:
                 raise  # 🆕 کاربر لغو کرده — مستقیم برو به هندلر لغو
@@ -3251,6 +3305,10 @@ async def fe_filebin_cb(event):
                 break
             if status_code in (429, 413):
                 # محدودیت/حجم — تلاش با .zip بی‌فایده‌ست
+                break
+            if status_code in FILEBIN_RETRY_CODES:
+                # 🆕 خطای موقتی سرور (مثل 507 پر بودن حافظه‌ی سایت) —
+                # تلاش با .zip بی‌فایده‌ست؛ ری‌تای خودکار بالا انجام شد
                 break
             # بقیه‌ی خطاهای HTTP (مثل 403 پسوند بلاک) → تلاش بعدی با .zip
 
@@ -3284,28 +3342,74 @@ async def fe_filebin_cb(event):
             rows.append([Button.url("📄 صفحه فایل", file_url), Button.url("🗃 صفحه باکس", bin_url)])
             await _safe_edit(event, "".join(parts), rows)
         else:
-            if last_status == 429:
-                detail = "سایت Filebin فعلاً محدودیت زده (429) — چند دقیقه بعد دوباره امتحان کن"
-            elif last_status == 413:
-                detail = "حجم فایل برای Filebin زیاده (413)"
-            elif last_status == -1:
-                detail = f"خطای اتصال به Filebin:\n<code>{_esc(last_body[:150])}</code>"
-            else:
-                detail = (
-                    f"آپلود انجام نشد (کد {last_status})\n"
-                    f"<code>{_esc(last_body[:150])}</code>"
+            prog_up.stop()  # فاز filebin تموم — نوار پیشرفت جدید برای fallback
+            # 🆕 Filebin جا نداشت (مثل 507 حافظه‌ی پر) یا هر خطای دیگه —
+            # خودکار روی هاست جایگزین آپلود می‌کنیم تا کاربر با دست خالی نمونه
+            fb_label, fb_res, fb_note = None, None, ""
+            prog_fb = _ProgEdit(btn_msg, "آپلود جایگزین")
+            try:
+                await _safe_edit(
+                    event,
+                    "⚠️ Filebin فعلاً جا نداره — دارم روی سرویس جایگزین آپلود می‌کنم...",
+                    _abort_rows(abort_token),
                 )
-            await _safe_edit(
-                event,
-                f"❌ آپلود به Filebin ناموفق بود.\n{detail}",
-                _menu_rows(chat_id, msg_id),
-            )
+                fb_label, fb_res, fb_note = await _run_upload_with_abort(
+                    abort_token, _filebin_fallback_upload(remote_name, got, prog_fb)
+                )
+            except _UploadAborted:
+                raise  # 🆕 کاربر لغو کرده — مستقیم برو به هندلر لغو
+            except Exception as e:
+                if abort_token in _ABORT_FLAGS:
+                    raise _UploadAborted() from None
+                logger.error(f"[FileExplorer] filebin fallback error: {e}", exc_info=True)
+            prog_fb.stop()
+            if fb_label and fb_res:
+                fsize = os.path.getsize(got)
+                direct = fb_res.get("play_url") or fb_res.get("dl_url") or ""
+                page = fb_res.get("page_url") or ""
+                parts = [
+                    f"✅ <b>روی {fb_label} آپلود شد!</b> — Filebin فعلاً ظرفیت نداشت\n\n",
+                    f"📄 فایل: <code>{_esc(remote_name)}</code>\n",
+                    f"📏 حجم: {_fmt_size(fsize)}\n\n",
+                ]
+                rows = []
+                if direct:
+                    parts.append(f"⚡️ لینک دانلود مستقیم:\n{_esc(direct)}\n\n")
+                    rows.append([Button.url("⬇️ دانلود مستقیم", direct)])
+                if page and page != direct:
+                    parts.append(f"📄 صفحه فایل:\n{_esc(page)}\n\n")
+                    rows.append([Button.url("📄 صفحه فایل", page)])
+                if fb_note:
+                    parts.append(f"ℹ️ {fb_note}")
+                await _safe_edit(event, "".join(parts), rows or None)
+            else:
+                if last_status == 507:
+                    detail = (
+                        "حافظه‌ی سایت Filebin پره (507) و سرویس‌های جایگزین هم جواب ندادن — "
+                        "چند دقیقه بعد دوباره امتحان کن"
+                    )
+                elif last_status == 429:
+                    detail = "سایت Filebin فعلاً محدودیت زده (429) — چند دقیقه بعد دوباره امتحان کن"
+                elif last_status == 413:
+                    detail = "حجم فایل برای Filebin زیاده (413)"
+                elif last_status == -1:
+                    detail = f"خطای اتصال به Filebin:\n<code>{_esc(last_body[:150])}</code>"
+                else:
+                    detail = (
+                        f"آپلود انجام نشد (کد {last_status})\n"
+                        f"<code>{_esc(last_body[:150])}</code>"
+                    )
+                await _safe_edit(
+                    event,
+                    f"❌ آپلود به Filebin ناموفق بود.\n{detail}",
+                    _menu_rows(chat_id, msg_id),
+                )
     except _UploadAborted:
         # 🆕 کاربر دکمه لغو رو زده — پیام لغو + برگشت منو
         logger.info("[FileExplorer] filebin upload cancelled by user")
         try:
             rows = _menu_rows(chat_id, msg_id) if chat_id is not None and msg_id is not None else None
-            await _safe_edit(event, "❌ آپلود به Filebin لغو شد.", rows)
+            await _safe_edit(event, "❌ عملیات آپلود لغو شد.", rows)
         except Exception:
             pass
     except Exception as e:

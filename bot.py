@@ -57,6 +57,8 @@ from file_explorer_handler import (
     register_file_explorer_handlers,
     upload_file_via_chain,
     _filebin_upload,
+    _filebin_upload_retry,
+    _filebin_fallback_upload,
     _filebin_remote_name,
     _ProgEdit,
 )
@@ -18639,23 +18641,52 @@ async def rds_filebin_callback(event):
     except Exception:
         btn_msg = None
     prog = _ProgEdit(btn_msg, "آپلود")
+    status, body = 0, ""
     try:
         await event.edit("☁️ در حال آپلود به Filebin...", buttons=None)
-        status, body = await _filebin_upload(bin_name, remote_name, image_path, prog)
+        # 🆕 ری‌تای خودکار روی خطاهای موقتی filebin (مثل 507 حافظه‌ی پر)
+        status, body = await _filebin_upload_retry(bin_name, remote_name, image_path, prog)
     except Exception as e:
         status, body = 0, str(e)[:200]
-    finally:
-        prog.stop()
+    fb_label, fb_res, fb_note = None, None, ""
+    if status not in (200, 201):
+        # 🆕 Filebin جا نداره یا خطای دیگه داد — خودکار روی هاست جایگزین
+        # (لیترباکس/کت‌باکس/اوگوو/گوفایل) آپلود می‌کنیم تا کاربر لینک بگیره
+        try:
+            await event.edit(
+                "⚠️ Filebin فعلاً جا نداره — دارم روی سرویس جایگزین آپلود می‌کنم...",
+                buttons=None,
+            )
+            fb_label, fb_res, fb_note = await _filebin_fallback_upload(
+                remote_name, image_path, prog
+            )
+        except Exception as e:
+            logger.warning(f"[RDS] filebin fallback error: {e}")
+    prog.stop()
     if status in (200, 201):
         link = f"https://filebin.net/{bin_name}/{remote_name}"
         await event.edit(
             f"✅ آپلود به Filebin انجام شد!\n🔗 {link}\n\n⏳ باکس filebin بعد از ~۶ روز بی‌استفاده خودکار پاک می‌شه.",
             buttons=None,
         )
+    elif fb_label and fb_res:
+        link = fb_res.get("dl_url") or fb_res.get("play_url") or ""
+        page = fb_res.get("page_url") or ""
+        txt = f"✅ آپلود روی {fb_label} انجام شد! (Filebin فعلاً ظرفیت نداشت)\n🔗 {link}\n"
+        if page and page != link:
+            txt += f"📄 {page}\n"
+        if fb_note:
+            txt += f"\nℹ️ {fb_note}"
+        await event.edit(txt, buttons=None)
     else:
-        await event.edit(
-            f"❌ آپلود به Filebin ناموفق بود (HTTP {status}):\n{body}", buttons=None
-        )
+        if status == 507:
+            detail = (
+                "حافظه‌ی سایت Filebin پره (507) و سرویس‌های جایگزین هم جواب ندادن — "
+                "چند دقیقه بعد دوباره امتحان کن"
+            )
+        else:
+            detail = f"آپلود انجام نشد (HTTP {status}):\n{body}"
+        await event.edit(f"❌ {detail}", buttons=None)
 
 
 def _rds_session_get_ocr_source(session_id: str):
