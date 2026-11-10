@@ -7371,7 +7371,6 @@ def _ytvia_caption(meta: dict) -> str:
         lines.append(f"📝 {desc}")
     lines.append("")
     lines.append(f"🔗 {meta.get('link') or ''}")
-    lines.append("_دانلود از طریق سایت واسط — بدون اتصال مستقیم به یوتیوب_")
     return "\n".join(lines)
 
 
