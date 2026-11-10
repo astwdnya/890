@@ -1799,6 +1799,28 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
         except Exception:
             pass
 
+        # 🆕 پروب رنج‌دار: خیلی از CDNها (مثل savenow) تو HEAD نه Content-Length
+        # می‌دن نه Accept-Ranges ولی با GET رنج‌دار جواب 206 می‌دن — بدون این
+        # پروب، دانلودِ ۲۴تکه‌ی موازی هرگز فعال نمی‌شه و تک‌کاناله می‌مونه
+        if content_length <= 0 or accept_ranges != "bytes":
+            try:
+                async with AsyncSession() as probe_sess:
+                    probe = await probe_sess.get(
+                        url,
+                        impersonate="chrome",
+                        headers={"Accept": "*/*", "Range": "bytes=0-0"},
+                        allow_redirects=True,
+                        timeout=10,
+                    )
+                    if probe.status_code == 206:
+                        cr = probe.headers.get("Content-Range", "")
+                        m = re.search(r"/(\d+)\s*$", cr)
+                        if m:
+                            content_length = int(m.group(1))
+                            accept_ranges = "bytes"
+            except Exception:
+                pass
+
         # تشخیص نام فایل از URL
         url_path = url.split("?")[0].rstrip("/")
         orig_name = os.path.basename(url_path)
@@ -1878,8 +1900,8 @@ async def _download_via_curl_cffi(url: str, filepath: str, status_msg: Message, 
         # بهینه‌سازی: از یه session اشتراکی استفاده می‌کنیم تا TLS handshake
         # فقط یه بار انجام بشه (به جای هر chunk).
         # ═══════════════════════════════════════════════════════════════════
-        NUM_WORKERS = 16
-        CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB per chunk
+        NUM_WORKERS = 24
+        CHUNK_SIZE = 8 * 1024 * 1024  # 🆕 8 MB per chunk (بود 5)
         MIN_SIZE_FOR_MULTI = 5 * 1024 * 1024  # 5 MB
 
         if (accept_ranges == "bytes" and content_length >= MIN_SIZE_FOR_MULTI
@@ -7712,8 +7734,8 @@ async def process_ytvia_request(event, url: str, status_msg):
             )
         ytvia_sessions[session_id]["menu_msg"] = menu_msg
         await status_msg.delete()
-        # 🆕 کپشن کامل — توضیحاتِ کامل ویدیو در پیام متنی جدا زیر منو
-        await _ytvia_send_full_desc(event, meta)
+        # 🆕 توضیحاتِ کامل همین‌جا فرستاده نمی‌شه — ذخیره و بعد از آپلودِ ویدیو
+        # (meta تو ytvia_sessions هست؛ ytvia_pick_callback بعد از ارسال می‌فرسته)
     except Exception as e:
         logger.warning(f"[YTVIA] menu send failed: {e}")
         try:
@@ -7794,8 +7816,32 @@ async def ytvia_pick_callback(event):
             await safe_edit(status_msg, f"❌ دانلود ناموفق: {err or 'نامشخص'}")
             return
 
-        caption = _ytvia_caption(meta)
+        # 🆕 صحت‌سنجی کیفیت واقعی با ffprobe + حجم واقعی → کپشن صادق
+        # (واسطه‌ی بایت ترنسکد می‌کنه؛ گاهی ارتفاع واقعی با خواسته فرق داره)
+        q_note = ""
+        if want["kind"] == "video":
+            _h_i = 0
+            try:
+                _d_i, _w_i, _h_i = await get_video_info(got_path)
+            except Exception:
+                _h_i = 0
+            req_h = int(want.get("height") or 0)
+            if _h_i and req_h and _h_i < req_h - 60:
+                q_note = f"\n⚠️ واسطه دقیقاً {req_h}p نداشت — نزدیک‌ترین {_h_i}p تحویل شد"
+        try:
+            real_size = os.path.getsize(got_path)
+        except Exception:
+            real_size = 0
+
+        # توضیحاتِ کامل در پیام جدا بعد از آپلود میاد → کپشنِ فایل بدون توضیحات
+        caption = _ytvia_caption(meta, desc_budget=0)
         caption += f"\n{'🎧' if want['kind'] == 'audio' else '🎯'} **{_ytvia_btn_label(want)[2:]}**"
+        if real_size:
+            caption += f"\n💾 حجم واقعی: {human_readable_size(real_size)}"
+        if q_note:
+            caption += q_note
+        if len(caption) > 1024:
+            caption = caption[:1021].rstrip() + " …"
 
         await send_file_with_progress(
             event.client,
@@ -7807,6 +7853,8 @@ async def ytvia_pick_callback(event):
             thumb_filepath=sess.get("thumb_path") or None,
             force_audio=(want["kind"] == "audio"),
         )
+        # 🆕 توضیحاتِ کامل ویدیو — بعد از تحویلِ فایل فرستاده می‌شه نه قبلش
+        await _ytvia_send_full_desc(event, meta)
         try:
             os.remove(got_path)
         except Exception:

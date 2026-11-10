@@ -127,6 +127,9 @@ def _normalize_medias(medias: List[dict], duration: int) -> List[dict]:
             "format_id": m.get("formatId") or "",
         })
     # دکمه‌های تکراری (همان کیفیت+اکستنشن) یکی می‌شن — بیشترین bitrate می‌مونه
+    # 🆕 فقط فرمت‌های «قابل تحویل» — واسطه‌ی بایت (loader.to) ویدیو رو mp4 و
+    # صدا رو m4a/mp3 تحویل می‌ده؛ webm/opus دکمه‌ی گمراه‌کننده‌ست و حذف می‌شه
+    out = [f for f in out if f["ext"] in ("mp4", "m4a", "mp3")]
     best: Dict[tuple, dict] = {}
     for f in out:
         key = (f["kind"], f["quality"], f["ext"])
@@ -237,14 +240,19 @@ async def fetch_thumb_bytes(thumb_url: str) -> Optional[bytes]:
 
 
 def _savenow_fmt(want: dict) -> str:
-    """فرمت savenow: ویدیو → «1080/720/480/360»، صدا → «m4a/mp3»."""
+    """فرمت savenow: ویدیو → دقیقاً همون ارتفاع (144…2160)، صدا → «m4a/mp3».
+
+    🆕 قبلاً فقط {1080,720,480,360} می‌شناخت: 144p می‌شد 360 و 2160p می‌شد 1080!
+    حالا ارتفاعِ دقیق مپ می‌شه و اگه تو ستِ واسطه نبود، نزدیک‌ترین."""
     if want["kind"] == "audio":
         return "m4a" if (want.get("ext") or "") == "m4a" else "mp3"
     h = int(want.get("height") or 360)
-    for q in (1080, 720, 480, 360):
-        if h >= q:
-            return str(q)
-    return "360"
+    supported = [144, 240, 360, 480, 720, 1080, 1440, 2160]
+    if h in supported:
+        return str(h)
+    # نزدیک‌ترین (تفاضل کمتر؛ مساوی بودنِ تفاضل → بالاتر برای وفاداری به کیفیت)
+    best = min(supported, key=lambda q: (abs(q - h), -q))
+    return str(best)
 
 
 async def _savenow_token() -> str:
@@ -297,29 +305,29 @@ async def _savenow_token() -> str:
 
 
 async def _bytes_via_savenow(video_url: str, want: dict) -> Optional[str]:
-    """loader.to: PoW → v2/download → poll progress → CDN خودش (بدون قید IP)."""
+    """loader.to: PoW → v2/download → poll progress → CDN خودش (بدون قید IP).
+
+    🆕 فقط کیفیتِ دقیقِ خواسته‌شده درخواست می‌شه — دیگه «یه پله پایین‌تر»
+    بی‌صدا تحویل نمی‌شه (قبلاً 1080p می‌خواستی و 720p می‌گرفتی!)."""
     tok = await _savenow_token()
     s = _sn_session()
     hdr = {"User-Agent": UA, "Referer": SAVENOW_REF, "Authorization": f"Bearer {tok}"}
     fmt = _savenow_fmt(want)
-    chain = [fmt]
-    if want["kind"] == "video":
-        order = ["1080", "720", "480", "360"]
-        i = order.index(fmt) if fmt in order else len(order) - 1
-        chain = order[i:i + 2]   # کیفیت خواسته + یک پله پایین‌تر به‌عنوان فالبک
     last_err = ""
-    for f in chain:
+    for attempt in range(2):
         try:
             # url باید دقیقاً مثل مرورگر کامل quote بشه — yarl دستکاریش می‌کنه
-            full = (SAVENOW_BASE + "/api/v2/download?format=" + f
+            full = (SAVENOW_BASE + "/api/v2/download?format=" + fmt
                     + "&url=" + quote(video_url, safe="") + "&apikey=" + SAVENOW_KEY)
             r = await s.get(full, timeout=45, headers=hdr)
             d = r.json()
             if not d.get("success") or not d.get("id"):
-                last_err = f"{f}: {str(d)[:100]}"
+                last_err = f"{fmt}: {str(d)[:100]}"
+                _savenow_tok.clear()   # توکن شاید خرابه → تلاش دوم تازه می‌گیره
                 continue
             pid = d["id"]
             deadline = time.time() + (300 if want["kind"] == "video" else 150)
+            done = False
             while time.time() < deadline:
                 await asyncio.sleep(3)
                 pr = await s.get(
@@ -329,21 +337,21 @@ async def _bytes_via_savenow(video_url: str, want: dict) -> Optional[str]:
                 p = pr.json()
                 if p.get("success") == 1 and p.get("download_url"):
                     dl = str(p["download_url"])
-                    if "googlevideo.com" in dl:   # هرگز مستقیم از یوتیوب
-                        last_err = f"{f}: googlevideo link رد شد"
+                    if "googlevideo.com" in dl:   # هرگز مستقیم از یوتوب
+                        last_err = f"{fmt}: googlevideo link رد شد"
                         break
                     _dl_health["savenow"] = time.time()
                     return dl
                 if p.get("success") not in (0, 1):
-                    last_err = f"{f}: progress {str(p)[:100]}"
+                    last_err = f"{fmt}: progress {str(p)[:100]}"
                     break
-            else:
-                last_err = f"{f}: timeout progress"
-                continue
-            if last_err:
-                continue
+            if not done:
+                last_err = last_err or f"{fmt}: timeout progress"
         except Exception as e:
-            last_err = f"{f}: {type(e).__name__}: {str(e)[:80]}"
+            last_err = f"{fmt}: {type(e).__name__}: {str(e)[:80]}"
+        if attempt == 0:
+            _savenow_tok.clear()   # تلاش دوم با توکن تازه
+            await asyncio.sleep(2)
     logger.info(f"[YTVIA] savenow failed: {last_err}")
     return None
 
