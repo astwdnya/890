@@ -3,7 +3,18 @@ hentaihaven_handler.py
 ----------------------
 استخراج لینک‌های دانلود از hentaihaven.xxx و ارسال ویدیو به کاربر.
 
-روش کار (player-logic API):
+روش کار — مسیر جدید (بازطراحی Next.js، پروب 2026-11):
+  1. صفحه‌ی /watch/ یه اپ Next.js شده و URL مانیفست HLS رو مستقیم داخل
+     HTML خودش داره (تو RSC flight data، با escape شدن اسلش‌ها)
+     مثل: https://octopusmanifest.org/{uuid}/playlist.m3u8
+  2. مانیفست master هست: واریانت‌های 720p/360p + track صوت جدا (snd/a.m3u8)
+     + زیرنویس‌های vtt — CDN بدون کوکی/رفرر خاص
+  3. دانلود با yt-dlp (m3u8) — audio/subtitle رو خودش mux می‌کنه
+  ⚠️ سگمنت‌های fMP4 با پسوند فریبنده‌ی .html سرو می‌شن (mrocto.porngifx.com)
+     → ffmpeg مستقیم روی مانیفست کار نمی‌کنه («mismatches allowed
+     extensions»)؛ مسیر دانلود حتماً yt-dlp باشه (هندلر فعلی همینطوریه)
+
+روش کار — مسیر قدیمی (فال‌بک، player-logic API وردپرس):
   1. صفحه /watch/ رو می‌گیریم و player.php?data=... تازه رو استخراج می‌کنیم
   2. player.php یه x-secure-token می‌ده که با (ROT13 → atob) ×3 decode میشه
   3. توکن decode شده یه JSON config داره با en/iv/uri
@@ -73,6 +84,9 @@ _ALLOWED_HOSTS = frozenset(
 _ALLOWED_HOST_SUFFIXES = (
     ".hentaihaven.xxx",
     ".master-lengs.org",
+    # 🆕 CDN های سایتِ Next.js جدید (پروب 2026-11): مانیفست/سگمنت‌های HLS
+    ".octopusmanifest.org",
+    ".coverlanyvd.org",  # preview/thumbnail های نسخه‌ی جدید
     ".cdntrex.com",
     ".kvcdn.com",
     ".cdn13.com",
@@ -370,6 +384,104 @@ def _decode_player_token(raw_token: str) -> Optional[dict]:
         return None
 
 
+# ─── استخراج مسیر جدید (Next.js) ────────────────────────────
+
+
+_M3U8_RE = re.compile(r'https?://[^\s"\'<>\\]+?\.m3u8(?:\?[^\s"\'<>\\]*)?')
+_STREAM_INF_RE = re.compile(r"#EXT-X-STREAM-INF:([^\n]*)\n([^\n#][^\n]*)")
+
+
+def _parse_master_variants(master_text: str, master_url: str) -> List[dict]:
+    """پارس واریانت‌های master playlist → لیست کیفیت مرتب‌شده‌ی نزولی."""
+    base = master_url.rsplit("/", 1)[0] + "/"
+    variants: List[dict] = []
+    for attrs, uri in _STREAM_INF_RE.findall(master_text):
+        uri = uri.strip()
+        if not uri or uri.startswith("#"):
+            continue
+        if uri.startswith("//"):
+            uri = "https:" + uri
+        elif not uri.startswith("http"):
+            uri = urljoin(base, uri)
+        res_m = re.search(r"RESOLUTION=(\d+)x(\d+)", attrs)
+        height = int(res_m.group(2)) if res_m else 0
+        variants.append(
+            {
+                "label": f"📺 MP4 {height}p (HLS)" if height else "📺 MP4 (HLS)",
+                "url": uri,
+                "height": height,
+                "quality_key": f"{height}p" if height else "auto",
+                "method": "m3u8",
+                "is_hd": height >= 720,
+            }
+        )
+
+    # نزولی + حذف دامپلیکیت URL
+    seen = set()
+    uniq = []
+    for v in sorted(variants, key=lambda q: q.get("height", 0), reverse=True):
+        if v["url"] in seen:
+            continue
+        seen.add(v["url"])
+        uniq.append(v)
+    return uniq
+
+
+def _single_hls_source(master_url: str) -> dict:
+    return {
+        "label": "📺 MP4 (HLS)",
+        "url": master_url,
+        "height": 0,
+        "quality_key": "auto",
+        "method": "m3u8",
+        "is_hd": True,
+    }
+
+
+async def _extract_via_nextjs_page(session, url: str) -> Tuple[List[dict], str]:
+    """فلوی جدید سایت (بازطراحی Next.js — پروب 2026-11):
+    صفحه‌ی watch مستقیم URL مانیفست HLS رو تو خود HTML داره (RSC flight
+    data با escape شدن اسلش‌ها). مانیفست master هست → واریانت‌ها رو درمیاریم.
+    Returns: (qualities, title) — خالی یعنی مسیر جدید جواب نداد."""
+    wr = await session.get(
+        url,
+        impersonate="chrome",
+        headers={"Referer": _SITE_REFERER},
+        timeout=20,
+    )
+    if wr.status_code != 200:
+        return [], f"watch page HTTP {wr.status_code}"
+
+    title = _extract_title(wr.text)
+
+    # تو flight data اسلش‌ها escape هستن (\/) → اول unescape بعد regex
+    candidates = _M3U8_RE.findall(wr.text.replace("\\/", "/"))
+    master_url = candidates[0] if candidates else ""
+    if not master_url:
+        return [], ""
+
+    if not _is_allowed_host(master_url):
+        logger.warning("next.js m3u8 on unexpected host: %s", master_url[:100])
+
+    logger.info("Next.js page m3u8: %s", master_url[:120])
+
+    pr = await session.get(
+        master_url,
+        impersonate="chrome",
+        headers={"Referer": _SITE_REFERER},
+        timeout=20,
+    )
+    if pr.status_code != 200:
+        # مانیفست از اینجا لود نشد — خود URL master رو مستقیم بده
+        # (yt-dlp/ffmpeg خودشون هندلش می‌کنن)
+        return [_single_hls_source(master_url)], title
+
+    variants = _parse_master_variants(pr.text, master_url)
+    if variants:
+        return variants, title
+    return [_single_hls_source(master_url)], title
+
+
 # ─── Main extraction ───────────────────────────────────────
 
 
@@ -399,6 +511,20 @@ async def extract_hentaihaven_qualities(url: str) -> Tuple[List[dict], str]:
                 await session.get(_SITE_REFERER, impersonate="chrome", timeout=15)
             except Exception:
                 pass
+
+            # 1️⃣ مسیر جدید (بازطراحی Next.js): m3u8 مستقیم تو HTML صفحه‌ست
+            try:
+                qualities, title = await _extract_via_nextjs_page(session, url)
+                if qualities:
+                    logger.info(
+                        "Extracted %d sources (next.js) for: %s",
+                        len(qualities), title[:60],
+                    )
+                    return qualities, title
+            except Exception as ne:
+                logger.warning("Next.js flow failed for %s: %s", url, ne)
+
+            # 2️⃣ فال‌بک: فلوی قدیمی player-logic (اگه سایت برگرده به وردپرس)
 
             # 1. watch page → data تازه
             logger.info("Fetching watch page: %s", url)
