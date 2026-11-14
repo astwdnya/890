@@ -78,6 +78,11 @@ _ALLOWED_HOSTS = frozenset(
         "hentaihaven.xxx",
         "www.hentaihaven.xxx",
         "master-lengs.org",
+        # 🆕 CDN های نسخه‌ی Next.js (پروب 2026-11) — دامنه‌های apex باید همینجا
+        # باشن چون پسوندِ «.domain» فقط ساب‌دامین رو می‌گیره و مانیفست روی
+        # خودِ دامنه‌ی اصلی سرو می‌شه (باگ «URL host not allowed»)
+        "octopusmanifest.org",
+        "coverlanyvd.org",
     }
 )
 
