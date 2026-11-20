@@ -87,6 +87,10 @@ _PLAYER_IFRAME_RE = re.compile(
 )
 # تگ video داخل payload دیکدشده
 _VIDEO_TAG_SRC_RE = re.compile(r'<video[^>]*\bsrc=["\']([^"\']+)["\']', re.I)
+# 🆕 تگ <source> داخل <video> — پلیر برای برخی ویدیوها (مثل 2026/08، پراب
+# 11-20) لینک امضاشده رو روی source می‌ذاره؛ خود <video> فقط poster/id/class
+# داره و regex قبلی هیچی پیدا نمی‌کرد → امضا ساکت fail می‌شد → 403 همه‌جا
+_SOURCE_TAG_SRC_RE = re.compile(r'<source[^>]+src=["\']([^"\']+)["\']', re.I)
 # fallback: هر MP4 مستقیم از CDN داخل خود صفحه
 _RAW_MP4_RE = re.compile(
     r"https?://cdn\d*\.9vids\.com/[^\s\"'<>]+\.mp4", re.I
@@ -165,13 +169,19 @@ async def _fresh_signed_url(iframe_url: str, page_url: str) -> Optional[str]:
     if not phtml or pstatus != 200:
         logger.warning("[9Vids] player fetch failed (HTTP %s) — لینک امضاشده نشد", pstatus)
         return None
+    # ترتیب: src روی خود <video> → بعد src روی <source> فرزند (ساختار جدیدترِ
+    # پلیر برای ویدیوهای قدیمی‌تر) — هر کدوم که md5= داشته باشه امضای واقعیه
     mv = _VIDEO_TAG_SRC_RE.search(phtml)
-    if not mv:
-        return None
-    signed = _htmlmod.unescape(mv.group(1).strip())
-    if "md5=" not in signed:
-        return None
-    return signed
+    if mv:
+        candidate = _htmlmod.unescape(mv.group(1).strip())
+        if "md5=" in candidate:
+            return candidate
+    for ms in _SOURCE_TAG_SRC_RE.finditer(phtml):
+        candidate = _htmlmod.unescape(ms.group(1).strip())
+        if "md5=" in candidate:
+            logger.info("[9Vids] signed URL from <source> tag (video tag had no src)")
+            return candidate
+    return None
 
 
 # ─── Quality extraction ────────────────────────────────────
