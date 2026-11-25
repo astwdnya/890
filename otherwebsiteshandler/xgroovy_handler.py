@@ -498,6 +498,120 @@ async def _extract_with_curl_cffi(url: str) -> Tuple[List[dict], str]:
 # ─── Main extraction ───────────────────────────────────────
 
 
+# 🆕 دامنه‌های تبلیغ/پیش‌نمایش که تو فلوی پلیر لود میشن — از کپچر شبکه فیلتر میشن
+_AD_HOST_HINTS = (
+    "bxcdn.net",  # ویدیوهای تبلیغاتی (206)
+    "orbsrv.com",  # ad provider
+    "fozekikikiminu.com",  # pixel/backup.gif تبلیغات
+    "preview.xgroovy.com",  # پیش‌نماهای ویدیوهای دیگه تو لیست‌های سایت
+)
+
+
+def _gifs_to_videos_url(url: str) -> str:
+    """🆕 ریرایت /gifs/<id>/<slug>/ → /videos/<id>/<slug>/
+
+    Cloudflare فقط روت /gifs/ رو چالش می‌گیره؛ همون ویدیو روی /videos/
+    بدون چالشه (پراب 11-25: /gifs/ → 403 challenge، /videos/ → 200).
+    لینک alternate/canonical داخل embed هم همین ساختار رو تأیید می‌کنه."""
+    return re.sub(r"/gifs/", "/videos/", url, count=1)
+
+
+async def _extract_via_browser(url: str) -> Tuple[List[dict], str]:
+    """🆕 استخراج با مرورگر واقعی (patchright → playwright) — دور زدن CF.
+
+    صفحه‌ی /videos/ (بدون چالش CF) باز میشه؛ پلیر خودش میره سراغ CDN و ما
+    پاسخ‌های m3u8/mp4 رو از شبکه کپچر می‌کنیم. از URL کپچرشده پسوند واریانت
+    (_NNNp) حذف میشه تا مِستر پلی‌لیست به yt-dlp برسه و بهترین واریانت دانلود بشه."""
+    AsyncPw = None
+    try:
+        from patchright.async_api import async_playwright as _pw  # اولویت: فورک ضد-CF
+        AsyncPw = _pw
+    except ImportError:
+        try:
+            from playwright.async_api import async_playwright as _pw
+            AsyncPw = _pw
+        except ImportError:
+            return [], "Playwright/patchright not installed"
+
+    page_url = _gifs_to_videos_url(url)
+    m3u8_urls: List[str] = []
+    mp4_urls: List[str] = []
+    title = ""
+    try:
+        async with AsyncPw() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+            ctx = await browser.new_context(
+                user_agent=_USER_AGENT,
+                locale="en-US",
+                viewport={"width": 1280, "height": 800},
+            )
+            page = await ctx.new_page()
+
+            async def _on_resp(resp):
+                u = str(resp.url)
+                low = u.lower()
+                if any(h in low for h in _AD_HOST_HINTS):
+                    return
+                if ".m3u8" in low:
+                    m3u8_urls.append(u)
+                elif ".mp4" in low and "media-hls" not in low:
+                    # ⚠️ سگمنت‌های fMP4 روی media-hls نیستن (پسوند h264_442 و...)
+                    # ولی اگه رد شدند، از پسوند الگو هم محافظت می‌کنیم
+                    if not re.search(r"_h264_\d+_", low):
+                        mp4_urls.append(u)
+
+            page.on("response", _on_resp)
+            try:
+                await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as e:
+                logger.warning("Browser goto: %s", e)
+            # تا اولین منبع ویدیویی کپچر نشده صبر کن (حداکثر ~۲۴ ثانیه)
+            for _ in range(12):
+                await page.wait_for_timeout(2000)
+                if m3u8_urls or mp4_urls:
+                    break
+            try:
+                title = (await page.title()) or ""
+            except Exception:
+                title = ""
+            await browser.close()
+    except Exception as e:
+        logger.warning("Browser extraction error: %s", e)
+        return [], f"Browser extraction error: {str(e)[:80]}"
+
+    qualities: List[dict] = []
+    if m3u8_urls:
+        # مِستر پلی‌لیست: پسوند واریانت _NNNp حذف میشه → yt-dlp بهترین واریانت
+        best = m3u8_urls[0]
+        master = re.sub(r"_\d+p\.m3u8$", ".m3u8", best)
+        target = master if master != best else best
+        logger.info("Browser captured m3u8: %s → master: %s", best[:90], target[:90])
+        qualities.append(
+            {
+                "label": "📺 HLS (Master)",
+                "url": target,
+                "height": 720,
+                "quality_key": "720p",
+                "method": "m3u8",
+                "is_hd": True,
+            }
+        )
+    for u in mp4_urls[:2]:
+        qualities.append(
+            {
+                "label": "📡 MP4",
+                "url": u,
+                "height": 720,
+                "quality_key": "720p",
+                "method": "direct",
+                "is_hd": True,
+            }
+        )
+    if not qualities:
+        return [], "Browser: no video source captured"
+    return qualities, (title[:100].strip() or "xgroovy_video")
+
+
 async def extract_xgroovy_qualities(url: str) -> Tuple[List[dict], str]:
     """
     لینک‌های کیفیت مختلف رو از صفحه xgroovy استخراج میکنه.
@@ -506,6 +620,8 @@ async def extract_xgroovy_qualities(url: str) -> Tuple[List[dict], str]:
       1. yt-dlp با --impersonate (بهترین روش برای Cloudflare)
       2. curl_cffi مستقیم (اگه yt-dlp impersonation نداشت)
       3. request ساده (بعید که کار کنه ولی سعی میکنه)
+      4. 🆕 مرورگر واقعی patchright/playwright — روت /gifs/ رو CF چالش
+         می‌گیره ولی /videos/ بازه؛ ریرایت + کپچر شبکه‌ی پلیر HLS
     """
     if not is_xgroovy_url(url):
         logger.warning("URL is not a valid xgroovy URL: %s", url)
@@ -550,6 +666,18 @@ async def extract_xgroovy_qualities(url: str) -> Tuple[List[dict], str]:
             qualities.sort(key=_quality_sort_key, reverse=True)
             return qualities, title
 
+    # ── روش 4: 🆕 مرورگر واقعی — CF فقط /gifs/ رو چالش می‌گیره ──
+    logger.info("Direct methods failed, trying browser extraction for: %s", url)
+    qualities, title = await _extract_via_browser(url)
+    if qualities:
+        qualities.sort(key=_quality_sort_key, reverse=True)
+        logger.info(
+            "Extracted %d qualities (browser) for: %s",
+            len(qualities),
+            title[:60],
+        )
+        return qualities, title
+
     logger.warning("All extraction methods failed for: %s", url)
 
     has_ytdlp = shutil.which("yt-dlp") is not None
@@ -562,6 +690,20 @@ async def extract_xgroovy_qualities(url: str) -> Tuple[List[dict], str]:
             "Cloudflare protection detected. Install impersonation support:\n"
             "pip install curl_cffi\n"
             "or: pip install yt-dlp[default,curl-cffi]"
+        )
+    try:
+        import patchright  # noqa: F401
+        has_pw = True
+    except ImportError:
+        try:
+            import playwright  # noqa: F401
+            has_pw = True
+        except ImportError:
+            has_pw = False
+    if not has_pw:
+        return [], (
+            "Cloudflare challenge blocks direct access. Install a browser engine:\n"
+            "pip install patchright && python3 -m patchright install chromium"
         )
 
     return [], "Extraction failed - site may have updated its protection"
