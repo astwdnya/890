@@ -507,6 +507,12 @@ _AD_HOST_HINTS = (
 )
 
 
+# 🆕 آخرین master های استخراج‌شده: page_url → (master_url, ts)
+# برای re-capture موقع دانلود: stream-id های growcdnss می‌چرخند/منقضی می‌شن
+_RECENT_BROWSER_MASTERS: Dict[str, tuple] = {}
+_BROWSER_MASTER_TTL = 6 * 3600
+
+
 def _gifs_to_videos_url(url: str) -> str:
     """🆕 ریرایت /gifs/<id>/<slug>/ → /videos/<id>/<slug>/
 
@@ -565,9 +571,25 @@ async def _extract_via_browser(url: str) -> Tuple[List[dict], str]:
                 await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
             except Exception as e:
                 logger.warning("Browser goto: %s", e)
-            # تا اولین منبع ویدیویی کپچر نشده صبر کن (حداکثر ~۲۴ ثانیه)
-            for _ in range(12):
-                await page.wait_for_timeout(2000)
+            # 🆕 پلیر اول پری‌رول تبلیغ پخش می‌کنه و استریم واقعی HLS بدون
+            # کلیک همیشه استارت نمیشه (پراب 11-25 شب: video element مشغول
+            # mp4 تبلیغ bxcdn بود) — کلیک روی کنترل پلیر stream واقعی رو
+            # استارت می‌کنه؛ اول فرصت بدون کلیک (شاید مستقیم پخش کنه)
+            for _ in range(3):
+                await page.wait_for_timeout(2500)
+                if m3u8_urls:
+                    break
+                for _sel in (".fp-ui", "[class*=play]"):
+                    try:
+                        _el = page.locator(_sel).first
+                        if await _el.count() and await _el.is_visible():
+                            await _el.click(timeout=3000)
+                            break
+                    except Exception:
+                        continue
+            # تا اولین منبع ویدیویی کپچر نشده صبر کن (حداکثر ~۱۵ ثانیه)
+            for _ in range(6):
+                await page.wait_for_timeout(2500)
                 if m3u8_urls or mp4_urls:
                     break
             try:
@@ -585,6 +607,7 @@ async def _extract_via_browser(url: str) -> Tuple[List[dict], str]:
         best = m3u8_urls[0]
         master = re.sub(r"_\d+p\.m3u8$", ".m3u8", best)
         target = master if master != best else best
+        _RECENT_BROWSER_MASTERS[page_url] = (target, time.time())
         logger.info("Browser captured m3u8: %s → master: %s", best[:90], target[:90])
         qualities.append(
             {
@@ -1226,6 +1249,8 @@ async def _download_with_ytdlp(
             "--progress",
             "--newline",
             "--no-check-certificates",
+            "--socket-timeout",
+            "30",
             "-f",
             "best",
             "--concurrent-fragments",
@@ -1480,4 +1505,24 @@ async def download_xgroovy_m3u8(
         return True, "", size
 
     _cleanup_file(filepath)
+
+    # 🆕 stream-id های growcdnss می‌چرخند/منقضی می‌شن (و DNS سندباکس گاهی
+    # resolve timeout می‌ده) — اگه صفحه‌ی مبدأ این master تو کش استخراج
+    # هست، با یه کپچر تازه از مرورگر دوباره تلاش کن
+    page_url = ""
+    now = time.time()
+    for p_url, (master, ts) in list(_RECENT_BROWSER_MASTERS.items()):
+        if master == m3u8_url and now - ts <= _BROWSER_MASTER_TTL:
+            page_url = p_url
+            break
+    if page_url:
+        logger.info("xgroovy m3u8 failed → re-capturing fresh stream: %s", page_url[:80])
+        fresh_q, _t = await _extract_via_browser(page_url)
+        fresh = next((q["url"] for q in fresh_q if q.get("method") == "m3u8"), "")
+        if fresh and fresh != m3u8_url:
+            success, error, size = await _download_with_ytdlp(fresh, filepath, progress_cb)
+            if success:
+                return True, "", size
+            _cleanup_file(filepath)
+
     return False, error, 0
