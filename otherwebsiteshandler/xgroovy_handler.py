@@ -1306,6 +1306,10 @@ async def _download_hls_curlcffi(
                     if r2 is None or r2.status_code != 200:
                         consec_fail += 1
                         if consec_fail >= 5:
+                            logger.warning(
+                                "HLS curl_cffi: media playlist %d consecutive failures (last HTTP %s) — aborting",
+                                consec_fail, getattr(r2, "status_code", "exc"),
+                            )
                             return False, f"media playlist HTTP error x{consec_fail}", 0
                         await asyncio.sleep(3)
                         continue
@@ -1334,33 +1338,45 @@ async def _download_hls_curlcffi(
                         except Exception:
                             pass
 
-                    new = 0
-                    loop_hit = False
+                    # 🆕 فچ موازی پنجره (burst ها) با حفظ ترتیب نوشتن
+                    todo = []
                     for su in seg_urls:
                         u = su if su.startswith("http") else urljoin(variant, su)
                         if u in seen:
                             continue
                         seen.add(u)
-                        try:
-                            rs = await sess.get(u)
-                        except Exception:
-                            rs = None
-                        if rs is None or rs.status_code != 200:
-                            continue
-                        # استریم لایو محتوا را loop می‌کند و token چرخشی در
-                        # URL سگمنت‌ها dedup با URL را بی‌اثر می‌کند — با هش
-                        # محتوا تشخیص بده و بعد از یک دوره‌ی کامل تمام کن
-                        _h = hashlib.md5(rs.content).hexdigest()
-                        if _h in seg_hashes and nseg >= 30:
-                            logger.info("HLS loop detected at segment %d — finishing", nseg)
-                            loop_hit = True
-                            break
-                        seg_hashes.add(_h)
-                        await f.write(rs.content)
-                        total += len(rs.content)
-                        new += 1
-                        if total > MAX_DOWNLOAD_SIZE:
-                            return False, "File exceeds size limit", 0
+                        todo.append(u)
+
+                    new = 0
+                    loop_hit = False
+                    if todo:
+                        sem = asyncio.Semaphore(8)
+
+                        async def _get(u_):
+                            async with sem:
+                                try:
+                                    return await sess.get(u_)
+                                except Exception:
+                                    return None
+
+                        results = await asyncio.gather(*[_get(u) for u in todo[:12]])
+                        for u, rs in zip(todo, results):
+                            if rs is None or rs.status_code != 200:
+                                continue
+                            # استریم لایو محتوا را loop می‌کند و token چرخشی
+                            # در URL سگمنت‌ها dedup با URL را بی‌اثر می‌کند —
+                            # با هش محتوا تشخیص بده و بعد از یک دوره‌ی کامل تمام کن
+                            _h = hashlib.md5(rs.content).hexdigest()
+                            if _h in seg_hashes and nseg >= 30:
+                                logger.info("HLS loop detected at segment %d — finishing", nseg)
+                                loop_hit = True
+                                break
+                            seg_hashes.add(_h)
+                            await f.write(rs.content)
+                            total += len(rs.content)
+                            new += 1
+                            if total > MAX_DOWNLOAD_SIZE:
+                                return False, "File exceeds size limit", 0
 
                     if loop_hit:
                         break
@@ -1371,9 +1387,10 @@ async def _download_hls_curlcffi(
                     now = time.time()
                     if now - last_progress >= 2.0:
                         last_progress = now
+                        _spd = total / 1048576 / max(now - t_start, 1)
                         await progress_cb(
                             f"📥 **دریافت HLS (مرورگر-نما ⚡)...**\n"
-                            f"`سگمنت {nseg} — {total / 1048576:.1f}MB`"
+                            f"`سگمنت {nseg} — {total / 1048576:.1f}MB — {_spd:.2f}MB/s`"
                         )
 
                     if "#EXT-X-ENDLIST" in text:
@@ -1381,7 +1398,10 @@ async def _download_hls_curlcffi(
                     # لایو: اگر ۷۵ ثانیه سگمنت تازه نیامد، استریم تمام شده
                     if time.time() - last_new > 75:
                         break
-                    await asyncio.sleep(2)
+                    # supply هر ~۲ ثانیه یک سگمنت می‌دهد — poll سریع‌تر فقط
+                    # rate-limit پلی‌لیست را فعال می‌کند (پراب 11-26 ظهر)؛ 2s
+                    # دقیقاً همگام با supply است
+                    await asyncio.sleep(2.0)
             finally:
                 await f.close()
 
@@ -1669,6 +1689,20 @@ async def download_xgroovy_m3u8(
 
     if not shutil.which("yt-dlp"):
         return False, "yt-dlp is not installed", 0
+
+    # 🆕 اگر مستر کهنه است (فاز استریم جلو رفته)، مستر تازه بگیر — استریم
+    # فیک-لایو از صفر شروع می‌شود و loop می‌زند؛ دانلود از استریم کهنه فایل
+    # را از وسط ویدیو شروع می‌کند (پراب 11-26 ظهر: MEDIA-SEQUENCE هر instance
+    # مستقل است). با مستر تازه فایل مرتب از ابتدا می‌آید
+    for p_url, (master, ts) in list(_RECENT_BROWSER_MASTERS.items()):
+        if master == m3u8_url:
+            if time.time() - ts > 90:
+                fresh_q, _t = await _extract_via_browser(p_url)
+                fm = next((q["url"] for q in fresh_q if q.get("method") == "m3u8"), "")
+                if fm and fm != m3u8_url:
+                    logger.info("stale stream (age %.0fs) → fresh master for in-order file", time.time() - ts)
+                    m3u8_url = fm
+            break
 
     # 🆕 اول دانلودر curl_cffi امپرسونیت‌شده (پراب ۱۱-۲۶: CDN روی TLS
     # غیرمرورگری استال می‌کند و yt-dlp هنگ می‌شود)، yt-dlp فال‌بک است
