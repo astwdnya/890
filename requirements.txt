@@ -3,6 +3,8 @@ aiohttp>=3.9.0
 aiofiles>=23.0.0
 yt-dlp[default,curl-cffi]
 playwright>=1.58.0
+# ─── فورک ضد-CF playwright برای استخراج مرورگری xgroovy (پراب 11-25/26) ───
+patchright
 flask>=3.0.0
 uvloop>=0.19.0
 cryptg>=0.4.0
