@@ -566,7 +566,10 @@ async def _extract_via_browser(url: str) -> Tuple[List[dict], str]:
                     if not re.search(r"_h264_\d+_", low):
                         mp4_urls.append(u)
 
-            page.on("response", _on_resp)
+            # ⚠️ listener سطح context نه page — m3u8 ها از Worker ی SDK تبلیغات
+            # میان (پراب 11-26 عصر: CDP initiator = hls.light.min.js worker) و
+            # page.on آن‌ها را نمی‌گیرد → «captured nothing» های پراکنده
+            ctx.on("response", _on_resp)
             try:
                 await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
             except Exception as e:
@@ -1296,6 +1299,10 @@ async def _download_hls_curlcffi(
             last_progress = 0.0
             last_new = time.time()
             consec_fail = 0
+            # 🆕 backlog سگمنت‌های ناموفق — origin سگمنت‌های قدیمی را مدت‌ها
+            # نگه می‌دارد (پراب 11-26 عصر: DVR) پس بعداً قابل retry هستند
+            failed: dict = {}
+            last_write = time.time()
             try:
                 deadline = time.time() + 25 * 60
                 while time.time() < deadline:
@@ -1338,8 +1345,12 @@ async def _download_hls_curlcffi(
                         except Exception:
                             pass
 
-                    # 🆕 فچ موازی پنجره (burst ها) با حفظ ترتیب نوشتن
-                    todo = []
+                    # 🆕 فچ موازی پنجره (burst ها) با حفظ ترتیب نوشتن + retry
+                    # سگمنت‌های ناموفق از backlog (چون origin آن‌ها را نگه می‌دارد)
+                    retry_list = [u for u, a in list(failed.items()) if a < 8][:6]
+                    for u in retry_list:
+                        failed[u] += 1
+                    todo = list(retry_list)
                     for su in seg_urls:
                         u = su if su.startswith("http") else urljoin(variant, su)
                         if u in seen:
@@ -1359,10 +1370,13 @@ async def _download_hls_curlcffi(
                                 except Exception:
                                     return None
 
-                        results = await asyncio.gather(*[_get(u) for u in todo[:12]])
+                        results = await asyncio.gather(*[_get(u) for u in todo[:18]])
                         for u, rs in zip(todo, results):
                             if rs is None or rs.status_code != 200:
+                                if u not in failed:
+                                    failed[u] = 1
                                 continue
+                            failed.pop(u, None)
                             # استریم لایو محتوا را loop می‌کند و token چرخشی
                             # در URL سگمنت‌ها dedup با URL را بی‌اثر می‌کند —
                             # با هش محتوا تشخیص بده و بعد از یک دوره‌ی کامل تمام کن
@@ -1384,13 +1398,15 @@ async def _download_hls_curlcffi(
                     if new:
                         nseg += new
                         last_new = time.time()
+                        last_write = time.time()
                     now = time.time()
                     if now - last_progress >= 2.0:
                         last_progress = now
                         _spd = total / 1048576 / max(now - t_start, 1)
+                        _bk = f" — retry:{len(failed)}" if failed else ""
                         await progress_cb(
                             f"📥 **دریافت HLS (مرورگر-نما ⚡)...**\n"
-                            f"`سگمنت {nseg} — {total / 1048576:.1f}MB — {_spd:.2f}MB/s`"
+                            f"`سگمنت {nseg} — {total / 1048576:.1f}MB — {_spd:.2f}MB/s{_bk}`"
                         )
 
                     if "#EXT-X-ENDLIST" in text:
@@ -1398,6 +1414,10 @@ async def _download_hls_curlcffi(
                     # لایو: اگر ۷۵ ثانیه سگمنت تازه نیامد، استریم تمام شده
                     if time.time() - last_new > 75:
                         break
+                    # اگر مدت‌ها هیچ بایتی نوشته نشد و backlog مانده → خطای واقعی
+                    if failed and time.time() - last_write > 120:
+                        logger.warning("HLS curl_cffi: %d segments stuck in retry backlog — aborting", len(failed))
+                        return False, f"segment failures stuck x{len(failed)}", total
                     # supply هر ~۲ ثانیه یک سگمنت می‌دهد — poll سریع‌تر فقط
                     # rate-limit پلی‌لیست را فعال می‌کند (پراب 11-26 ظهر)؛ 2s
                     # دقیقاً همگام با supply است
