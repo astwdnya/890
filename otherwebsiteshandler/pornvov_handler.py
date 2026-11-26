@@ -43,6 +43,7 @@ import base64
 import json
 import logging
 import re
+import time
 from typing import List, Optional, Tuple
 from urllib.parse import unquote
 
@@ -117,6 +118,67 @@ def is_pornvov_url(url: str) -> bool:
     return bool(_URL_RE.match(url.strip()))
 
 
+def _retry_fetch_text(
+    url: str,
+    *,
+    impersonate: Optional[str] = "chrome",
+    headers: Optional[dict] = None,
+    attempts: int = 3,
+    connect_timeout: float = 8.0,
+    total_timeout: float = 15.0,
+) -> str:
+    """GET با retry خودکار — هر تلاش کانکشن تازه میسازه.
+
+    🔑 نکته‌ی کلیدی مقاوم‌سازی:
+      - timeout تاپل (connect, total) → اگه مسیر/IP مقصد مرده باشه،
+        بعد از connect_timeout سریع رد میشه (به‌جای هنگ تا total).
+      - هر attempt یک درخواست کاملاً تازه‌ست → DNS resolve دوباره انجام
+        میشه و با راند-رابینِ DNS شانس رسیدن به IP سالم بالا میره.
+      - روی خطاهای HTTP 4xx (مثل 403/404) retry نمی‌کنه — بی‌فایده‌ست.
+    """
+    from curl_cffi import requests as _req
+
+    last_err: Exception = RuntimeError("no attempt made")
+    for attempt in range(1, attempts + 1):
+        r = None
+        try:
+            r = _req.get(
+                url,
+                impersonate=impersonate,
+                timeout=(connect_timeout, total_timeout),
+                headers=headers,
+            )
+        except Exception as e:
+            # خطای شبکه (curl 28 timeout، DNS، TCP connect و ...) → retryable
+            last_err = e
+            logger.warning(
+                "[PornVov] fetch attempt %d/%d failed: %s (%s)",
+                attempt,
+                attempts,
+                str(e)[:100],
+                type(e).__name__,
+            )
+            if attempt < attempts:
+                time.sleep(1.5 * attempt)
+            continue
+
+        # 🔑 چک وضعیت HTTP بیرون از try شبکه‌ای:
+        if 400 <= r.status_code < 500:
+            # 4xx (بلاک/۴۰۴) → retry بی‌فایده‌ست، مستقیم throw
+            r.raise_for_status()
+        if r.status_code >= 500:
+            # 5xx → موقتیه، retry منطقیه
+            last_err = RuntimeError(f"HTTP {r.status_code}")
+            logger.warning(
+                "[PornVov] fetch attempt %d/%d: HTTP %d", attempt, attempts, r.status_code
+            )
+            if attempt < attempts:
+                time.sleep(1.5 * attempt)
+            continue
+        return r.text
+    raise last_err
+
+
 def _split_fragment(url: str) -> Tuple[str, Optional[str]]:
     """جدا کردن fragment حمل‌شده (#pvo=<page>) از لینک کیفیت."""
     m = re.search(r"#%s=([^#]+)$" % _FRAGMENT_TAG, url)
@@ -161,17 +223,27 @@ def _decrypt_payload(b64_payload: str, key: str) -> str:
 
 
 def _fetch_okru_videos_sync(session_key: str, vids: str) -> dict:
-    """صدا زدن API عمومی OK.ru (بدون impersonation — chrome جواب XML میده!)."""
-    from curl_cffi import requests as _req
+    """صدا زدن API عمومی OK.ru (بدون impersonation — chrome جواب XML میده!).
 
+    🔧 با retry: api.ok.ru دو IP داره که گاهی یکی‌شون از بعضی سرورها
+    در دسترس نیست (curl 28 Connection timed out) — تلاش بعدی با DNS
+    تازه معمولاً به IP سالم می‌رسه. تایم‌اوت هم از 25s تکی به (8, 15)
+    برای ۳ تلاش تغییر کرد تا کل زنجیره سریع‌تر fail-fast/recover بشه.
+    """
     api_url = (
         f"https://api.ok.ru/fb.do?application_key={_OKRU_APP_KEY}"
         f"&fields={_OKRU_FIELDS}&method=video.get"
         f"&session_key={session_key}&vids={vids}"
     )
-    r = _req.get(api_url, timeout=25, headers={"User-Agent": _UA})
-    r.raise_for_status()
-    data = r.json()
+    text = _retry_fetch_text(
+        api_url,
+        impersonate=None,  # 🔑 API با impersonation جواب XML میده
+        headers={"User-Agent": _UA},
+        attempts=3,
+        connect_timeout=8.0,
+        total_timeout=15.0,
+    )
+    data = json.loads(text)
     videos = (data.get("videos") or [{}])[0]
     if not videos:
         raise ValueError("OK.ru API: empty videos")
@@ -187,29 +259,33 @@ def _fetch_chain_sync(page_url: str) -> Tuple[str, dict]:
 
     Returns: (title, videos_dict از API)
     """
-    from curl_cffi import requests as _req
-
-    s = _req.Session()
+    # 🔧 مقاوم‌سازی: همه‌ی fetch های صفحه/embed با retry + connect-timeout
+    # (کوکی لازم نیست — طبق RE مستندات، سشن هم لازم نبود)
     if "/embed/" in page_url:
-        emb_html = s.get(
-            page_url, impersonate="chrome", timeout=25,
+        emb_html = _retry_fetch_text(
+            page_url,
+            impersonate="chrome",
             headers={"User-Agent": _UA},
-        ).text
+            attempts=2,
+        )
         title = extract_title_from_html(emb_html, DISPLAY_NAME)
     else:
-        page = s.get(
-            page_url, impersonate="chrome", timeout=25,
+        page = _retry_fetch_text(
+            page_url,
+            impersonate="chrome",
             headers={"User-Agent": _UA},
-        ).text
+            attempts=2,
+        )
         title = extract_title_from_html(page, DISPLAY_NAME)
         m = _EMBED_ID_RE.search(page)
         if not m:
             raise ValueError("embed id not found on page")
-        emb_html = s.get(
+        emb_html = _retry_fetch_text(
             f"{HOMEPAGE}embed/{m.group(1)}",
-            impersonate="chrome", timeout=25,
+            impersonate="chrome",
             headers={"User-Agent": _UA, "Referer": page_url},
-        ).text
+            attempts=2,
+        )
 
     g = _GENERATE_MP4_RE.search(emb_html)
     if not g:
