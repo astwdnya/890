@@ -571,31 +571,49 @@ async def _extract_via_browser(url: str) -> Tuple[List[dict], str]:
                 await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
             except Exception as e:
                 logger.warning("Browser goto: %s", e)
-            # 🆕 پلیر اول پری‌رول تبلیغ پخش می‌کنه و استریم واقعی HLS بدون
-            # کلیک همیشه استارت نمیشه (پراب 11-25 شب: video element مشغول
-            # mp4 تبلیغ bxcdn بود) — کلیک روی کنترل پلیر stream واقعی رو
-            # استارت می‌کنه؛ اول فرصت بدون کلیک (شاید مستقیم پخش کنه)
-            for _ in range(3):
-                await page.wait_for_timeout(2500)
-                if m3u8_urls:
-                    break
-                for _sel in (".fp-ui", "[class*=play]"):
-                    try:
-                        _el = page.locator(_sel).first
-                        if await _el.count() and await _el.is_visible():
-                            await _el.click(timeout=3000)
-                            break
-                    except Exception:
-                        continue
-            # تا اولین منبع ویدیویی کپچر نشده صبر کن (حداکثر ~۱۵ ثانیه)
-            for _ in range(6):
+            # 🆕 پلیر اول پری‌رول تبلیغ (bxcdn mp4) پخش می‌کند و استریم HLS
+            # واقعی فقط بعد از آن با کلیک استارت می‌شود (پراب ۱۱-۲۵/۲۶:
+            # video element مشغول تبلیغ بود؛ کلیک روی [class*=play] بعد از
+            # ~۸ ثانیه ۲۶ پاسخ m3u8 داد) — فلوی برنده‌ی پراب: اول فرصتِ
+            # پخش خودکار، بعد کلیک هر ~۱۰ ثانیه تا ظهور m3u8
+            for _ in range(4):  # ~۱۰ ثانیه فرصت پخش خودکار (بدون تبلیغ)
                 await page.wait_for_timeout(2500)
                 if m3u8_urls or mp4_urls:
                     break
+            if not m3u8_urls and not mp4_urls:
+                # ⚠️ کلیک روی FluidPlayer تگل play/pause است — هر کلیکِ اضافه
+                # تبلیغ را pause می‌کند و استریم هرگز استارت نمی‌شود (پراب
+                # ۱۱-۲۶: یک کلیک ۱۴-۲۶ پاسخ m3u8 داد؛ کلیک‌های مکرر صفر
+                # پاسخ). پس حداکثر ۲ کلیک با فاصله‌ی ~۲۰ ثانیه
+                _clicks = 0
+                for _ in range(14):  # ~۵۰ ثانیه صبر صبور
+                    await page.wait_for_timeout(3500)
+                    if m3u8_urls or mp4_urls:
+                        break
+                    if _clicks < 2 and _ in (0, 6):
+                        _clicks += 1
+                        for _sel in (".fp-ui", "[class*=play]"):
+                            try:
+                                _el = page.locator(_sel).first
+                                if await _el.count() and await _el.is_visible():
+                                    await _el.click(timeout=3000)
+                                    break
+                            except Exception:
+                                continue
             try:
                 title = (await page.title()) or ""
             except Exception:
                 title = ""
+            if not m3u8_urls and not mp4_urls:
+                # عیب‌یابی: video element چه چیزی پخش می‌کرد؟ (تبلیغ یا اصلی)
+                try:
+                    _vs = await page.evaluate(
+                        "() => { const v = document.querySelector('video');"
+                        " return v ? (v.currentSrc || v.src || '?').slice(0, 90) : 'no-video'; }"
+                    )
+                    logger.warning("Browser captured nothing; video element src: %s", _vs)
+                except Exception:
+                    pass
             await browser.close()
     except Exception as e:
         logger.warning("Browser extraction error: %s", e)
@@ -1229,6 +1247,158 @@ async def _download_with_curl_cffi(
 # ─── Download: yt-dlp ──────────────────────────────────────
 
 
+async def _download_hls_curlcffi(
+    m3u8_url: str,
+    filepath: str,
+    progress_cb: ProgressCallback,
+) -> Tuple[bool, str, int]:
+    """دانلود HLS با curl_cffi امپرسونیت‌شده مثل پلیر مرورگر.
+
+    پراب ۱۱-۲۶ صبح: CDN روی TLS غیرمرورگری استال می‌کند (yt-dlp روی فچ
+    همان پلی‌لیست هنگ می‌شود؛ curl_cffi همه‌چیز را در ۰.۰۳s می‌گیرد) و
+    پلی‌لیست لایو-استایل است (پنجره‌ی لغزنده‌ی ~۳ سگمنت) — پس مثل پلیر
+    poll می‌کنیم و هر سگمنت تازه را به‌محض ظهور می‌گیریم."""
+    from urllib.parse import urljoin
+
+    import hashlib
+
+    from curl_cffi.requests import AsyncSession
+
+    headers = {
+        "Referer": "https://www.xgroovy.com/",
+        "Origin": "https://www.xgroovy.com",
+        "User-Agent": _USER_AGENT,
+    }
+    t_start = time.time()
+    try:
+        async with AsyncSession(impersonate="chrome", timeout=40, headers=headers) as sess:
+            r = await sess.get(m3u8_url)
+            if r.status_code != 200:
+                return False, f"master playlist HTTP {r.status_code}", 0
+            # بهترین واریانت بر اساس BANDWIDTH؛ اگر مستر خودش پلی‌لیست مدیا
+            # بود (بدون STREAM-INF) مستقیم همان استفاده می‌شود
+            best, best_bw, bw = "", -1, 0
+            for raw in r.text.splitlines():
+                line = raw.strip()
+                if line.startswith("#EXT-X-STREAM-INF"):
+                    m = re.search(r"BANDWIDTH=(\d+)", line)
+                    bw = int(m.group(1)) if m else 0
+                elif line and not line.startswith("#") and bw > best_bw:
+                    best_bw, best = bw, line
+            variant = best if best.startswith("http") else urljoin(m3u8_url, best or "x")
+            if not best:
+                variant = m3u8_url
+
+            f = await aiofiles.open(filepath, "wb")
+            total, nseg = 0, 0
+            seen: set = set()
+            seg_hashes: set = set()
+            last_progress = 0.0
+            last_new = time.time()
+            consec_fail = 0
+            try:
+                deadline = time.time() + 25 * 60
+                while time.time() < deadline:
+                    try:
+                        r2 = await sess.get(variant)
+                    except Exception:
+                        r2 = None
+                    if r2 is None or r2.status_code != 200:
+                        consec_fail += 1
+                        if consec_fail >= 5:
+                            return False, f"media playlist HTTP error x{consec_fail}", 0
+                        await asyncio.sleep(3)
+                        continue
+                    consec_fail = 0
+
+                    text = r2.text
+                    init_uri, seg_urls = None, []
+                    for raw in text.splitlines():
+                        line = raw.strip()
+                        if line.startswith("#EXT-X-MAP") and init_uri is None:
+                            m = re.search(r'URI="([^"]+)"', line)
+                            if m:
+                                init_uri = m.group(1)
+                        elif line and not line.startswith("#"):
+                            seg_urls.append(line)
+
+                    # init سگمنت فقط یک بار در ابتدای فایل
+                    if init_uri and total == 0:
+                        try:
+                            ri = await sess.get(
+                                init_uri if init_uri.startswith("http") else urljoin(variant, init_uri)
+                            )
+                            if ri.status_code == 200:
+                                await f.write(ri.content)
+                                total += len(ri.content)
+                        except Exception:
+                            pass
+
+                    new = 0
+                    loop_hit = False
+                    for su in seg_urls:
+                        u = su if su.startswith("http") else urljoin(variant, su)
+                        if u in seen:
+                            continue
+                        seen.add(u)
+                        try:
+                            rs = await sess.get(u)
+                        except Exception:
+                            rs = None
+                        if rs is None or rs.status_code != 200:
+                            continue
+                        # استریم لایو محتوا را loop می‌کند و token چرخشی در
+                        # URL سگمنت‌ها dedup با URL را بی‌اثر می‌کند — با هش
+                        # محتوا تشخیص بده و بعد از یک دوره‌ی کامل تمام کن
+                        _h = hashlib.md5(rs.content).hexdigest()
+                        if _h in seg_hashes and nseg >= 30:
+                            logger.info("HLS loop detected at segment %d — finishing", nseg)
+                            loop_hit = True
+                            break
+                        seg_hashes.add(_h)
+                        await f.write(rs.content)
+                        total += len(rs.content)
+                        new += 1
+                        if total > MAX_DOWNLOAD_SIZE:
+                            return False, "File exceeds size limit", 0
+
+                    if loop_hit:
+                        break
+
+                    if new:
+                        nseg += new
+                        last_new = time.time()
+                    now = time.time()
+                    if now - last_progress >= 2.0:
+                        last_progress = now
+                        await progress_cb(
+                            f"📥 **دریافت HLS (مرورگر-نما ⚡)...**\n"
+                            f"`سگمنت {nseg} — {total / 1048576:.1f}MB`"
+                        )
+
+                    if "#EXT-X-ENDLIST" in text:
+                        break
+                    # لایو: اگر ۷۵ ثانیه سگمنت تازه نیامد، استریم تمام شده
+                    if time.time() - last_new > 75:
+                        break
+                    await asyncio.sleep(2)
+            finally:
+                await f.close()
+
+            if total <= 0:
+                return False, "no segments downloaded", 0
+            logger.info(
+                "HLS curl_cffi download OK: %d segments, %.1fMB in %.0fs",
+                nseg, total / 1048576, time.time() - t_start,
+            )
+            return True, "", total
+    except asyncio.CancelledError:
+        _cleanup_file(filepath)
+        raise
+    except Exception as e:
+        return False, str(e)[:150], 0
+
+
 async def _download_with_ytdlp(
     url: str,
     filepath: str,
@@ -1300,7 +1470,7 @@ async def _download_with_ytdlp(
         last_update = 0.0
         while True:
             try:
-                line = await asyncio.wait_for(process.stdout.readline(), timeout=120)
+                line = await asyncio.wait_for(process.stdout.readline(), timeout=600)
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
@@ -1500,7 +1670,12 @@ async def download_xgroovy_m3u8(
     if not shutil.which("yt-dlp"):
         return False, "yt-dlp is not installed", 0
 
-    success, error, size = await _download_with_ytdlp(m3u8_url, filepath, progress_cb)
+    # 🆕 اول دانلودر curl_cffi امپرسونیت‌شده (پراب ۱۱-۲۶: CDN روی TLS
+    # غیرمرورگری استال می‌کند و yt-dlp هنگ می‌شود)، yt-dlp فال‌بک است
+    success, error, size = await _download_hls_curlcffi(m3u8_url, filepath, progress_cb)
+    if not success:
+        _cleanup_file(filepath)
+        success, error, size = await _download_with_ytdlp(m3u8_url, filepath, progress_cb)
     if success:
         return True, "", size
 
@@ -1520,7 +1695,10 @@ async def download_xgroovy_m3u8(
         fresh_q, _t = await _extract_via_browser(page_url)
         fresh = next((q["url"] for q in fresh_q if q.get("method") == "m3u8"), "")
         if fresh and fresh != m3u8_url:
-            success, error, size = await _download_with_ytdlp(fresh, filepath, progress_cb)
+            success, error, size = await _download_hls_curlcffi(fresh, filepath, progress_cb)
+            if not success:
+                _cleanup_file(filepath)
+                success, error, size = await _download_with_ytdlp(fresh, filepath, progress_cb)
             if success:
                 return True, "", size
             _cleanup_file(filepath)
