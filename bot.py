@@ -600,6 +600,16 @@ from otherwebsiteshandler.ninevids_handler import (
     is_ninevids_url, extract_ninevids_qualities,
     download_ninevids_direct, download_ninevids_m3u8, ninevids_sessions,
 )
+# 🆕 PornVov (RE شده: kt_player generate_mp4 → AES decrypt → API عمومی OK.ru → MP4 مستقیم okcdn)
+from otherwebsiteshandler.pornvov_handler import (
+    is_pornvov_url, extract_pornvov_qualities,
+    download_pornvov_direct, download_pornvov_m3u8, pornvov_sessions,
+)
+# 🆕 Xfantazy (KVS flashvars → get_file با کوکی سشن + دانلود ۱۶ وورکر)
+from otherwebsiteshandler.xfantazy_handler import (
+    is_xfantazy_url, extract_xfantazy_qualities,
+    download_xfantazy_direct, download_xfantazy_m3u8, xfantazy_sessions,
+)
 from otherwebsiteshandler.porntop_handler import (
     is_porntop_url, extract_porntop_qualities,
     download_porntop_direct, download_porntop_m3u8, porntop_sessions,
@@ -20272,6 +20282,18 @@ process_ninevids_request, ninevids_quality_callback, ninevids_cancel_callback = 
     ninevids_sessions, "9Vids",
 )
 
+# 🆕 PornVov (RE: kt_player generate_mp4 → AES-256-CBC/PBKDF2-SHA512 decrypt → API OK.ru → MP4 مستقیم okcdn)
+process_pornvov_request, pornvov_quality_callback, pornvov_cancel_callback = _make_site_handler(
+    "pvo", extract_pornvov_qualities, download_pornvov_direct, download_pornvov_m3u8,
+    pornvov_sessions, "PornVov",
+)
+
+# 🆕 Xfantazy (KVS flashvars → get_file امضاشده + کوکی سشن + دانلود ۱۶ وورکر)
+process_xfantazy_request, xfantazy_quality_callback, xfantazy_cancel_callback = _make_site_handler(
+    "xfz", extract_xfantazy_qualities, download_xfantazy_direct, download_xfantazy_m3u8,
+    xfantazy_sessions, "Xfantazy",
+)
+
 # PornTop (KVS + yt-dlp fallback)
 process_porntop_request, porntop_quality_callback, porntop_cancel_callback = _make_site_handler(
     "ptp2", extract_porntop_qualities, download_porntop_direct, download_porntop_m3u8,
@@ -20668,6 +20690,8 @@ NEW_SITE_HANDLERS = [
     (is_hdzog_url, process_hdzog_request, "HDzog"),
     (is_drtuber_url, process_drtuber_request, "DrTuber"),
     (is_ninevids_url, process_ninevids_request, "9Vids"),
+    (is_pornvov_url, process_pornvov_request, "PornVov"),
+    (is_xfantazy_url, process_xfantazy_request, "Xfantazy"),
     (is_porntop_url, process_porntop_request, "PornTop"),
     (is_xhaccess_url, process_xhaccess_request, "xHAccess"),
     (is_pornone_url, process_pornone_request, "PornOne"),
@@ -24901,6 +24925,11 @@ async def main():
     client.add_event_handler(ninevids_cancel_callback, events.CallbackQuery(pattern=r"nvd_cancel_.+"))
     client.add_event_handler(porntop_quality_callback, events.CallbackQuery(pattern=r"ptp2_q_.+"))
     client.add_event_handler(porntop_cancel_callback, events.CallbackQuery(pattern=r"ptp2_cancel_.+"))
+    # 🆕 PornVov + Xfantazy
+    client.add_event_handler(pornvov_quality_callback, events.CallbackQuery(pattern=r"pvo_q_.+"))
+    client.add_event_handler(pornvov_cancel_callback, events.CallbackQuery(pattern=r"pvo_cancel_.+"))
+    client.add_event_handler(xfantazy_quality_callback, events.CallbackQuery(pattern=r"xfz_q_.+"))
+    client.add_event_handler(xfantazy_cancel_callback, events.CallbackQuery(pattern=r"xfz_cancel_.+"))
     client.add_event_handler(xhaccess_quality_callback, events.CallbackQuery(pattern=r"xha_q_.+"))
     client.add_event_handler(xhaccess_cancel_callback, events.CallbackQuery(pattern=r"xha_cancel_.+"))
     client.add_event_handler(pornone_quality_callback, events.CallbackQuery(pattern=r"pon_q_.+"))
